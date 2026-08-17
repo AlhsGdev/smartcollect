@@ -15,7 +15,7 @@ from sqlalchemy.orm import sessionmaker, Session
 # ==========================================
 import os
 
-RESEND_API_KEY = os.getenv("RESEND_API_KEY", "re_D65MY4hi_PCh3YWnnqq4weG9uArz4SiaR")
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "re_XwZxHfT4 5HsbnNDYpDu6Frthe4eQ1F4x")
 SENDER_EMAIL = "onboarding@resend.dev"
 MAX_DEVICES = 3
 
