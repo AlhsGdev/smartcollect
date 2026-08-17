@@ -1,3 +1,4 @@
+﻿import os
 import json
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -10,12 +11,8 @@ from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 
-# ==========================================
-# CONFIGURATION RESEND & SERVEUR
-# ==========================================
-import os
-
-RESEND_API_KEY = os.getenv("RESEND_API_KEY", "re_XwZxHfT4 5HsbnNDYpDu6Frthe4eQ1F4x")
+# Récupération sécurisée de la variable d'environnement sur Render
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 SENDER_EMAIL = "onboarding@resend.dev"
 MAX_DEVICES = 3
 
@@ -65,6 +62,9 @@ class LicenseAuthRequest(BaseModel):
     device_uuid: str
 
 def send_license_email(recipient_email: str, license_key: str, days: int, hours: int, minutes: int) -> bool:
+    if not RESEND_API_KEY:
+        return False
+
     url = "https://api.resend.com/emails"
     headers = {
         "Authorization": f"Bearer {RESEND_API_KEY}",
@@ -94,6 +94,10 @@ def send_license_email(recipient_email: str, license_key: str, days: int, hours:
         return response.status_code in [200, 201]
     except Exception:
         return False
+
+@app.get("/")
+def read_root():
+    return {"status": "online", "service": "SmartCollect License API"}
 
 @app.post("/api/admin/generate-key")
 def generate_key(req: GenerateKeyRequest, db: Session = Depends(get_db)):
@@ -139,11 +143,9 @@ def activate_license(req: LicenseAuthRequest, db: Session = Depends(get_db)):
 
     now = get_utc_now()
 
-    # Si la licence a déjà une date d'expiration fixée et qu'elle est dépassée
     if license_entry.expires_at and now > license_entry.expires_at:
         raise HTTPException(status_code=403, detail="Cette licence a expiré.")
 
-    # Si c'est la toute première activation, calcul de l'expiration exacte
     if not license_entry.activated_at:
         license_entry.activated_at = now
         total_duration = timedelta(
