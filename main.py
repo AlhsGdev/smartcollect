@@ -99,6 +99,49 @@ def send_license_email(recipient_email: str, license_key: str, days: int, hours:
 def read_root():
     return {"status": "online", "service": "SmartCollect License API"}
 
+# Route pour récupérer et recharger toutes les licences dans le tableau admin
+@app.get("/api/admin/licenses")
+def get_all_licenses(db: Session = Depends(get_db)):
+    licenses = db.query(LicenseKey).order_by(LicenseKey.id.desc()).all()
+    now = get_utc_now()
+    results = []
+
+    for item in licenses:
+        raw_devices = item.device_uuid or "[]"
+        is_expired = False
+        if item.expires_at and now > item.expires_at:
+            is_expired = True
+
+        if raw_devices == "REVOKED":
+            device_status = "0/3 (Révoqué)"
+            status_text = "🔴 Révoquée"
+        elif is_expired:
+            device_status = "Expiré"
+            status_text = "⌛ Expirée"
+        else:
+            try:
+                dev_list = json.loads(raw_devices) if raw_devices.startswith("[") else [raw_devices]
+                device_status = f"{len(dev_list)} / {MAX_DEVICES}"
+            except Exception:
+                device_status = f"0 / {MAX_DEVICES}"
+
+            status_text = "🟢 Active" if item.is_active else "🟡 En attente"
+
+        results.append({
+            "id": item.id,
+            "key": item.key,
+            "assigned_to_email": item.assigned_to_email,
+            "status_text": status_text,
+            "device_status": device_status,
+            "duration_days": item.duration_days,
+            "duration_hours": item.duration_hours,
+            "duration_minutes": item.duration_minutes,
+            "created_at": item.created_at.strftime("%Y-%m-%d %H:%M:%S") if item.created_at else "—",
+            "expires_at": item.expires_at.strftime("%Y-%m-%d %H:%M:%S") if item.expires_at else "Non activé"
+        })
+
+    return {"licenses": results}
+
 @app.post("/api/admin/generate-key")
 def generate_key(req: GenerateKeyRequest, db: Session = Depends(get_db)):
     part1 = secrets.token_hex(2).upper()
