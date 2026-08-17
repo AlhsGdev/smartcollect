@@ -1,0 +1,6 @@
+﻿fastapi
+uvicorn
+sqlalchemy
+requests
+pydantic
+email-validator
