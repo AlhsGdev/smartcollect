@@ -1,4 +1,4 @@
-import os
+﻿import os
 import json
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -11,15 +11,11 @@ from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 
-# ==========================================
-# CONFIGURATION & ENVIRONNEMENT
-# ==========================================
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 SENDER_EMAIL = os.getenv("SENDER_EMAIL", "onboarding@resend.dev")
 MAX_DEVICES = 3
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./licenses.db")
-
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
@@ -31,9 +27,6 @@ Base = declarative_base()
 def get_utc_now():
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
-# ==========================================
-# MODÈLE DE BASE DE DONNÉES
-# ==========================================
 class LicenseKey(Base):
     __tablename__ = "licenses"
 
@@ -60,9 +53,6 @@ def get_db():
 
 app = FastAPI(title="SmartCollect License Server")
 
-# ==========================================
-# SCHÉMAS PYDANTIC
-# ==========================================
 class GenerateKeyRequest(BaseModel):
     email: EmailStr
     days: int = 30
@@ -83,9 +73,6 @@ class UpdateLicenseRequest(BaseModel):
 class AdminActionRequest(BaseModel):
     action: str
 
-# ==========================================
-# SERVICE D'ENVOI D'E-MAILS (RESEND)
-# ==========================================
 def send_license_email(recipient_email: str, license_key: str, days: int, hours: int, minutes: int) -> bool:
     if not RESEND_API_KEY:
         return False
@@ -104,11 +91,11 @@ def send_license_email(recipient_email: str, license_key: str, days: int, hours:
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px; border: 1px solid #e2e8f0; border-radius: 12px; background-color: #ffffff;">
             <h2 style="color: #4f46e5; text-align: center;">SmartCollect — Clé d'Activation</h2>
             <p>Bonjour,</p>
-            <p>Voici votre clé d'activation officielle pour l'application <strong>SmartCollect</strong> :</p>
+            <p>Voici votre clé d'activation officielle pour <strong>SmartCollect</strong> :</p>
             <div style="background-color: #f1f5f9; border-left: 5px solid #4f46e5; padding: 18px; text-align: center; margin: 20px 0; border-radius: 6px;">
                 <span style="font-size: 26px; font-weight: bold; letter-spacing: 2px; color: #0f172a;">{license_key}</span>
             </div>
-            <p>• <strong>Durée de validité :</strong> {duration_str}<br>
+            <p>• <strong>Durée autorisée :</strong> {duration_str}<br>
                • <strong>Appareils autorisés :</strong> jusqu'à {MAX_DEVICES} appareils</p>
             <p style="font-size: 12px; color: #94a3b8; text-align: center;">Le décompte commence dès votre première activation.</p>
         </div>
@@ -120,108 +107,12 @@ def send_license_email(recipient_email: str, license_key: str, days: int, hours:
     except Exception:
         return False
 
-# ==========================================
-# ROUTES PUBLIQUES & CLIENT
-# ==========================================
 @app.get("/")
 def read_root():
     return {"status": "online", "service": "SmartCollect License API"}
 
-@app.post("/api/license/activate")
-def activate_license(req: LicenseAuthRequest, db: Session = Depends(get_db)):
-    license_entry = db.query(LicenseKey).filter(LicenseKey.key == req.key.strip()).first()
+# ==================== ROUTES ADMIN DASHBOARD ====================
 
-    if not license_entry:
-        raise HTTPException(status_code=404, detail="Clé de licence introuvable.")
-
-    if license_entry.assigned_to_email.lower().strip() != req.email.lower().strip():
-        raise HTTPException(status_code=403, detail="Cette clé n'est pas assignée à cette adresse e-mail.")
-
-    if license_entry.device_uuid == "REVOKED":
-        raise HTTPException(status_code=403, detail="Cette licence a été révoquée par l'administrateur.")
-
-    now = get_utc_now()
-
-    if license_entry.expires_at and now > license_entry.expires_at:
-        raise HTTPException(status_code=403, detail="Cette licence a expiré.")
-
-    if not license_entry.activated_at:
-        license_entry.activated_at = now
-        total_duration = timedelta(
-            days=license_entry.duration_days or 0,
-            hours=license_entry.duration_hours or 0,
-            minutes=license_entry.duration_minutes or 0
-        )
-        if total_duration.total_seconds() <= 0:
-            total_duration = timedelta(days=30)
-        license_entry.expires_at = now + total_duration
-
-    try:
-        devices: List[str] = json.loads(license_entry.device_uuid or "[]")
-    except Exception:
-        devices = []
-
-    if req.device_uuid in devices:
-        db.commit()
-        return {
-            "status": "success",
-            "message": f"Appareil déjà activé ({len(devices)}/{MAX_DEVICES} appareils).",
-            "expires_at": license_entry.expires_at.strftime("%Y-%m-%d %H:%M:%S")
-        }
-
-    if len(devices) >= MAX_DEVICES:
-        raise HTTPException(
-            status_code=403,
-            detail=f"Limite atteinte : Cette clé est déjà utilisée sur {MAX_DEVICES} appareils."
-        )
-
-    devices.append(req.device_uuid)
-    license_entry.device_uuid = json.dumps(devices)
-    license_entry.is_active = True
-    db.commit()
-
-    return {
-        "status": "success",
-        "message": f"Activation réussie ({len(devices)}/{MAX_DEVICES} appareils).",
-        "expires_at": license_entry.expires_at.strftime("%Y-%m-%d %H:%M:%S")
-    }
-
-@app.post("/api/license/verify")
-def verify_license(req: LicenseAuthRequest, db: Session = Depends(get_db)):
-    license_entry = db.query(LicenseKey).filter(LicenseKey.key == req.key.strip()).first()
-
-    if not license_entry:
-        raise HTTPException(status_code=404, detail="Licence introuvable.")
-
-    if license_entry.device_uuid == "REVOKED":
-        raise HTTPException(status_code=403, detail="Licence révoquée par l'administrateur.")
-
-    if license_entry.assigned_to_email.lower().strip() != req.email.lower().strip():
-        raise HTTPException(status_code=403, detail="E-mail non concordant.")
-
-    now = get_utc_now()
-    if license_entry.expires_at and now > license_entry.expires_at:
-        raise HTTPException(status_code=403, detail="Cette licence a expiré.")
-
-    try:
-        devices: List[str] = json.loads(license_entry.device_uuid or "[]")
-    except Exception:
-        devices = []
-
-    if req.device_uuid not in devices or not license_entry.is_active:
-        raise HTTPException(status_code=403, detail="Cet appareil n'est pas autorisé.")
-
-    return {
-        "status": "valid",
-        "message": "Licence active.",
-        "expires_at": license_entry.expires_at.strftime("%Y-%m-%d %H:%M:%S") if license_entry.expires_at else None,
-        "active_devices_count": len(devices),
-        "max_devices": MAX_DEVICES
-    }
-
-# ==========================================
-# ROUTES ADMINISTRATEUR (DASHBOARD GUI)
-# ==========================================
 @app.get("/api/admin/licenses")
 def get_all_licenses(db: Session = Depends(get_db)):
     licenses = db.query(LicenseKey).order_by(LicenseKey.id.desc()).all()
@@ -339,7 +230,7 @@ def perform_license_action(key_id: int, req: AdminActionRequest, db: Session = D
         license_entry.activated_at = None
         license_entry.expires_at = None
     else:
-        raise HTTPException(status_code=400, detail="Action invalide. Utilisez 'revoke' ou 'reset'.")
+        raise HTTPException(status_code=400, detail="Action invalide.")
 
     db.commit()
     return {"status": "success", "message": f"Action '{req.action}' exécutée."}
@@ -357,9 +248,8 @@ def resend_license_email(key_id: int, db: Session = Depends(get_db)):
         hours=license_entry.duration_hours or 0,
         minutes=license_entry.duration_minutes or 0
     )
-
     if not sent:
-        raise HTTPException(status_code=500, detail="Échec de l'envoi de l'e-mail.")
+        raise HTTPException(status_code=500, detail="Échec envoi e-mail.")
 
     return {"status": "success", "message": "E-mail renvoyé avec succès."}
 
@@ -372,3 +262,96 @@ def delete_license(key_id: int, db: Session = Depends(get_db)):
     db.delete(license_entry)
     db.commit()
     return {"status": "success", "message": "Licence supprimée avec succès."}
+
+# ==================== ROUTES CLIENT (FLUTTER) ====================
+
+@app.post("/api/license/activate")
+def activate_license(req: LicenseAuthRequest, db: Session = Depends(get_db)):
+    license_entry = db.query(LicenseKey).filter(LicenseKey.key == req.key.strip()).first()
+
+    if not license_entry:
+        raise HTTPException(status_code=404, detail="Clé de licence introuvable.")
+
+    if license_entry.assigned_to_email.lower().strip() != req.email.lower().strip():
+        raise HTTPException(status_code=403, detail="Cette clé n'est pas assignée à cette adresse e-mail.")
+
+    if license_entry.device_uuid == "REVOKED":
+        raise HTTPException(status_code=403, detail="Cette licence a été révoquée par l'administrateur.")
+
+    now = get_utc_now()
+    if license_entry.expires_at and now > license_entry.expires_at:
+        raise HTTPException(status_code=403, detail="Cette licence a expiré.")
+
+    if not license_entry.activated_at:
+        license_entry.activated_at = now
+        total_duration = timedelta(
+            days=license_entry.duration_days or 0,
+            hours=license_entry.duration_hours or 0,
+            minutes=license_entry.duration_minutes or 0
+        )
+        if total_duration.total_seconds() <= 0:
+            total_duration = timedelta(days=30)
+        license_entry.expires_at = now + total_duration
+
+    try:
+        devices: List[str] = json.loads(license_entry.device_uuid or "[]")
+    except Exception:
+        devices = []
+
+    if req.device_uuid in devices:
+        db.commit()
+        return {
+            "status": "success",
+            "message": f"Appareil déjà activé ({len(devices)}/{MAX_DEVICES} appareils).",
+            "expires_at": license_entry.expires_at.strftime("%Y-%m-%d %H:%M:%S")
+        }
+
+    if len(devices) >= MAX_DEVICES:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Limite atteinte : Cette clé est déjà utilisée sur {MAX_DEVICES} appareils."
+        )
+
+    devices.append(req.device_uuid)
+    license_entry.device_uuid = json.dumps(devices)
+    license_entry.is_active = True
+    db.commit()
+
+    return {
+        "status": "success",
+        "message": f"Activation réussie ({len(devices)}/{MAX_DEVICES} appareils).",
+        "expires_at": license_entry.expires_at.strftime("%Y-%m-%d %H:%M:%S")
+    }
+
+@app.post("/api/license/verify")
+def verify_license(req: LicenseAuthRequest, db: Session = Depends(get_db)):
+    license_entry = db.query(LicenseKey).filter(LicenseKey.key == req.key.strip()).first()
+
+    if not license_entry:
+        raise HTTPException(status_code=404, detail="Licence introuvable.")
+
+    if license_entry.device_uuid == "REVOKED":
+        raise HTTPException(status_code=403, detail="Licence révoquée par l'administrateur.")
+
+    if license_entry.assigned_to_email.lower().strip() != req.email.lower().strip():
+        raise HTTPException(status_code=403, detail="E-mail non concordant.")
+
+    now = get_utc_now()
+    if license_entry.expires_at and now > license_entry.expires_at:
+        raise HTTPException(status_code=403, detail="Cette licence a expiré.")
+
+    try:
+        devices: List[str] = json.loads(license_entry.device_uuid or "[]")
+    except Exception:
+        devices = []
+
+    if req.device_uuid not in devices or not license_entry.is_active:
+        raise HTTPException(status_code=403, detail="Cet appareil n'est pas autorisé.")
+
+    return {
+        "status": "valid",
+        "message": "Licence active.",
+        "expires_at": license_entry.expires_at.strftime("%Y-%m-%d %H:%M:%S") if license_entry.expires_at else None,
+        "active_devices_count": len(devices),
+        "max_devices": MAX_DEVICES
+    }
