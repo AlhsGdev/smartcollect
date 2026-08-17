@@ -11,6 +11,7 @@ from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 
+# Configuration Render & Resend
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 SENDER_EMAIL = "onboarding@resend.dev"
 MAX_DEVICES = 3
@@ -107,7 +108,7 @@ def send_license_email(recipient_email: str, license_key: str, days: int, hours:
 def read_root():
     return {"status": "online", "service": "SmartCollect License API"}
 
-# ==================== ENDPOINTS ADMIN ====================
+# ==================== GESTION ADMIN ====================
 
 @app.get("/api/admin/licenses")
 def get_all_licenses(db: Session = Depends(get_db)):
@@ -245,7 +246,7 @@ def delete_license(license_id: int, db: Session = Depends(get_db)):
     db.commit()
     return {"status": "success"}
 
-# ==================== ENDPOINTS CLIENT (FLUTTER) ====================
+# ==================== FLUTTER CLIENT ====================
 
 @app.post("/api/license/activate")
 def activate_license(req: LicenseAuthRequest, db: Session = Depends(get_db)):
