@@ -1,6 +1,5 @@
-﻿fastapi
-uvicorn
-sqlalchemy
+fastapi
+uvicorn[standard]
 requests
-pydantic
-email-validator
+pydantic[email]
+sqlalchemy
