@@ -1,4 +1,5 @@
 import os
+import json
 import uuid
 import datetime
 import requests
@@ -6,7 +7,7 @@ from typing import Optional, List
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, String, Boolean, DateTime, Integer
+from sqlalchemy import create_engine, Column, String, Boolean, DateTime, Integer, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 
@@ -26,7 +27,8 @@ class LicenseDB(Base):
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     key = Column(String, unique=True, index=True, nullable=False)
     email = Column(String, index=True, nullable=False)
-    device_uuid = Column(String, nullable=True)
+    max_devices = Column(Integer, default=1)
+    devices_list = Column(Text, default="[]")  # Liste JSON des UUIDs
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     expires_at = Column(DateTime, nullable=True)
@@ -40,10 +42,9 @@ def get_db():
     finally:
         db.close()
 
-# ----------------- FONCTION D'ENVOI D'EMAIL EN ARRIÈRE-PLAN -----------------
-def send_license_email_task(to_email: str, license_key: str, duration_str: str):
+# ----------------- FONCTION D'ENVOI D'EMAIL -----------------
+def send_license_email_task(to_email: str, license_key: str, duration_str: str, max_dev: int):
     if not RESEND_API_KEY or "votre_cle" in RESEND_API_KEY:
-        print("Clé RESEND manquante, envoi annulé.")
         return
 
     url = "https://api.resend.com/emails"
@@ -56,18 +57,25 @@ def send_license_email_task(to_email: str, license_key: str, duration_str: str):
     <!DOCTYPE html>
     <html>
     <head><meta charset="utf-8"></head>
-    <body style="font-family: Arial, sans-serif; background-color: #f8fafc; padding: 20px;">
-        <div style="background-color: #ffffff; max-width: 500px; margin: auto; padding: 25px; border-radius: 12px; border: 1px solid #e2e8f0;">
-            <h2 style="color: #1e293b; text-align: center;">SmartCollect — Clé d'Activation</h2>
-            <p>Bonjour,</p>
-            <p>Voici votre clé d'activation officielle pour l'application <b>SmartCollect</b> :</p>
-            <div style="background-color: #eef2ff; border: 2px solid #6366f1; border-radius: 8px; padding: 15px; text-align: center; margin: 20px 0;">
-                <span style="font-size: 22px; font-weight: bold; color: #4338ca; letter-spacing: 2px;">{license_key}</span>
+    <body style="font-family: 'Segoe UI', Arial, sans-serif; background-color: #f8fafc; margin: 0; padding: 20px;">
+        <div style="background-color: #ffffff; max-width: 520px; margin: auto; padding: 30px; border-radius: 16px; border: 1px solid #e2e8f0;">
+            <h2 style="color: #1e293b; text-align: center; margin-top: 0;">SmartCollect — Clé d'Activation</h2>
+            <p style="color: #334155; font-size: 15px;">Bonjour,</p>
+            <p style="color: #334155; font-size: 14px;">Voici votre clé d'activation officielle pour l'application <b>SmartCollect</b> :</p>
+            
+            <div style="background-color: #eef2ff; border: 2px solid #6366f1; border-radius: 12px; padding: 18px; text-align: center; margin: 24px 0;">
+                <span style="font-size: 24px; font-weight: 800; color: #4338ca; letter-spacing: 2px;">{license_key}</span>
             </div>
-            <p style="color: #475569; font-size: 14px;">
-                • <b>Durée :</b> {duration_str}<br>
-                • <b>Appareil :</b> 1 terminal actif
-            </p>
+            
+            <div style="color: #475569; font-size: 14px; line-height: 1.8;">
+                • <b>Durée de validité :</b> {duration_str}<br>
+                • <b>Appareils autorisés :</b> jusqu'à {max_dev} appareil(s)<br>
+                • <i>Le décompte commence dès votre première activation.</i>
+            </div>
+            
+            <div style="text-align: center; color: #94a3b8; font-size: 12px; margin-top: 28px;">
+                SmartCollect Security System • Ne partagez pas cette clé.
+            </div>
         </div>
     </body>
     </html>
@@ -88,9 +96,9 @@ def send_license_email_task(to_email: str, license_key: str, duration_str: str):
 # ----------------- MODÈLES PYDANTIC -----------------
 class LicenseCreateRequest(BaseModel):
     email: str
-    duration_days: int = 30
-    duration_hours: int = 0
-    duration_minutes: int = 0
+    duration_val: int = 1
+    duration_unit: str = "Mois"  # "Jours", "Mois", "Ans"
+    max_devices: int = 1
 
 class LicenseActionRequest(BaseModel):
     email: Optional[str] = None
@@ -103,16 +111,14 @@ class LicenseResponse(BaseModel):
     id: int
     key: str
     email: str
-    device_uuid: Optional[str]
+    max_devices: int
+    used_devices: int
     is_active: bool
     created_at: datetime.datetime
     expires_at: Optional[datetime.datetime]
 
-    class Config:
-        from_attributes = True
-
 # ----------------- FASTAPI APP -----------------
-app = FastAPI(title="SmartCollect License API")
+app = FastAPI(title="SmartCollect Cloud License API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -124,13 +130,27 @@ app.add_middleware(
 
 @app.get("/")
 def read_root():
-    return {"status": "online", "service": "SmartCollect License API (FastAPI)"}
+    return {"status": "online", "service": "SmartCollect Cloud API"}
 
-@app.get("/api/admin/licenses", response_model=List[LicenseResponse])
+@app.get("/api/admin/licenses")
 def get_all_licenses(db: Session = Depends(get_db)):
-    return db.query(LicenseDB).order_by(LicenseDB.created_at.desc()).all()
+    rows = db.query(LicenseDB).order_by(LicenseDB.created_at.desc()).all()
+    results = []
+    for lic in rows:
+        devs = json.loads(lic.devices_list or "[]")
+        results.append({
+            "id": lic.id,
+            "key": lic.key,
+            "email": lic.email,
+            "max_devices": lic.max_devices,
+            "used_devices": len(devs),
+            "is_active": lic.is_active,
+            "created_at": lic.created_at.isoformat(),
+            "expires_at": lic.expires_at.isoformat() if lic.expires_at else None
+        })
+    return results
 
-@app.post("/api/admin/licenses/create", response_model=LicenseResponse)
+@app.post("/api/admin/licenses/create")
 def create_license(req: LicenseCreateRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     clean_email = req.email.strip().lower()
     
@@ -138,16 +158,24 @@ def create_license(req: LicenseCreateRequest, background_tasks: BackgroundTasks,
     part2 = uuid.uuid4().hex[:4].upper()
     generated_key = f"APP-{part1}-{part2}"
 
-    total_delta = datetime.timedelta(
-        days=req.duration_days,
-        hours=req.duration_hours,
-        minutes=req.duration_minutes
-    )
-    expires_at = datetime.datetime.utcnow() + total_delta
+    # Calcul de la durée
+    days = 0
+    if req.duration_unit == "Jours":
+        days = req.duration_val
+    elif req.duration_unit == "Mois":
+        days = req.duration_val * 30
+    elif req.duration_unit == "Ans":
+        days = req.duration_val * 365
+    else:
+        days = req.duration_val
+
+    expires_at = datetime.datetime.utcnow() + datetime.timedelta(days=days)
 
     lic = LicenseDB(
         key=generated_key,
         email=clean_email,
+        max_devices=max(1, req.max_devices),
+        devices_list="[]",
         expires_at=expires_at,
         is_active=True
     )
@@ -155,11 +183,17 @@ def create_license(req: LicenseCreateRequest, background_tasks: BackgroundTasks,
     db.commit()
     db.refresh(lic)
 
-    duration_label = f"{req.duration_days}j {req.duration_hours}h {req.duration_minutes}min"
-    # Envoi en arrière-plan sans bloquer la réponse HTTP
-    background_tasks.add_task(send_license_email_task, clean_email, generated_key, duration_label)
+    duration_label = f"{req.duration_val} {req.duration_unit}"
+    background_tasks.add_task(send_license_email_task, clean_email, generated_key, duration_label, lic.max_devices)
 
-    return lic
+    return {
+        "id": lic.id,
+        "key": lic.key,
+        "email": lic.email,
+        "max_devices": lic.max_devices,
+        "used_devices": 0,
+        "expires_at": lic.expires_at.isoformat()
+    }
 
 @app.delete("/api/admin/licenses/{license_id}")
 def delete_license(license_id: int, db: Session = Depends(get_db)):
@@ -168,7 +202,16 @@ def delete_license(license_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Licence introuvable")
     db.delete(lic)
     db.commit()
-    return {"message": "Licence supprimée avec succès"}
+    return {"message": "Licence supprimée"}
+
+@app.post("/api/admin/licenses/{license_id}/reset-devices")
+def reset_devices(license_id: int, db: Session = Depends(get_db)):
+    lic = db.query(LicenseDB).filter(LicenseDB.id == license_id).first()
+    if not lic:
+        raise HTTPException(status_code=404, detail="Licence introuvable")
+    lic.devices_list = "[]"
+    db.commit()
+    return {"message": "Appareils réinitialisés"}
 
 @app.post("/api/admin/licenses/{license_id}/resend-email")
 def resend_email_route(license_id: int, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
@@ -176,23 +219,21 @@ def resend_email_route(license_id: int, background_tasks: BackgroundTasks, db: S
     if not lic:
         raise HTTPException(status_code=404, detail="Licence introuvable")
     
-    duration_str = "Valide"
-    if lic.expires_at:
-        remaining = lic.expires_at - datetime.datetime.utcnow()
-        duration_str = f"{max(0, remaining.days)} jours restants"
+    remaining = lic.expires_at - datetime.datetime.utcnow() if lic.expires_at else None
+    duration_str = f"{max(0, remaining.days)} jours restants" if remaining else "Illimité"
+    background_tasks.add_task(send_license_email_task, lic.email, lic.key, duration_str, lic.max_devices)
+    return {"message": "Envoi initié"}
 
-    background_tasks.add_task(send_license_email_task, lic.email, lic.key, duration_str)
-    return {"message": "Envoi de l'e-mail initié"}
-
-# ----------------- ACTIVATION FLUTTER -----------------
+# ----------------- FLUTTER ACTIVATION MULTI-APPAREILS -----------------
 @app.post("/api/license/activate")
 def activate_license(req: LicenseActionRequest, db: Session = Depends(get_db)):
     clean_email = (req.email or "").strip().lower()
     raw_key = req.key or req.license_key or req.cle or ""
     clean_key = raw_key.strip().upper()
+    device_id = req.device_uuid or "unknown_device"
 
     if not clean_email or not clean_key:
-        raise HTTPException(status_code=400, detail="E-mail et clé d'activation requis.")
+        raise HTTPException(status_code=400, detail="E-mail et clé requis.")
 
     lic = db.query(LicenseDB).filter(
         LicenseDB.email.ilike(clean_email),
@@ -208,10 +249,17 @@ def activate_license(req: LicenseActionRequest, db: Session = Depends(get_db)):
     if lic.expires_at and lic.expires_at < datetime.datetime.utcnow():
         raise HTTPException(status_code=403, detail="Cette licence a expiré.")
 
-    if lic.device_uuid is None:
-        lic.device_uuid = req.device_uuid
+    # Gestion de la liste des appareils
+    devices = json.loads(lic.devices_list or "[]")
+    if device_id not in devices:
+        if len(devices) >= lic.max_devices:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Limite atteinte ({lic.max_devices} appareil(s) maximum autorisés)."
+            )
+        devices.append(device_id)
+        lic.devices_list = json.dumps(devices)
         db.commit()
-        db.refresh(lic)
 
     return {
         "success": True,
@@ -224,6 +272,7 @@ def verify_license(req: LicenseActionRequest, db: Session = Depends(get_db)):
     clean_email = (req.email or "").strip().lower()
     raw_key = req.key or req.license_key or req.cle or ""
     clean_key = raw_key.strip().upper()
+    device_id = req.device_uuid or "unknown_device"
 
     lic = db.query(LicenseDB).filter(
         LicenseDB.email.ilike(clean_email),
@@ -231,10 +280,14 @@ def verify_license(req: LicenseActionRequest, db: Session = Depends(get_db)):
     ).first()
 
     if not lic or not lic.is_active:
-        raise HTTPException(status_code=404, detail="Licence invalide ou révoquée.")
+        raise HTTPException(status_code=404, detail="Licence invalide.")
 
     if lic.expires_at and lic.expires_at < datetime.datetime.utcnow():
         raise HTTPException(status_code=403, detail="Licence expirée.")
+
+    devices = json.loads(lic.devices_list or "[]")
+    if device_id not in devices and len(devices) >= lic.max_devices:
+        raise HTTPException(status_code=403, detail="Appareil non autorisé.")
 
     return {
         "valid": True,
