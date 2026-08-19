@@ -37,7 +37,7 @@ class LicenseModel(Base):
     expires_at = Column(DateTime, nullable=True)
     max_devices = Column(Integer, default=1)
     used_devices = Column(Integer, default=0)
-    device_ids = Column(String, default="")  # Séparés par des virgules
+    device_ids = Column(String, default="")  # Identifiants séparés par des virgules
     is_active = Column(Boolean, default=True)
 
 Base.metadata.create_all(bind=engine)
@@ -108,11 +108,11 @@ def calculate_expiration(val: int, unit: str) -> datetime:
         return now + timedelta(days=val * 30)
 
 # ---------------------------------------------------------
-# Routes Publiques & Flutter
+# Routes Publiques, Health-Check & Flutter
 # ---------------------------------------------------------
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def root():
-    return {"status": "online", "service": "SmartCollect License API (FastAPI)"}
+    return {"status": "online", "service": "SmartCollect License API"}
 
 @app.post("/api/license/verify")
 def verify_license(payload: LicenseVerifyRequest, db: Session = Depends(get_db)):
@@ -194,7 +194,6 @@ def resend_email(key: str, db: Session = Depends(get_db)):
     lic = db.query(LicenseModel).filter(LicenseModel.key == key).first()
     if not lic:
         raise HTTPException(status_code=404, detail="Licence introuvable.")
-    # Logique d'envoi d'email simulée ou branchée à Resend/SMTP
     return {"message": f"Email envoyé à {lic.email}."}
 
 @app.delete("/api/admin/licenses/{key}")
