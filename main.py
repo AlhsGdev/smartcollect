@@ -342,3 +342,7 @@ def verify_license(req: LicenseActionRequest, db: Session = Depends(get_db)):
         "valid": True,
         "expires_at": lic.expires_at.isoformat() if lic.expires_at else None
     }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000)
