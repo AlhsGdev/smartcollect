@@ -16,6 +16,7 @@ from sqlalchemy.orm import declarative_base, sessionmaker, Session
 # ---------------------------------------------------------
 DB_FILE = os.environ.get("DB_PATH", "licenses.db")
 DATABASE_URL = f"sqlite:///{DB_FILE}"
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 
 engine = create_engine(
     DATABASE_URL, 
@@ -37,7 +38,7 @@ class LicenseModel(Base):
     expires_at = Column(DateTime, nullable=True)
     max_devices = Column(Integer, default=1)
     used_devices = Column(Integer, default=0)
-    device_ids = Column(String, default="")  # Séparés par des virgules
+    device_ids = Column(String, default="")
     is_active = Column(Boolean, default=True)
 
 Base.metadata.create_all(bind=engine)
@@ -48,7 +49,7 @@ Base.metadata.create_all(bind=engine)
 class LicenseCreateRequest(BaseModel):
     email: EmailStr
     duration_val: int = 1
-    duration_unit: str = "Mois"  # "Mois", "Jours", "Heures", "Minutes", "Ans"
+    duration_unit: str = "Mois"
     max_devices: int = 1
 
 class LicenseVerifyRequest(BaseModel):
@@ -89,7 +90,6 @@ def get_db():
         db.close()
 
 def generate_license_key() -> str:
-    # Format standard : ABCD-EFGH-IJKL-MNOP (4 blocs de 4 caractères alphanumériques majuscules)
     chars = string.ascii_uppercase + string.digits
     blocks = [''.join(secrets.choice(chars) for _ in range(4)) for _ in range(4)]
     return "-".join(blocks)
@@ -105,11 +105,75 @@ def calculate_expiration(val: int, unit: str) -> datetime:
         return now + timedelta(days=val)
     elif "an" in unit:
         return now + timedelta(days=val * 365)
-    else:  # Mois par défaut
+    else:
         return now + timedelta(days=val * 30)
 
+def send_license_email(to_email: str, license_key: str, expires_at: Optional[datetime], max_devices: int) -> bool:
+    if not RESEND_API_KEY:
+        print("ATTENTION: RESEND_API_KEY non configurée.")
+        return False
+
+    exp_str = expires_at.strftime("%d/%m/%Y à %H:%M UTC") if expires_at else "Illimitée"
+
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <style>
+        body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #0f172a; color: #f8fafc; padding: 24px; }}
+        .container {{ max-width: 520px; margin: 0 auto; background: #1e293b; border-radius: 12px; border: 1px solid #334155; padding: 32px; }}
+        .title {{ font-size: 22px; font-weight: bold; color: #ffffff; text-align: center; margin-bottom: 8px; }}
+        .subtitle {{ font-size: 14px; color: #94a3b8; text-align: center; margin-bottom: 24px; }}
+        .key-box {{ background: #0f172a; border: 2px dashed #6366f1; border-radius: 8px; padding: 18px; text-align: center; font-size: 22px; font-weight: bold; letter-spacing: 2px; color: #818cf8; font-family: monospace; margin-bottom: 24px; }}
+        .info-row {{ display: flex; justify-content: space-between; font-size: 13px; color: #cbd5e1; border-bottom: 1px solid #334155; padding: 10px 0; }}
+        .footer {{ font-size: 12px; color: #64748b; text-align: center; margin-top: 24px; }}
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <div class="title">Votre Clé d'Activation SmartCollect</div>
+        <div class="subtitle">Merci pour votre confiance. Voici vos identifiants d'activation :</div>
+        
+        <div class="key-box">{license_key}</div>
+
+        <div class="info-row">
+          <span>Date d'expiration :</span>
+          <strong>{exp_str}</strong>
+        </div>
+        <div class="info-row">
+          <span>Appareils autorisés :</span>
+          <strong>{max_devices} appareil(s)</strong>
+        </div>
+
+        <div class="footer">
+          Collez cette clé directement à l'ouverture de l'application SmartCollect pour débloquer votre accès.
+        </div>
+      </div>
+    </body>
+    </html>
+    """
+
+    headers = {
+        "Authorization": f"Bearer {RESEND_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "from": "SmartCollect <onboarding@resend.dev>",
+        "to": [to_email],
+        "subject": "Votre Clé de Licence SmartCollect",
+        "html": html_content
+    }
+
+    try:
+        res = requests.post("https://api.resend.com/emails", json=payload, headers=headers, timeout=10)
+        return res.status_code in [200, 201]
+    except Exception as e:
+        print(f"Erreur d'envoi d'email : {e}")
+        return False
+
 # ---------------------------------------------------------
-# Routes Publiques & Flutter
+# Routes Publiques, Health-Check & Flutter
 # ---------------------------------------------------------
 @app.api_route("/", methods=["GET", "HEAD"])
 def root():
@@ -171,6 +235,10 @@ def create_license(payload: LicenseCreateRequest, db: Session = Depends(get_db))
     db.add(lic)
     db.commit()
     db.refresh(lic)
+
+    # Envoi direct de l'email
+    send_license_email(lic.email, lic.key, lic.expires_at, lic.max_devices)
+
     return lic
 
 @app.post("/api/admin/licenses/{key}/status")
@@ -197,7 +265,12 @@ def resend_email(key: str, db: Session = Depends(get_db)):
     lic = db.query(LicenseModel).filter(LicenseModel.key == key.strip().upper()).first()
     if not lic:
         raise HTTPException(status_code=404, detail="Licence introuvable.")
-    return {"message": f"Email envoyé à {lic.email}."}
+    
+    sent = send_license_email(lic.email, lic.key, lic.expires_at, lic.max_devices)
+    if not sent:
+        raise HTTPException(status_code=500, detail="Échec de l'envoi de l'email via Resend.")
+
+    return {"message": f"Email renvoyé avec succès à {lic.email}."}
 
 @app.delete("/api/admin/licenses/{key}")
 def delete_license(key: str, db: Session = Depends(get_db)):
