@@ -12,7 +12,7 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 
 # ----------------- CONFIGURATION RESEND -----------------
-RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "re_123456789_votre_cle_resend")
 RESEND_SENDER = "SmartCollect <onboarding@resend.dev>"
 
 # ----------------- BASE DE DONNÉES -----------------
@@ -42,7 +42,7 @@ def get_db():
     finally:
         db.close()
 
-# ----------------- ENVOI EMAIL RESEND (ASYNC) -----------------
+# ----------------- ENVOI EMAIL RESEND (BACKGROUND TASK) -----------------
 def send_license_email_task(to_email: str, license_key: str, duration_str: str, max_dev: int):
     if not RESEND_API_KEY or "votre_cle" in RESEND_API_KEY:
         return
@@ -70,11 +70,11 @@ def send_license_email_task(to_email: str, license_key: str, duration_str: str, 
             <div style="color: #475569; font-size: 14px; line-height: 1.8;">
                 • <b>Durée de validité :</b> {duration_str}<br>
                 • <b>Appareils autorisés :</b> jusqu'à {max_dev} terminal/terminaux<br>
-                • <i>Le décompte commence dès la création de votre licence.</i>
+                • <i>Le décompte commence dès la génération de votre clé.</i>
             </div>
             
             <div style="text-align: center; color: #94a3b8; font-size: 12px; margin-top: 28px;">
-                SmartCollect Security System • Licence sécurisée
+                SmartCollect Security System • Licence Cloud
             </div>
         </div>
     </body>
@@ -97,7 +97,7 @@ def send_license_email_task(to_email: str, license_key: str, duration_str: str, 
 class LicenseCreateRequest(BaseModel):
     email: str
     duration_val: int = 1
-    duration_unit: str = "Mois"  # "Minutes", "Heures", "Jours", "Mois", "Ans"
+    duration_unit: str = "Mois"
     max_devices: int = 1
 
 class LicenseActionRequest(BaseModel):
@@ -122,7 +122,7 @@ app.add_middleware(
 def read_root():
     return {"status": "online", "service": "SmartCollect License API"}
 
-# ----------------- ENDPOINTS ADMIN -----------------
+# ----------------- ROUTES ADMINISTRATEUR -----------------
 @app.get("/api/admin/licenses")
 def get_all_licenses(db: Session = Depends(get_db)):
     rows = db.query(LicenseDB).order_by(LicenseDB.created_at.desc()).all()
@@ -149,7 +149,6 @@ def create_license(req: LicenseCreateRequest, background_tasks: BackgroundTasks,
     part2 = uuid.uuid4().hex[:4].upper()
     generated_key = f"APP-{part1}-{part2}"
 
-    # Calcul précis selon l'unité sélectionnée
     unit = req.duration_unit.strip().lower()
     val = max(1, req.duration_val)
 
@@ -194,8 +193,13 @@ def create_license(req: LicenseCreateRequest, background_tasks: BackgroundTasks,
     }
 
 @app.post("/api/admin/licenses/{license_id}/status")
-def toggle_license_status(license_id: int, db: Session = Depends(get_db)):
-    lic = db.query(LicenseDB).filter(LicenseDB.id == license_id).first()
+def toggle_license_status(license_id: str, db: Session = Depends(get_db)):
+    lic = None
+    if license_id.isdigit():
+        lic = db.query(LicenseDB).filter(LicenseDB.id == int(license_id)).first()
+    if not lic:
+        lic = db.query(LicenseDB).filter(LicenseDB.key.ilike(license_id.strip())).first()
+
     if not lic:
         raise HTTPException(status_code=404, detail="Licence introuvable")
     
@@ -203,30 +207,50 @@ def toggle_license_status(license_id: int, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(lic)
     
-    status_label = "autorisée et réactivée" if lic.is_active else "révoquée et bloquée"
-    return {"message": f"La licence {lic.key} est {status_label}.", "is_active": lic.is_active}
+    status_label = "autorisée et activée" if lic.is_active else "révoquée et bloquée"
+    return {
+        "message": f"La licence {lic.key} est désormais {status_label}.",
+        "is_active": lic.is_active
+    }
 
 @app.delete("/api/admin/licenses/{license_id}")
-def delete_license(license_id: int, db: Session = Depends(get_db)):
-    lic = db.query(LicenseDB).filter(LicenseDB.id == license_id).first()
+def delete_license(license_id: str, db: Session = Depends(get_db)):
+    lic = None
+    if license_id.isdigit():
+        lic = db.query(LicenseDB).filter(LicenseDB.id == int(license_id)).first()
+    if not lic:
+        lic = db.query(LicenseDB).filter(LicenseDB.key.ilike(license_id.strip())).first()
+
     if not lic:
         raise HTTPException(status_code=404, detail="Licence introuvable")
+    
     db.delete(lic)
     db.commit()
-    return {"message": "Licence supprimée"}
+    return {"message": "Licence supprimée avec succès"}
 
 @app.post("/api/admin/licenses/{license_id}/reset-devices")
-def reset_devices(license_id: int, db: Session = Depends(get_db)):
-    lic = db.query(LicenseDB).filter(LicenseDB.id == license_id).first()
+def reset_devices(license_id: str, db: Session = Depends(get_db)):
+    lic = None
+    if license_id.isdigit():
+        lic = db.query(LicenseDB).filter(LicenseDB.id == int(license_id)).first()
+    if not lic:
+        lic = db.query(LicenseDB).filter(LicenseDB.key.ilike(license_id.strip())).first()
+
     if not lic:
         raise HTTPException(status_code=404, detail="Licence introuvable")
+    
     lic.devices_list = "[]"
     db.commit()
     return {"message": "Appareils dissociés avec succès"}
 
 @app.post("/api/admin/licenses/{license_id}/resend-email")
-def resend_email_route(license_id: int, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    lic = db.query(LicenseDB).filter(LicenseDB.id == license_id).first()
+def resend_email_route(license_id: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    lic = None
+    if license_id.isdigit():
+        lic = db.query(LicenseDB).filter(LicenseDB.id == int(license_id)).first()
+    if not lic:
+        lic = db.query(LicenseDB).filter(LicenseDB.key.ilike(license_id.strip())).first()
+
     if not lic:
         raise HTTPException(status_code=404, detail="Licence introuvable")
     
@@ -250,7 +274,7 @@ def resend_email_route(license_id: int, background_tasks: BackgroundTasks, db: S
     background_tasks.add_task(send_license_email_task, lic.email, lic.key, duration_str, lic.max_devices)
     return {"message": "E-mail en cours d'envoi"}
 
-# ----------------- VALIDATION MOBILE FLUTTER -----------------
+# ----------------- CLIENT FLUTTER -----------------
 @app.post("/api/license/activate")
 def activate_license(req: LicenseActionRequest, db: Session = Depends(get_db)):
     clean_email = (req.email or "").strip().lower()
