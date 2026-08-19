@@ -1,6 +1,7 @@
 import os
 import uuid
 import datetime
+import requests
 from typing import Optional, List
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,7 +10,12 @@ from sqlalchemy import create_engine, Column, String, Boolean, DateTime, Integer
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 
-# ----------------- Base de Données -----------------
+# ----------------- CONFIGURATION RESEND -----------------
+# Vous pouvez définir la variable RESEND_API_KEY sur Fly.io ou la laisser ici
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
+RESEND_SENDER = "SmartCollect <onboarding@resend.dev>"  # Ou votre domaine vérifié
+
+# ----------------- BASE DE DONNÉES -----------------
 DATABASE_URL = "sqlite:///./licenses.db"
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -35,18 +41,73 @@ def get_db():
     finally:
         db.close()
 
-# ----------------- Modèles Pydantic -----------------
+# ----------------- FONCTION D'ENVOI D'EMAIL -----------------
+def send_license_email(to_email: str, license_key: str, duration_str: str):
+    url = "https://api.resend.com/emails"
+    headers = {
+        "Authorization": f"Bearer {RESEND_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <style>
+            body {{ font-family: 'Segoe UI', Arial, sans-serif; background-color: #f8fafc; margin: 0; padding: 20px; }}
+            .card {{ background-color: #ffffff; max-width: 520px; margin: auto; padding: 30px; border-radius: 16px; border: 1px solid #e2e8f0; }}
+            .title {{ font-size: 20px; font-weight: bold; color: #1e293b; text-align: center; }}
+            .key-box {{ background-color: #eef2ff; border: 2px solid #6366f1; border-radius: 12px; padding: 18px; text-align: center; margin: 24px 0; }}
+            .key-text {{ font-size: 24px; font-weight: 800; color: #4338ca; letter-spacing: 2px; }}
+            .details {{ color: #475569; font-size: 14px; line-height: 1.6; }}
+            .footer {{ text-align: center; color: #94a3b8; font-size: 12px; margin-top: 24px; }}
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <div class="title">SmartCollect — Clé d'Activation</div>
+            <p style="color: #334155; font-size: 15px; margin-top: 20px;">Bonjour,</p>
+            <p style="color: #334155; font-size: 14px;">Voici votre clé d'activation officielle pour l'application <b>SmartCollect</b> :</p>
+            
+            <div class="key-box">
+                <div class="key-text">{license_key}</div>
+            </div>
+            
+            <div class="details">
+                • <b>Durée de validité :</b> {duration_str}<br>
+                • <b>Appareils autorisés :</b> 1 appareil actif<br>
+                • <i>Le décompte commence dès votre première activation sur l'application.</i>
+            </div>
+            
+            <div class="footer">
+                SmartCollect Security System • Ne partagez pas cette clé.
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+    payload = {
+        "from": RESEND_SENDER,
+        "to": [to_email],
+        "subject": f"Votre Clé d'Activation SmartCollect ({duration_str})",
+        "html": html_content
+    }
+
+    try:
+        res = requests.post(url, headers=headers, json=payload, timeout=10)
+        return res.status_code in [200, 201]
+    except Exception as e:
+        print(f"Erreur envoi email: {e}")
+        return False
+
+# ----------------- MODÈLES PYDANTIC -----------------
 class LicenseCreateRequest(BaseModel):
     email: str
     duration_days: int = 30
     duration_hours: int = 0
     duration_minutes: int = 0
-
-class LicenseUpdateRequest(BaseModel):
-    email: Optional[str] = None
-    duration_days: Optional[int] = None
-    duration_hours: Optional[int] = None
-    duration_minutes: Optional[int] = None
 
 class LicenseActionRequest(BaseModel):
     email: Optional[str] = None
@@ -67,7 +128,7 @@ class LicenseResponse(BaseModel):
     class Config:
         from_attributes = True
 
-# ----------------- Application FastAPI -----------------
+# ----------------- APPLICATION FASTAPI -----------------
 app = FastAPI(title="SmartCollect License API")
 
 app.add_middleware(
@@ -82,7 +143,7 @@ app.add_middleware(
 def read_root():
     return {"status": "online", "service": "SmartCollect License API (FastAPI)"}
 
-# ----------------- Routes Administrateur (PySide6) -----------------
+# ----------------- ROUTES ADMINISTRATION -----------------
 @app.get("/api/admin/licenses", response_model=List[LicenseResponse])
 def get_all_licenses(db: Session = Depends(get_db)):
     return db.query(LicenseDB).order_by(LicenseDB.created_at.desc()).all()
@@ -91,7 +152,7 @@ def get_all_licenses(db: Session = Depends(get_db)):
 def create_license(req: LicenseCreateRequest, db: Session = Depends(get_db)):
     clean_email = req.email.strip().lower()
     
-    # Génération clé au format APP-XXXX-XXXX
+    # Format de clé identique à vos emails : APP-XXXX-XXXX
     part1 = uuid.uuid4().hex[:4].upper()
     part2 = uuid.uuid4().hex[:4].upper()
     generated_key = f"APP-{part1}-{part2}"
@@ -112,27 +173,11 @@ def create_license(req: LicenseCreateRequest, db: Session = Depends(get_db)):
     db.add(lic)
     db.commit()
     db.refresh(lic)
-    return lic
 
-@app.put("/api/admin/licenses/{license_id}", response_model=LicenseResponse)
-def update_license(license_id: int, req: LicenseUpdateRequest, db: Session = Depends(get_db)):
-    lic = db.query(LicenseDB).filter(LicenseDB.id == license_id).first()
-    if not lic:
-        raise HTTPException(status_code=404, detail="Licence introuvable")
+    # Déclenchement automatique de l'envoi de l'e-mail
+    duration_label = f"{req.duration_days}j {req.duration_hours}h {req.duration_minutes}min"
+    send_license_email(clean_email, generated_key, duration_label)
 
-    if req.email:
-        lic.email = req.email.strip().lower()
-
-    if req.duration_days is not None:
-        total_delta = datetime.timedelta(
-            days=req.duration_days,
-            hours=req.duration_hours or 0,
-            minutes=req.duration_minutes or 0
-        )
-        lic.expires_at = datetime.datetime.utcnow() + total_delta
-
-    db.commit()
-    db.refresh(lic)
     return lic
 
 @app.delete("/api/admin/licenses/{license_id}")
@@ -144,16 +189,23 @@ def delete_license(license_id: int, db: Session = Depends(get_db)):
     db.commit()
     return {"message": "Licence supprimée avec succès"}
 
-@app.post("/api/admin/licenses/{license_id}/reset")
-def reset_device(license_id: int, db: Session = Depends(get_db)):
+@app.post("/api/admin/licenses/{license_id}/resend-email")
+def resend_email_route(license_id: int, db: Session = Depends(get_db)):
     lic = db.query(LicenseDB).filter(LicenseDB.id == license_id).first()
     if not lic:
         raise HTTPException(status_code=404, detail="Licence introuvable")
-    lic.device_uuid = None
-    db.commit()
-    return {"message": "Appareil dissocié avec succès"}
+    
+    duration_str = "Valide"
+    if lic.expires_at:
+        remaining = lic.expires_at - datetime.datetime.utcnow()
+        duration_str = f"{max(0, remaining.days)} jours restants"
 
-# ----------------- Routes Application Flutter -----------------
+    success = send_license_email(lic.email, lic.key, duration_str)
+    if not success:
+        raise HTTPException(status_code=500, detail="Échec lors de l'envoi du mail via Resend")
+    return {"message": "E-mail renvoyé avec succès"}
+
+# ----------------- ROUTES APPLICATION FLUTTER -----------------
 @app.post("/api/license/activate")
 def activate_license(req: LicenseActionRequest, db: Session = Depends(get_db)):
     clean_email = (req.email or "").strip().lower()
@@ -183,8 +235,7 @@ def activate_license(req: LicenseActionRequest, db: Session = Depends(get_db)):
         db.commit()
         db.refresh(lic)
     elif req.device_uuid and lic.device_uuid != req.device_uuid:
-        # Multi-poste : si besoin de restreindre à un seul poste, décommentez la ligne ci-dessous :
-        # raise HTTPException(status_code=403, detail="Licence déjà utilisée sur un autre appareil.")
+        # Enlever la restriction si vous souhaitez autoriser la même clé sur plusieurs postes
         pass
 
     return {
