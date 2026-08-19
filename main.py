@@ -28,7 +28,7 @@ class LicenseDB(Base):
     key = Column(String, unique=True, index=True, nullable=False)
     email = Column(String, index=True, nullable=False)
     max_devices = Column(Integer, default=1)
-    devices_list = Column(Text, default="[]")  # Liste JSON des UUIDs
+    devices_list = Column(Text, default="[]")
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     expires_at = Column(DateTime, nullable=True)
@@ -42,7 +42,7 @@ def get_db():
     finally:
         db.close()
 
-# ----------------- FONCTION D'ENVOI D'EMAIL -----------------
+# ----------------- ENVOI D'EMAIL EN TÂCHE DE FOND -----------------
 def send_license_email_task(to_email: str, license_key: str, duration_str: str, max_dev: int):
     if not RESEND_API_KEY or "votre_cle" in RESEND_API_KEY:
         return
@@ -97,7 +97,7 @@ def send_license_email_task(to_email: str, license_key: str, duration_str: str, 
 class LicenseCreateRequest(BaseModel):
     email: str
     duration_val: int = 1
-    duration_unit: str = "Mois"  # "Jours", "Mois", "Ans"
+    duration_unit: str = "Mois"
     max_devices: int = 1
 
 class LicenseActionRequest(BaseModel):
@@ -107,18 +107,8 @@ class LicenseActionRequest(BaseModel):
     cle: Optional[str] = None
     device_uuid: Optional[str] = None
 
-class LicenseResponse(BaseModel):
-    id: int
-    key: str
-    email: str
-    max_devices: int
-    used_devices: int
-    is_active: bool
-    created_at: datetime.datetime
-    expires_at: Optional[datetime.datetime]
-
-# ----------------- FASTAPI APP -----------------
-app = FastAPI(title="SmartCollect Cloud License API")
+# ----------------- APPLICATION FASTAPI -----------------
+app = FastAPI(title="SmartCollect License API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -130,8 +120,9 @@ app.add_middleware(
 
 @app.get("/")
 def read_root():
-    return {"status": "online", "service": "SmartCollect Cloud API"}
+    return {"status": "online", "service": "SmartCollect License API"}
 
+# ----------------- GESTION ADMIN -----------------
 @app.get("/api/admin/licenses")
 def get_all_licenses(db: Session = Depends(get_db)):
     rows = db.query(LicenseDB).order_by(LicenseDB.created_at.desc()).all()
@@ -158,7 +149,6 @@ def create_license(req: LicenseCreateRequest, background_tasks: BackgroundTasks,
     part2 = uuid.uuid4().hex[:4].upper()
     generated_key = f"APP-{part1}-{part2}"
 
-    # Calcul de la durée
     days = 0
     if req.duration_unit == "Jours":
         days = req.duration_val
@@ -192,8 +182,22 @@ def create_license(req: LicenseCreateRequest, background_tasks: BackgroundTasks,
         "email": lic.email,
         "max_devices": lic.max_devices,
         "used_devices": 0,
+        "is_active": lic.is_active,
         "expires_at": lic.expires_at.isoformat()
     }
+
+@app.post("/api/admin/licenses/{license_id}/status")
+def toggle_license_status(license_id: int, db: Session = Depends(get_db)):
+    lic = db.query(LicenseDB).filter(LicenseDB.id == license_id).first()
+    if not lic:
+        raise HTTPException(status_code=404, detail="Licence introuvable")
+    
+    lic.is_active = not lic.is_active
+    db.commit()
+    db.refresh(lic)
+    
+    status_label = "autorisée et activée" if lic.is_active else "révoquée et bloquée"
+    return {"message": f"La licence {lic.key} est désormais {status_label}.", "is_active": lic.is_active}
 
 @app.delete("/api/admin/licenses/{license_id}")
 def delete_license(license_id: int, db: Session = Depends(get_db)):
@@ -224,7 +228,7 @@ def resend_email_route(license_id: int, background_tasks: BackgroundTasks, db: S
     background_tasks.add_task(send_license_email_task, lic.email, lic.key, duration_str, lic.max_devices)
     return {"message": "Envoi initié"}
 
-# ----------------- FLUTTER ACTIVATION MULTI-APPAREILS -----------------
+# ----------------- CLIENT FLUTTER -----------------
 @app.post("/api/license/activate")
 def activate_license(req: LicenseActionRequest, db: Session = Depends(get_db)):
     clean_email = (req.email or "").strip().lower()
@@ -244,18 +248,17 @@ def activate_license(req: LicenseActionRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Clé de licence introuvable.")
 
     if not lic.is_active:
-        raise HTTPException(status_code=403, detail="Cette licence a été révoquée.")
+        raise HTTPException(status_code=403, detail="Cette licence a été révoquée par l'administrateur.")
 
     if lic.expires_at and lic.expires_at < datetime.datetime.utcnow():
         raise HTTPException(status_code=403, detail="Cette licence a expiré.")
 
-    # Gestion de la liste des appareils
     devices = json.loads(lic.devices_list or "[]")
     if device_id not in devices:
         if len(devices) >= lic.max_devices:
             raise HTTPException(
                 status_code=403,
-                detail=f"Limite atteinte ({lic.max_devices} appareil(s) maximum autorisés)."
+                detail=f"Limite atteinte ({lic.max_devices} appareil(s) max)."
             )
         devices.append(device_id)
         lic.devices_list = json.dumps(devices)
@@ -280,7 +283,7 @@ def verify_license(req: LicenseActionRequest, db: Session = Depends(get_db)):
     ).first()
 
     if not lic or not lic.is_active:
-        raise HTTPException(status_code=404, detail="Licence invalide.")
+        raise HTTPException(status_code=404, detail="Licence invalide ou révoquée.")
 
     if lic.expires_at and lic.expires_at < datetime.datetime.utcnow():
         raise HTTPException(status_code=403, detail="Licence expirée.")
