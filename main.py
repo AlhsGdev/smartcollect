@@ -12,7 +12,7 @@ from sqlalchemy import Column, Integer, String, Boolean, DateTime, create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
 # ---------------------------------------------------------
-# Configuration Base de données (Compatible Local & Render)
+# Configuration Base de données (SQLite Local & Render)
 # ---------------------------------------------------------
 DB_FILE = os.environ.get("DB_PATH", "licenses.db")
 DATABASE_URL = f"sqlite:///{DB_FILE}"
@@ -37,7 +37,7 @@ class LicenseModel(Base):
     expires_at = Column(DateTime, nullable=True)
     max_devices = Column(Integer, default=1)
     used_devices = Column(Integer, default=0)
-    device_ids = Column(String, default="")  # Identifiants séparés par des virgules
+    device_ids = Column(String, default="")  # Séparés par des virgules
     is_active = Column(Boolean, default=True)
 
 Base.metadata.create_all(bind=engine)
@@ -89,9 +89,10 @@ def get_db():
         db.close()
 
 def generate_license_key() -> str:
+    # Format standard : ABCD-EFGH-IJKL-MNOP (4 blocs de 4 caractères alphanumériques majuscules)
     chars = string.ascii_uppercase + string.digits
-    segments = [''.join(secrets.choice(chars) for _ in range(4)) for _ in range(4)]
-    return f"SC-{'-'.join(segments)}"
+    blocks = [''.join(secrets.choice(chars) for _ in range(4)) for _ in range(4)]
+    return "-".join(blocks)
 
 def calculate_expiration(val: int, unit: str) -> datetime:
     now = datetime.utcnow()
@@ -108,7 +109,7 @@ def calculate_expiration(val: int, unit: str) -> datetime:
         return now + timedelta(days=val * 30)
 
 # ---------------------------------------------------------
-# Routes Publiques, Health-Check & Flutter
+# Routes Publiques & Flutter
 # ---------------------------------------------------------
 @app.api_route("/", methods=["GET", "HEAD"])
 def root():
@@ -116,7 +117,9 @@ def root():
 
 @app.post("/api/license/verify")
 def verify_license(payload: LicenseVerifyRequest, db: Session = Depends(get_db)):
-    lic = db.query(LicenseModel).filter(LicenseModel.key == payload.key.strip()).first()
+    clean_key = payload.key.strip().upper()
+    lic = db.query(LicenseModel).filter(LicenseModel.key == clean_key).first()
+    
     if not lic:
         raise HTTPException(status_code=404, detail="Licence introuvable.")
     
@@ -172,7 +175,7 @@ def create_license(payload: LicenseCreateRequest, db: Session = Depends(get_db))
 
 @app.post("/api/admin/licenses/{key}/status")
 def toggle_license_status(key: str, db: Session = Depends(get_db)):
-    lic = db.query(LicenseModel).filter(LicenseModel.key == key).first()
+    lic = db.query(LicenseModel).filter(LicenseModel.key == key.strip().upper()).first()
     if not lic:
         raise HTTPException(status_code=404, detail="Licence introuvable.")
     lic.is_active = not lic.is_active
@@ -181,7 +184,7 @@ def toggle_license_status(key: str, db: Session = Depends(get_db)):
 
 @app.post("/api/admin/licenses/{key}/reset-devices")
 def reset_devices(key: str, db: Session = Depends(get_db)):
-    lic = db.query(LicenseModel).filter(LicenseModel.key == key).first()
+    lic = db.query(LicenseModel).filter(LicenseModel.key == key.strip().upper()).first()
     if not lic:
         raise HTTPException(status_code=404, detail="Licence introuvable.")
     lic.device_ids = ""
@@ -191,14 +194,14 @@ def reset_devices(key: str, db: Session = Depends(get_db)):
 
 @app.post("/api/admin/licenses/{key}/resend-email")
 def resend_email(key: str, db: Session = Depends(get_db)):
-    lic = db.query(LicenseModel).filter(LicenseModel.key == key).first()
+    lic = db.query(LicenseModel).filter(LicenseModel.key == key.strip().upper()).first()
     if not lic:
         raise HTTPException(status_code=404, detail="Licence introuvable.")
     return {"message": f"Email envoyé à {lic.email}."}
 
 @app.delete("/api/admin/licenses/{key}")
 def delete_license(key: str, db: Session = Depends(get_db)):
-    lic = db.query(LicenseModel).filter(LicenseModel.key == key).first()
+    lic = db.query(LicenseModel).filter(LicenseModel.key == key.strip().upper()).first()
     if not lic:
         raise HTTPException(status_code=404, detail="Licence introuvable.")
     db.delete(lic)
