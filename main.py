@@ -12,11 +12,16 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 
 # ----------------- CONFIGURATION RESEND -----------------
-RESEND_API_KEY = os.getenv("RESEND_API_KEY", "re_123456789_votre_cle_resend")
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 RESEND_SENDER = "SmartCollect <onboarding@resend.dev>"
 
-# ----------------- BASE DE DONNÉES -----------------
-DATABASE_URL = "sqlite:///./licenses.db"
+# ----------------- BASE DE DONNÉES PERSISTANTE -----------------
+# Utilise le volume /data si disponible sur Fly.io, sinon le dossier local
+if os.path.exists("/data"):
+    DATABASE_URL = "sqlite:////data/licenses.db"
+else:
+    DATABASE_URL = "sqlite:///./licenses.db"
+
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -42,7 +47,7 @@ def get_db():
     finally:
         db.close()
 
-# ----------------- ENVOI EMAIL RESEND (BACKGROUND TASK) -----------------
+# ----------------- ENVOI D'EMAIL RESEND (ASYNC) -----------------
 def send_license_email_task(to_email: str, license_key: str, duration_str: str, max_dev: int):
     if not RESEND_API_KEY or "votre_cle" in RESEND_API_KEY:
         return
@@ -70,11 +75,11 @@ def send_license_email_task(to_email: str, license_key: str, duration_str: str, 
             <div style="color: #475569; font-size: 14px; line-height: 1.8;">
                 • <b>Durée de validité :</b> {duration_str}<br>
                 • <b>Appareils autorisés :</b> jusqu'à {max_dev} terminal/terminaux<br>
-                • <i>Le décompte commence dès la génération de votre clé.</i>
+                • <i>Le décompte commence dès la création de votre licence.</i>
             </div>
             
             <div style="text-align: center; color: #94a3b8; font-size: 12px; margin-top: 28px;">
-                SmartCollect Security System • Licence Cloud
+                SmartCollect Security System • Licence sécurisée
             </div>
         </div>
     </body>
@@ -122,7 +127,7 @@ app.add_middleware(
 def read_root():
     return {"status": "online", "service": "SmartCollect License API"}
 
-# ----------------- ROUTES ADMINISTRATEUR -----------------
+# ----------------- ENDPOINTS ADMIN -----------------
 @app.get("/api/admin/licenses")
 def get_all_licenses(db: Session = Depends(get_db)):
     rows = db.query(LicenseDB).order_by(LicenseDB.created_at.desc()).all()
@@ -194,14 +199,17 @@ def create_license(req: LicenseCreateRequest, background_tasks: BackgroundTasks,
 
 @app.post("/api/admin/licenses/{license_id}/status")
 def toggle_license_status(license_id: str, db: Session = Depends(get_db)):
-    lic = None
-    if license_id.isdigit():
-        lic = db.query(LicenseDB).filter(LicenseDB.id == int(license_id)).first()
-    if not lic:
-        lic = db.query(LicenseDB).filter(LicenseDB.key.ilike(license_id.strip())).first()
+    target = license_id.strip()
+    
+    # Recherche par la clé unique (APP-XXXX-XXXX)
+    lic = db.query(LicenseDB).filter(LicenseDB.key.ilike(target)).first()
+    
+    # Recherche de repli par ID numérique
+    if not lic and target.isdigit():
+        lic = db.query(LicenseDB).filter(LicenseDB.id == int(target)).first()
 
     if not lic:
-        raise HTTPException(status_code=404, detail="Licence introuvable")
+        raise HTTPException(status_code=404, detail="Licence introuvable sur le serveur")
     
     lic.is_active = not lic.is_active
     db.commit()
@@ -209,32 +217,30 @@ def toggle_license_status(license_id: str, db: Session = Depends(get_db)):
     
     status_label = "autorisée et activée" if lic.is_active else "révoquée et bloquée"
     return {
-        "message": f"La licence {lic.key} est désormais {status_label}.",
+        "message": f"La licence {lic.key} est {status_label}.",
         "is_active": lic.is_active
     }
 
 @app.delete("/api/admin/licenses/{license_id}")
 def delete_license(license_id: str, db: Session = Depends(get_db)):
-    lic = None
-    if license_id.isdigit():
-        lic = db.query(LicenseDB).filter(LicenseDB.id == int(license_id)).first()
-    if not lic:
-        lic = db.query(LicenseDB).filter(LicenseDB.key.ilike(license_id.strip())).first()
+    target = license_id.strip()
+    lic = db.query(LicenseDB).filter(LicenseDB.key.ilike(target)).first()
+    if not lic and target.isdigit():
+        lic = db.query(LicenseDB).filter(LicenseDB.id == int(target)).first()
 
     if not lic:
         raise HTTPException(status_code=404, detail="Licence introuvable")
     
     db.delete(lic)
     db.commit()
-    return {"message": "Licence supprimée avec succès"}
+    return {"message": "Licence supprimée"}
 
 @app.post("/api/admin/licenses/{license_id}/reset-devices")
 def reset_devices(license_id: str, db: Session = Depends(get_db)):
-    lic = None
-    if license_id.isdigit():
-        lic = db.query(LicenseDB).filter(LicenseDB.id == int(license_id)).first()
-    if not lic:
-        lic = db.query(LicenseDB).filter(LicenseDB.key.ilike(license_id.strip())).first()
+    target = license_id.strip()
+    lic = db.query(LicenseDB).filter(LicenseDB.key.ilike(target)).first()
+    if not lic and target.isdigit():
+        lic = db.query(LicenseDB).filter(LicenseDB.id == int(target)).first()
 
     if not lic:
         raise HTTPException(status_code=404, detail="Licence introuvable")
@@ -245,11 +251,10 @@ def reset_devices(license_id: str, db: Session = Depends(get_db)):
 
 @app.post("/api/admin/licenses/{license_id}/resend-email")
 def resend_email_route(license_id: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    lic = None
-    if license_id.isdigit():
-        lic = db.query(LicenseDB).filter(LicenseDB.id == int(license_id)).first()
-    if not lic:
-        lic = db.query(LicenseDB).filter(LicenseDB.key.ilike(license_id.strip())).first()
+    target = license_id.strip()
+    lic = db.query(LicenseDB).filter(LicenseDB.key.ilike(target)).first()
+    if not lic and target.isdigit():
+        lic = db.query(LicenseDB).filter(LicenseDB.id == int(target)).first()
 
     if not lic:
         raise HTTPException(status_code=404, detail="Licence introuvable")
@@ -274,7 +279,7 @@ def resend_email_route(license_id: str, background_tasks: BackgroundTasks, db: S
     background_tasks.add_task(send_license_email_task, lic.email, lic.key, duration_str, lic.max_devices)
     return {"message": "E-mail en cours d'envoi"}
 
-# ----------------- CLIENT FLUTTER -----------------
+# ----------------- VALIDATION CLIENT FLUTTER -----------------
 @app.post("/api/license/activate")
 def activate_license(req: LicenseActionRequest, db: Session = Depends(get_db)):
     clean_email = (req.email or "").strip().lower()
@@ -343,6 +348,7 @@ def verify_license(req: LicenseActionRequest, db: Session = Depends(get_db)):
         "expires_at": lic.expires_at.isoformat() if lic.expires_at else None
     }
 
+# ----------------- POINT D'ENTRÉE UVICORN -----------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000)
