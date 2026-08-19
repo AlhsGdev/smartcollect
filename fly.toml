@@ -1,19 +1,25 @@
+# fly.toml app configuration file generated for smartcollect on 2026-08-19T10:07:14Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
 app = "smartcollect"
-primary_region = "ams"
+primary_region = 'ams'
 
 [http_service]
   internal_port = 8000
   force_https = true
-  auto_stop_machines = "off"
+  auto_stop_machines = false
   auto_start_machines = true
-  min_machines_running = 1
-  processes = ["app"]
+  min_machines_running = 0
+  processes = ['app']
 
 [mounts]
   source = "data"
   destination = "/data"
 
 [[vm]]
-  cpu_kind = "shared"
+  cpu_kind = 'shared'
   cpus = 1
   memory_mb = 256
+  memory = '1gb'
