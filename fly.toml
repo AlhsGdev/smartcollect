@@ -9,6 +9,10 @@ primary_region = "ams"
   min_machines_running = 1
   processes = ["app"]
 
+[mounts]
+  source = "data"
+  destination = "/data"
+
 [[vm]]
   cpu_kind = "shared"
   cpus = 1
