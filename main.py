@@ -42,7 +42,7 @@ def get_db():
     finally:
         db.close()
 
-# ----------------- ENVOI D'EMAIL EN TÂCHE DE FOND -----------------
+# ----------------- ENVOI EMAIL RESEND (ASYNC) -----------------
 def send_license_email_task(to_email: str, license_key: str, duration_str: str, max_dev: int):
     if not RESEND_API_KEY or "votre_cle" in RESEND_API_KEY:
         return
@@ -69,12 +69,12 @@ def send_license_email_task(to_email: str, license_key: str, duration_str: str, 
             
             <div style="color: #475569; font-size: 14px; line-height: 1.8;">
                 • <b>Durée de validité :</b> {duration_str}<br>
-                • <b>Appareils autorisés :</b> jusqu'à {max_dev} appareil(s)<br>
-                • <i>Le décompte commence dès votre première activation.</i>
+                • <b>Appareils autorisés :</b> jusqu'à {max_dev} terminal/terminaux<br>
+                • <i>Le décompte commence dès la création de votre licence.</i>
             </div>
             
             <div style="text-align: center; color: #94a3b8; font-size: 12px; margin-top: 28px;">
-                SmartCollect Security System • Ne partagez pas cette clé.
+                SmartCollect Security System • Licence sécurisée
             </div>
         </div>
     </body>
@@ -97,7 +97,7 @@ def send_license_email_task(to_email: str, license_key: str, duration_str: str, 
 class LicenseCreateRequest(BaseModel):
     email: str
     duration_val: int = 1
-    duration_unit: str = "Mois"
+    duration_unit: str = "Mois"  # "Minutes", "Heures", "Jours", "Mois", "Ans"
     max_devices: int = 1
 
 class LicenseActionRequest(BaseModel):
@@ -108,7 +108,7 @@ class LicenseActionRequest(BaseModel):
     device_uuid: Optional[str] = None
 
 # ----------------- APPLICATION FASTAPI -----------------
-app = FastAPI(title="SmartCollect License API")
+app = FastAPI(title="SmartCollect Cloud API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -122,7 +122,7 @@ app.add_middleware(
 def read_root():
     return {"status": "online", "service": "SmartCollect License API"}
 
-# ----------------- GESTION ADMIN -----------------
+# ----------------- ENDPOINTS ADMIN -----------------
 @app.get("/api/admin/licenses")
 def get_all_licenses(db: Session = Depends(get_db)):
     rows = db.query(LicenseDB).order_by(LicenseDB.created_at.desc()).all()
@@ -149,17 +149,24 @@ def create_license(req: LicenseCreateRequest, background_tasks: BackgroundTasks,
     part2 = uuid.uuid4().hex[:4].upper()
     generated_key = f"APP-{part1}-{part2}"
 
-    days = 0
-    if req.duration_unit == "Jours":
-        days = req.duration_val
-    elif req.duration_unit == "Mois":
-        days = req.duration_val * 30
-    elif req.duration_unit == "Ans":
-        days = req.duration_val * 365
-    else:
-        days = req.duration_val
+    # Calcul précis selon l'unité sélectionnée
+    unit = req.duration_unit.strip().lower()
+    val = max(1, req.duration_val)
 
-    expires_at = datetime.datetime.utcnow() + datetime.timedelta(days=days)
+    if unit in ["minute", "minutes", "min"]:
+        delta = datetime.timedelta(minutes=val)
+    elif unit in ["heure", "heures", "h"]:
+        delta = datetime.timedelta(hours=val)
+    elif unit in ["jour", "jours", "j"]:
+        delta = datetime.timedelta(days=val)
+    elif unit in ["mois", "m"]:
+        delta = datetime.timedelta(days=val * 30)
+    elif unit in ["an", "ans", "année", "années", "a"]:
+        delta = datetime.timedelta(days=val * 365)
+    else:
+        delta = datetime.timedelta(days=val)
+
+    expires_at = datetime.datetime.utcnow() + delta
 
     lic = LicenseDB(
         key=generated_key,
@@ -196,8 +203,8 @@ def toggle_license_status(license_id: int, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(lic)
     
-    status_label = "autorisée et activée" if lic.is_active else "révoquée et bloquée"
-    return {"message": f"La licence {lic.key} est désormais {status_label}.", "is_active": lic.is_active}
+    status_label = "autorisée et réactivée" if lic.is_active else "révoquée et bloquée"
+    return {"message": f"La licence {lic.key} est {status_label}.", "is_active": lic.is_active}
 
 @app.delete("/api/admin/licenses/{license_id}")
 def delete_license(license_id: int, db: Session = Depends(get_db)):
@@ -215,7 +222,7 @@ def reset_devices(license_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Licence introuvable")
     lic.devices_list = "[]"
     db.commit()
-    return {"message": "Appareils réinitialisés"}
+    return {"message": "Appareils dissociés avec succès"}
 
 @app.post("/api/admin/licenses/{license_id}/resend-email")
 def resend_email_route(license_id: int, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
@@ -223,12 +230,27 @@ def resend_email_route(license_id: int, background_tasks: BackgroundTasks, db: S
     if not lic:
         raise HTTPException(status_code=404, detail="Licence introuvable")
     
-    remaining = lic.expires_at - datetime.datetime.utcnow() if lic.expires_at else None
-    duration_str = f"{max(0, remaining.days)} jours restants" if remaining else "Illimité"
-    background_tasks.add_task(send_license_email_task, lic.email, lic.key, duration_str, lic.max_devices)
-    return {"message": "Envoi initié"}
+    duration_str = "Valide"
+    if lic.expires_at:
+        diff = lic.expires_at - datetime.datetime.utcnow()
+        if diff.total_seconds() > 0:
+            hours, remainder = divmod(int(diff.total_seconds()), 3600)
+            minutes, _ = divmod(remainder, 60)
+            days = hours // 24
+            hours = hours % 24
+            if days > 0:
+                duration_str = f"{days}j {hours}h restants"
+            elif hours > 0:
+                duration_str = f"{hours}h {minutes}min restants"
+            else:
+                duration_str = f"{minutes} min restantes"
+        else:
+            duration_str = "Expirée"
 
-# ----------------- CLIENT FLUTTER -----------------
+    background_tasks.add_task(send_license_email_task, lic.email, lic.key, duration_str, lic.max_devices)
+    return {"message": "E-mail en cours d'envoi"}
+
+# ----------------- VALIDATION MOBILE FLUTTER -----------------
 @app.post("/api/license/activate")
 def activate_license(req: LicenseActionRequest, db: Session = Depends(get_db)):
     clean_email = (req.email or "").strip().lower()
@@ -237,7 +259,7 @@ def activate_license(req: LicenseActionRequest, db: Session = Depends(get_db)):
     device_id = req.device_uuid or "unknown_device"
 
     if not clean_email or not clean_key:
-        raise HTTPException(status_code=400, detail="E-mail et clé requis.")
+        raise HTTPException(status_code=400, detail="E-mail et clé d'activation requis.")
 
     lic = db.query(LicenseDB).filter(
         LicenseDB.email.ilike(clean_email),
@@ -258,7 +280,7 @@ def activate_license(req: LicenseActionRequest, db: Session = Depends(get_db)):
         if len(devices) >= lic.max_devices:
             raise HTTPException(
                 status_code=403,
-                detail=f"Limite atteinte ({lic.max_devices} appareil(s) max)."
+                detail=f"Nombre maximum d'appareils atteint ({lic.max_devices} autorisé(s))."
             )
         devices.append(device_id)
         lic.devices_list = json.dumps(devices)
@@ -266,7 +288,7 @@ def activate_license(req: LicenseActionRequest, db: Session = Depends(get_db)):
 
     return {
         "success": True,
-        "message": "Licence activée avec succès !",
+        "message": "Activation réussie !",
         "expires_at": lic.expires_at.isoformat() if lic.expires_at else None
     }
 
