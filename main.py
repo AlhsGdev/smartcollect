@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 
 import requests
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text
@@ -17,7 +17,6 @@ from sqlalchemy.orm import declarative_base, sessionmaker, Session
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 SENDER_EMAIL = os.getenv("SENDER_EMAIL", "onboarding@resend.dev")
 
-# Connexion PostgreSQL (Neon / Supabase / Render) ou SQLite local de secours
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./licenses.db")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
@@ -45,6 +44,9 @@ class LicenseKey(Base):
     id = Column(Integer, primary_key=True, index=True)
     key = Column(String(32), unique=True, index=True, nullable=False)
     assigned_to_email = Column(String(255), nullable=False, index=True)
+    first_name = Column(String(100), default="", nullable=True)
+    last_name = Column(String(100), default="", nullable=True)
+    organization = Column(String(150), default="", nullable=True)
     is_active = Column(Boolean, default=True)
     device_uuid = Column(Text, default="[]")
     max_devices = Column(Integer, default=1)
@@ -83,7 +85,9 @@ app.add_middleware(
 class FlutterVerifyRequest(BaseModel):
     key: str
     device_id: str
-    email: Optional[str] = None
+    first_name: Optional[str] = ""
+    last_name: Optional[str] = ""
+    organization: Optional[str] = ""
 
 class CreateLicenseGUIRequest(BaseModel):
     email: EmailStr
@@ -92,7 +96,7 @@ class CreateLicenseGUIRequest(BaseModel):
     max_devices: int = 1
 
 # ==========================================
-# UTILITAIRE D'ENVOI D'EMAIL
+# SERVICE D'ENVOI D'EMAIL
 # ==========================================
 def send_license_email(recipient_email: str, license_key: str, duration_str: str, max_dev: int) -> bool:
     if not RESEND_API_KEY:
@@ -128,7 +132,7 @@ def send_license_email(recipient_email: str, license_key: str, duration_str: str
         return False
 
 # ==========================================
-# ROUTES PUBLIQUES & PING UPTIMEROBOT
+# ROUTES PUBLIQUES
 # ==========================================
 @app.get("/")
 def read_root():
@@ -139,7 +143,7 @@ def health_check():
     return {"status": "healthy"}
 
 # ==========================================
-# ROUTE VALIDATION / ACTIVATION FLUTTER
+# ROUTE ACTIVATION FLUTTER (AVEC PROFIL CLOUD)
 # ==========================================
 @app.post("/api/license/verify")
 def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(get_db)):
@@ -155,6 +159,14 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
     now = get_utc_now()
     if license_entry.expires_at and now > license_entry.expires_at:
         raise HTTPException(status_code=403, detail="Cette licence a expiré. Veuillez renouveler votre formule.")
+
+    # Enregistrement / mise à jour des informations de profil
+    if req.first_name and req.first_name.strip():
+        license_entry.first_name = req.first_name.strip()
+    if req.last_name and req.last_name.strip():
+        license_entry.last_name = req.last_name.strip()
+    if req.organization and req.organization.strip():
+        license_entry.organization = req.organization.strip()
 
     # Première activation
     if not license_entry.activated_at:
@@ -188,6 +200,9 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
     return {
         "status": "valid",
         "email": license_entry.assigned_to_email,
+        "first_name": license_entry.first_name,
+        "last_name": license_entry.last_name,
+        "organization": license_entry.organization,
         "expires_at": license_entry.expires_at.strftime("%Y-%m-%d %H:%M:%S") if license_entry.expires_at else None,
         "devices_used": len(devices),
         "max_devices": max_dev
@@ -207,10 +222,14 @@ def get_admin_licenses(db: Session = Depends(get_db)):
         except Exception:
             dev_list = []
 
+        full_name = f"{item.first_name or ''} {item.last_name or ''}".strip()
+
         results.append({
             "id": item.id,
             "key": item.key,
             "email": item.assigned_to_email,
+            "user_name": full_name if full_name else "Non activé",
+            "organization": item.organization if item.organization else "—",
             "used_devices": len(dev_list),
             "max_devices": item.max_devices or 1,
             "is_active": item.is_active and item.device_uuid != "REVOKED",
@@ -222,7 +241,6 @@ def get_admin_licenses(db: Session = Depends(get_db)):
 
 @app.post("/api/admin/licenses/create")
 def create_admin_license(req: CreateLicenseGUIRequest, db: Session = Depends(get_db)):
-    # Format XXXX-XXXX-XXXX-XXXX
     part1 = secrets.token_hex(2).upper()
     part2 = secrets.token_hex(2).upper()
     part3 = secrets.token_hex(2).upper()
@@ -291,7 +309,7 @@ def reset_admin_license_devices(key: str, db: Session = Depends(get_db)):
     lic.activated_at = None
     lic.expires_at = None
     db.commit()
-    return {"status": "success", "message": "Appareils dissociés et réactivation réinitialisée."}
+    return {"status": "success", "message": "Appareils dissociés."}
 
 @app.post("/api/admin/licenses/{key}/resend-email")
 def resend_admin_license_email(key: str, db: Session = Depends(get_db)):
