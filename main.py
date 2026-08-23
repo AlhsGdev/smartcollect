@@ -36,7 +36,7 @@ def get_utc_now():
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 # ==========================================
-# MODÈLE DE BASE DE DONNÉES
+# MODÈLES DE BASE DE DONNÉES
 # ==========================================
 class LicenseKey(Base):
     __tablename__ = "licenses"
@@ -57,6 +57,20 @@ class LicenseKey(Base):
     activated_at = Column(DateTime, nullable=True)
     expires_at = Column(DateTime, nullable=True)
 
+
+class AppNews(Base):
+    __tablename__ = "news"
+
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(255), nullable=False)
+    summary = Column(Text, nullable=False)
+    content = Column(Text, default="", nullable=True)
+    category = Column(String(50), default="news") # 'update', 'tip', 'news', 'alert'
+    version = Column(String(50), nullable=True)
+    download_url = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=get_utc_now)
+
+
 Base.metadata.create_all(bind=engine)
 
 def get_db():
@@ -69,7 +83,7 @@ def get_db():
 # ==========================================
 # INITIALISATION FASTAPI & CORS
 # ==========================================
-app = FastAPI(title="SmartCollect License Server")
+app = FastAPI(title="SmartCollect License & News Server")
 
 app.add_middleware(
     CORSMiddleware,
@@ -94,6 +108,14 @@ class CreateLicenseGUIRequest(BaseModel):
     duration_val: int = 1
     duration_unit: str = "Mois"
     max_devices: int = 1
+
+class NewsCreateRequest(BaseModel):
+    title: str
+    summary: str
+    content: Optional[str] = ""
+    category: str = "news"
+    version: Optional[str] = None
+    download_url: Optional[str] = None
 
 # ==========================================
 # SERVICE D'ENVOI D'EMAIL
@@ -143,6 +165,56 @@ def health_check():
     return {"status": "healthy"}
 
 # ==========================================
+# GESTION DES ACTUALITÉS / ASTUCES / MAJ
+# ==========================================
+@app.get("/api/news")
+def get_all_news(db: Session = Depends(get_db)):
+    news_items = db.query(AppNews).order_by(AppNews.id.desc()).all()
+    results = []
+    for n in news_items:
+        results.append({
+            "id": str(n.id),
+            "title": n.title,
+            "summary": n.summary,
+            "content": n.content or "",
+            "category": n.category or "news",
+            "version": n.version,
+            "download_url": n.download_url,
+            "created_at": n.created_at.isoformat() if n.created_at else get_utc_now().isoformat()
+        })
+    return results
+
+@app.post("/api/admin/news/create")
+def create_admin_news(req: NewsCreateRequest, db: Session = Depends(get_db)):
+    new_article = AppNews(
+        title=req.title.strip(),
+        summary=req.summary.strip(),
+        content=req.content.strip() if req.content else "",
+        category=req.category,
+        version=req.version.strip() if req.version else None,
+        download_url=req.download_url.strip() if req.download_url else None,
+        created_at=get_utc_now()
+    )
+    db.add(new_article)
+    db.commit()
+    db.refresh(new_article)
+
+    return {
+        "status": "success",
+        "id": new_article.id,
+        "title": new_article.title
+    }
+
+@app.delete("/api/admin/news/{news_id}")
+def delete_admin_news(news_id: int, db: Session = Depends(get_db)):
+    item = db.query(AppNews).filter(AppNews.id == news_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Article introuvable.")
+    db.delete(item)
+    db.commit()
+    return {"status": "success", "message": "Actualité supprimée."}
+
+# ==========================================
 # ROUTE ACTIVATION FLUTTER (AVEC PROFIL CLOUD)
 # ==========================================
 @app.post("/api/license/verify")
@@ -160,7 +232,6 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
     if license_entry.expires_at and now > license_entry.expires_at:
         raise HTTPException(status_code=403, detail="Cette licence a expiré. Veuillez renouveler votre formule.")
 
-    # Enregistrement / mise à jour des informations de profil
     if req.first_name and req.first_name.strip():
         license_entry.first_name = req.first_name.strip()
     if req.last_name and req.last_name.strip():
@@ -168,7 +239,6 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
     if req.organization and req.organization.strip():
         license_entry.organization = req.organization.strip()
 
-    # Première activation
     if not license_entry.activated_at:
         license_entry.activated_at = now
         total_duration = timedelta(
@@ -209,7 +279,7 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
     }
 
 # ==========================================
-# ROUTES ADMINISTRATION GUI (PYSIDE6)
+# ROUTES ADMINISTRATION LICENCES GUI
 # ==========================================
 @app.get("/api/admin/licenses")
 def get_admin_licenses(db: Session = Depends(get_db)):
