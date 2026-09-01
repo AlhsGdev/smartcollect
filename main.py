@@ -11,11 +11,20 @@ from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
 # ==========================================
-# CONFIGURATION BASE DE DONNÉES
+# CONFIGURATION BASE DE DONNÉES (NEON / RENDER)
 # ==========================================
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./licenses.db")
+DEFAULT_DB_URL = "postgresql://neondb_owner:npg_NmxZaUb7n1Co@ep-odd-rice-axq1ordl-pooler.c-4.us-east-2.aws.neon.tech/neondb?sslmode=require"
+
+DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_DB_URL)
+
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+# Nettoyage d'éventuels paramètres incompatibles psycopg2
+if "&channel_binding=require" in DATABASE_URL:
+    DATABASE_URL = DATABASE_URL.replace("&channel_binding=require", "")
+if "?channel_binding=require" in DATABASE_URL:
+    DATABASE_URL = DATABASE_URL.replace("?channel_binding=require", "")
 
 engine_kwargs = {}
 if DATABASE_URL.startswith("sqlite"):
@@ -23,6 +32,8 @@ if DATABASE_URL.startswith("sqlite"):
 else:
     engine_kwargs["pool_pre_ping"] = True
     engine_kwargs["pool_recycle"] = 300
+    engine_kwargs["pool_size"] = 5
+    engine_kwargs["max_overflow"] = 10
 
 engine = create_engine(DATABASE_URL, **engine_kwargs)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -97,7 +108,11 @@ class FlutterVerifyRequest(BaseModel):
 # ==========================================
 @app.get("/")
 def home():
-    return {"status": "online", "message": "SmartCollect API is running"}
+    return {
+        "status": "online",
+        "database": "Neon PostgreSQL",
+        "message": "SmartCollect API is running"
+    }
 
 @app.get("/health")
 def health():
