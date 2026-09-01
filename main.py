@@ -14,9 +14,6 @@ from sqlalchemy.orm import declarative_base, sessionmaker, Session
 # ==========================================
 # CONFIGURATION GLOBALE
 # ==========================================
-RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
-SENDER_EMAIL = os.getenv("SENDER_EMAIL", "onboarding@resend.dev")
-
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./licenses.db")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
@@ -103,6 +100,13 @@ class FlutterVerifyRequest(BaseModel):
     last_name: Optional[str] = ""
     organization: Optional[str] = ""
 
+class SelfRegisterRequest(BaseModel):
+    first_name: str
+    last_name: str
+    email: EmailStr
+    organization: Optional[str] = ""
+    device_id: str
+
 class CreateLicenseGUIRequest(BaseModel):
     email: EmailStr
     duration_val: int = 1
@@ -118,42 +122,6 @@ class NewsCreateRequest(BaseModel):
     download_url: Optional[str] = None
 
 # ==========================================
-# SERVICE D'ENVOI D'EMAIL
-# ==========================================
-def send_license_email(recipient_email: str, license_key: str, duration_str: str, max_dev: int) -> bool:
-    if not RESEND_API_KEY:
-        return False
-
-    url = "https://api.resend.com/emails"
-    headers = {
-        "Authorization": f"Bearer {RESEND_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "from": f"SmartCollect <{SENDER_EMAIL}>",
-        "to": [recipient_email],
-        "subject": f"Votre Clé d'Activation SmartCollect ({duration_str})",
-        "html": f"""
-        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px; border: 1px solid #e2e8f0; border-radius: 12px; background-color: #ffffff;">
-            <h2 style="color: #4f46e5; text-align: center;">SmartCollect — Clé d'Activation</h2>
-            <p>Bonjour,</p>
-            <p>Voici votre clé d'activation officielle pour l'application <strong>SmartCollect</strong> :</p>
-            <div style="background-color: #f1f5f9; border-left: 5px solid #4f46e5; padding: 18px; text-align: center; margin: 20px 0; border-radius: 6px;">
-                <span style="font-size: 24px; font-weight: bold; letter-spacing: 2px; color: #0f172a; font-family: monospace;">{license_key}</span>
-            </div>
-            <p>• <strong>Durée de validité :</strong> {duration_str}<br>
-               • <strong>Appareils autorisés :</strong> jusqu'à {max_dev} appareil(s)</p>
-            <p style="font-size: 12px; color: #94a3b8; text-align: center;">Le décompte commence dès votre première activation.</p>
-        </div>
-        """
-    }
-    try:
-        response = requests.post(url, headers=headers, json=payload, timeout=8)
-        return response.status_code in [200, 201]
-    except Exception:
-        return False
-
-# ==========================================
 # ROUTES PUBLIQUES
 # ==========================================
 @app.get("/")
@@ -163,6 +131,70 @@ def read_root():
 @app.get("/health")
 def health_check():
     return {"status": "healthy"}
+
+# ==========================================
+# ROUTE AUTO-ENREGISTREMENT SANS EMAIL (SELF-SERVICE)
+# ==========================================
+@app.post("/api/license/self-register")
+def self_register_license(req: SelfRegisterRequest, db: Session = Depends(get_db)):
+    clean_device_id = req.device_id.strip()
+
+    # 1. Vérifier si l'appareil possède déjà une licence active
+    licenses = db.query(LicenseKey).all()
+    for lic in licenses:
+        try:
+            devs = json.loads(lic.device_uuid or "[]")
+            if clean_device_id in devs:
+                if not lic.is_active or lic.device_uuid == "REVOKED":
+                    raise HTTPException(status_code=403, detail="Cet appareil a été suspendu ou révoqué.")
+                return {
+                    "status": "success",
+                    "key": lic.key,
+                    "first_name": lic.first_name,
+                    "last_name": lic.last_name,
+                    "organization": lic.organization,
+                    "expires_at": lic.expires_at.strftime("%Y-%m-%d %H:%M:%S") if lic.expires_at else "Illimité",
+                    "message": "Licence existante récupérée avec succès."
+                }
+        except Exception:
+            continue
+
+    # 2. Générer une nouvelle clé unique
+    part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
+    license_key = f"{part1}-{part2}-{part3}-{part4}"
+
+    # 3. Attribuer une période d'essai automatique (ex: 30 jours pour 1 appareil)
+    now = get_utc_now()
+    trial_duration = timedelta(days=30)
+    expires_at = now + trial_duration
+
+    new_lic = LicenseKey(
+        key=license_key,
+        assigned_to_email=req.email.lower().strip(),
+        first_name=req.first_name.strip(),
+        last_name=req.last_name.strip(),
+        organization=req.organization.strip() if req.organization else "",
+        is_active=True,
+        device_uuid=json.dumps([clean_device_id]),
+        max_devices=1,
+        duration_days=30,
+        activated_at=now,
+        expires_at=expires_at,
+        created_at=now
+    )
+    db.add(new_lic)
+    db.commit()
+    db.refresh(new_lic)
+
+    return {
+        "status": "success",
+        "key": license_key,
+        "first_name": new_lic.first_name,
+        "last_name": new_lic.last_name,
+        "organization": new_lic.organization,
+        "expires_at": new_lic.expires_at.strftime("%Y-%m-%d %H:%M:%S"),
+        "message": "Nouvelle licence d'essai activée avec succès !"
+    }
 
 # ==========================================
 # GESTION DES ACTUALITÉS / ASTUCES / MAJ
@@ -215,7 +247,7 @@ def delete_admin_news(news_id: int, db: Session = Depends(get_db)):
     return {"status": "success", "message": "Actualité supprimée."}
 
 # ==========================================
-# ROUTE ACTIVATION FLUTTER (AVEC PROFIL CLOUD)
+# ROUTE ACTIVATION MANUELLE FLUTTER
 # ==========================================
 @app.post("/api/license/verify")
 def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(get_db)):
@@ -349,14 +381,11 @@ def create_admin_license(req: CreateLicenseGUIRequest, db: Session = Depends(get
     db.commit()
     db.refresh(new_lic)
 
-    email_sent = send_license_email(new_lic.assigned_to_email, license_key, duration_str, req.max_devices)
-
     return {
         "id": new_lic.id,
         "key": license_key,
         "email": new_lic.assigned_to_email,
-        "duration": duration_str,
-        "email_sent": email_sent
+        "duration": duration_str
     }
 
 @app.post("/api/admin/licenses/{key}/status")
@@ -380,19 +409,6 @@ def reset_admin_license_devices(key: str, db: Session = Depends(get_db)):
     lic.expires_at = None
     db.commit()
     return {"status": "success", "message": "Appareils dissociés."}
-
-@app.post("/api/admin/licenses/{key}/resend-email")
-def resend_admin_license_email(key: str, db: Session = Depends(get_db)):
-    lic = db.query(LicenseKey).filter(LicenseKey.key == key.strip().upper()).first()
-    if not lic:
-        raise HTTPException(status_code=404, detail="Licence introuvable.")
-
-    duration_str = f"{lic.duration_days}j {lic.duration_hours}h {lic.duration_minutes}m"
-    sent = send_license_email(lic.assigned_to_email, lic.key, duration_str, lic.max_devices or 1)
-    if not sent:
-        raise HTTPException(status_code=500, detail="Échec lors de l'envoi de l'e-mail.")
-
-    return {"status": "success", "message": "E-mail renvoyé avec succès."}
 
 @app.delete("/api/admin/licenses/{key}")
 def delete_admin_license(key: str, db: Session = Depends(get_db)):
