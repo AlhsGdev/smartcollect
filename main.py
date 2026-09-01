@@ -7,14 +7,13 @@ from typing import Optional, List
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text, text
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
 # ==========================================
-# CONFIGURATION BASE DE DONNÉES (NEON / RENDER)
+# CONFIGURATION BASE DE DONNÉES
 # ==========================================
 DEFAULT_DB_URL = "postgresql://neondb_owner:npg_NmxZaUb7n1Co@ep-odd-rice-axq1ordl-pooler.c-4.us-east-2.aws.neon.tech/neondb?sslmode=require"
-
 DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_DB_URL)
 
 if DATABASE_URL.startswith("postgres://"):
@@ -49,7 +48,7 @@ class LicenseKey(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     key = Column(String(32), unique=True, index=True, nullable=False)
-    phone_number = Column(String(50), default="", nullable=True, index=True)
+    phone_number = Column(String(50), default="", nullable=True)
     email = Column(String(150), default="", nullable=True)
     first_name = Column(String(100), default="", nullable=True)
     last_name = Column(String(100), default="", nullable=True)
@@ -75,17 +74,6 @@ class AppNews(Base):
     download_url = Column(Text, nullable=True)
     created_at = Column(DateTime, default=get_utc_now)
 
-
-# Tentative d'auto-migration au démarrage
-try:
-    with engine.connect() as conn:
-        conn.execute(text("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS phone_number VARCHAR(50);"))
-        conn.execute(text("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS first_name VARCHAR(100) DEFAULT '';"))
-        conn.execute(text("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS last_name VARCHAR(100) DEFAULT '';"))
-        conn.execute(text("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS organization VARCHAR(150) DEFAULT '';"))
-        conn.commit()
-except Exception:
-    pass
 
 Base.metadata.create_all(bind=engine)
 
@@ -216,7 +204,7 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
         license_entry.expires_at = now + timedelta(days=license_entry.duration_days or 30)
 
     try:
-        devices: List[str] = json.loads(license_entry.device_uuid or "[]")
+        devices = json.loads(license_entry.device_uuid or "[]") if isinstance(license_entry.device_uuid, str) else []
     except Exception:
         devices = []
 
@@ -231,7 +219,7 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
 
     return {
         "status": "valid",
-        "phone_number": license_entry.phone_number,
+        "phone_number": license_entry.phone_number or "",
         "expires_at": license_entry.expires_at.strftime("%Y-%m-%d %H:%M:%S") if license_entry.expires_at else None
     }
 
@@ -241,32 +229,38 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
 @app.get("/api/admin/licenses")
 @app.get("/api/admin/licenses/")
 def get_admin_licenses(db: Session = Depends(get_db)):
-    licenses = db.query(LicenseKey).order_by(LicenseKey.id.desc()).all()
-    results = []
+    try:
+        licenses = db.query(LicenseKey).order_by(LicenseKey.id.desc()).all()
+        results = []
 
-    for item in licenses:
-        try:
-            dev_list = json.loads(item.device_uuid or "[]") if item.device_uuid != "REVOKED" else []
-        except Exception:
-            dev_list = []
+        for item in licenses:
+            try:
+                raw_dev = str(item.device_uuid or "[]")
+                dev_list = json.loads(raw_dev) if raw_dev not in ["REVOKED", ""] else []
+            except Exception:
+                dev_list = []
 
-        full_name = f"{item.first_name or ''} {item.last_name or ''}".strip()
-        phone_or_email = item.phone_number or item.email or "—"
+            first = str(item.first_name or "")
+            last = str(item.last_name or "")
+            full_name = f"{first} {last}".strip()
+            phone_or_email = str(item.phone_number or item.email or "—")
 
-        results.append({
-            "id": item.id,
-            "key": item.key,
-            "phone_number": phone_or_email,
-            "user_name": full_name if full_name else "Non activé",
-            "organization": item.organization if item.organization else "—",
-            "used_devices": len(dev_list),
-            "max_devices": item.max_devices or 1,
-            "is_active": item.is_active and item.device_uuid != "REVOKED",
-            "created_at": item.created_at.isoformat() if item.created_at else "",
-            "expires_at": item.expires_at.isoformat() if item.expires_at else None
-        })
+            results.append({
+                "id": item.id,
+                "key": str(item.key or ""),
+                "phone_number": phone_or_email,
+                "user_name": full_name if full_name else "Non activé",
+                "organization": str(item.organization or "—"),
+                "used_devices": len(dev_list),
+                "max_devices": item.max_devices if item.max_devices is not None else 1,
+                "is_active": bool(item.is_active and str(item.device_uuid) != "REVOKED"),
+                "created_at": item.created_at.isoformat() if item.created_at else "",
+                "expires_at": item.expires_at.isoformat() if item.expires_at else None
+            })
 
-    return results
+        return results
+    except Exception as err:
+        raise HTTPException(status_code=500, detail=f"Erreur SQL/Python: {str(err)}")
 
 @app.post("/api/admin/licenses/create")
 @app.post("/api/admin/licenses/create/")
@@ -342,20 +336,23 @@ def delete_admin_license(key: str, db: Session = Depends(get_db)):
 @app.get("/api/news")
 @app.get("/api/news/")
 def get_all_news(db: Session = Depends(get_db)):
-    news_items = db.query(AppNews).order_by(AppNews.id.desc()).all()
-    results = []
-    for n in news_items:
-        results.append({
-            "id": str(n.id),
-            "title": n.title,
-            "summary": n.summary,
-            "content": n.content or "",
-            "category": n.category or "news",
-            "version": n.version,
-            "download_url": n.download_url,
-            "created_at": n.created_at.isoformat() if n.created_at else get_utc_now().isoformat()
-        })
-    return results
+    try:
+        news_items = db.query(AppNews).order_by(AppNews.id.desc()).all()
+        results = []
+        for n in news_items:
+            results.append({
+                "id": str(n.id),
+                "title": str(n.title or ""),
+                "summary": str(n.summary or ""),
+                "content": str(n.content or ""),
+                "category": str(n.category or "news"),
+                "version": n.version,
+                "download_url": n.download_url,
+                "created_at": n.created_at.isoformat() if n.created_at else get_utc_now().isoformat()
+            })
+        return results
+    except Exception as err:
+        raise HTTPException(status_code=500, detail=f"Erreur SQL News: {str(err)}")
 
 @app.post("/api/admin/news/create")
 @app.post("/api/admin/news/create/")
