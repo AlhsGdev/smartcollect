@@ -74,7 +74,6 @@ class AppNews(Base):
     created_at = Column(DateTime, default=get_utc_now)
 
 
-# Désactivation automatique du NOT NULL sur l'ancien champ email si présent
 try:
     with engine.connect() as conn:
         conn.execute(text("DO $$ BEGIN IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='licenses' AND column_name='email') THEN ALTER TABLE licenses ALTER COLUMN email DROP NOT NULL; END IF; END $$;"))
@@ -126,6 +125,11 @@ class AdminCreateLicenseRequest(BaseModel):
     duration_unit: str = "Mois"
     max_devices: int = 1
 
+class AdminUpdateLicenseRequest(BaseModel):
+    duration_val: int = 1
+    duration_unit: str = "Mois"
+    max_devices: int = 1
+
 class NewsCreateRequest(BaseModel):
     title: str
     summary: str
@@ -150,7 +154,7 @@ def health():
     return {"status": "healthy"}
 
 # ==========================================
-# ROUTES APPLICATION FLUTTER
+# ROUTES FLUTTER
 # ==========================================
 @app.post("/api/license/request-key")
 @app.post("/api/license/request-key/")
@@ -269,6 +273,7 @@ def get_admin_licenses(db: Session = Depends(get_db)):
                 "organization": str(item.organization or "—"),
                 "used_devices": len(dev_list),
                 "max_devices": item.max_devices if item.max_devices is not None else 1,
+                "duration_days": item.duration_days or 30,
                 "is_active": bool(item.is_active and str(item.device_uuid) != "REVOKED"),
                 "created_at": item.created_at.isoformat() if item.created_at else "",
                 "expires_at": item.expires_at.isoformat() if item.expires_at else None
@@ -293,6 +298,8 @@ def create_admin_license(req: AdminCreateLicenseRequest, db: Session = Depends(g
             days = req.duration_val * 365
         elif "jour" in unit:
             days = req.duration_val
+        elif "heure" in unit:
+            days = max(1, req.duration_val // 24)
         else:
             days = req.duration_val
 
@@ -317,6 +324,40 @@ def create_admin_license(req: AdminCreateLicenseRequest, db: Session = Depends(g
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Erreur DB: {str(e)}")
+
+@app.put("/api/admin/licenses/{key}/update")
+@app.put("/api/admin/licenses/{key}/update/")
+def update_admin_license(key: str, req: AdminUpdateLicenseRequest, db: Session = Depends(get_db)):
+    lic = db.query(LicenseKey).filter(LicenseKey.key == key.strip().upper()).first()
+    if not lic:
+        raise HTTPException(status_code=404, detail="Licence introuvable.")
+
+    days = 30
+    unit = req.duration_unit.lower()
+    if "mois" in unit:
+        days = req.duration_val * 30
+    elif "an" in unit:
+        days = req.duration_val * 365
+    elif "jour" in unit:
+        days = req.duration_val
+    else:
+        days = req.duration_val
+
+    lic.max_devices = req.max_devices
+    lic.duration_days = days
+
+    # Si la licence a déjà été activée, on recalcule la date d'expiration à partir de la date d'activation
+    if lic.activated_at:
+        lic.expires_at = lic.activated_at + timedelta(days=days)
+
+    db.commit()
+    return {
+        "status": "success",
+        "message": "Licence mise à jour avec succès !",
+        "max_devices": lic.max_devices,
+        "duration_days": lic.duration_days,
+        "expires_at": lic.expires_at.isoformat() if lic.expires_at else None
+    }
 
 @app.post("/api/admin/licenses/{key}/status")
 def toggle_admin_license_status(key: str, db: Session = Depends(get_db)):
