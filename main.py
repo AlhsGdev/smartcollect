@@ -7,11 +7,11 @@ from typing import Optional, List
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text, text
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
 # ==========================================
-# CONFIGURATION BASE DE DONNÉES
+# CONFIGURATION BASE DE DONNÉES (NEON / RENDER)
 # ==========================================
 DEFAULT_DB_URL = "postgresql://neondb_owner:npg_NmxZaUb7n1Co@ep-odd-rice-axq1ordl-pooler.c-4.us-east-2.aws.neon.tech/neondb?sslmode=require"
 DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_DB_URL)
@@ -73,6 +73,14 @@ class AppNews(Base):
     download_url = Column(Text, nullable=True)
     created_at = Column(DateTime, default=get_utc_now)
 
+
+# Désactivation automatique du NOT NULL sur l'ancien champ email si présent
+try:
+    with engine.connect() as conn:
+        conn.execute(text("DO $$ BEGIN IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='licenses' AND column_name='email') THEN ALTER TABLE licenses ALTER COLUMN email DROP NOT NULL; END IF; END $$;"))
+        conn.commit()
+except Exception:
+    pass
 
 Base.metadata.create_all(bind=engine)
 
@@ -142,85 +150,95 @@ def health():
     return {"status": "healthy"}
 
 # ==========================================
-# ROUTES FLUTTER
+# ROUTES APPLICATION FLUTTER
 # ==========================================
 @app.post("/api/license/request-key")
 @app.post("/api/license/request-key/")
 def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get_db)):
-    clean_phone = req.phone_number.strip().replace(" ", "")
+    try:
+        clean_phone = req.phone_number.strip().replace(" ", "")
 
-    existing_lic = db.query(LicenseKey).filter(LicenseKey.phone_number == clean_phone).first()
-    if existing_lic:
+        existing_lic = db.query(LicenseKey).filter(LicenseKey.phone_number == clean_phone).first()
+        if existing_lic:
+            return {
+                "status": "success",
+                "message": "Une clé existe déjà pour ce numéro de téléphone !",
+                "license_key": existing_lic.key
+            }
+
+        part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
+        license_key = f"{part1}-{part2}-{part3}-{part4}"
+
+        new_lic = LicenseKey(
+            key=license_key,
+            phone_number=clean_phone,
+            first_name=req.first_name.strip(),
+            last_name=req.last_name.strip(),
+            organization=req.organization.strip() if req.organization else "",
+            is_active=True,
+            device_uuid="[]",
+            max_devices=1,
+            duration_days=30,
+            created_at=get_utc_now()
+        )
+        db.add(new_lic)
+        db.commit()
+        db.refresh(new_lic)
+
         return {
             "status": "success",
-            "message": "Une clé existe déjà pour ce numéro de téléphone !",
-            "license_key": existing_lic.key
+            "message": "Clé générée avec succès !",
+            "license_key": license_key
         }
-
-    part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
-    license_key = f"{part1}-{part2}-{part3}-{part4}"
-
-    new_lic = LicenseKey(
-        key=license_key,
-        phone_number=clean_phone,
-        first_name=req.first_name.strip(),
-        last_name=req.last_name.strip(),
-        organization=req.organization.strip() if req.organization else "",
-        is_active=True,
-        device_uuid="[]",
-        max_devices=1,
-        duration_days=30,
-        created_at=get_utc_now()
-    )
-    db.add(new_lic)
-    db.commit()
-    db.refresh(new_lic)
-
-    return {
-        "status": "success",
-        "message": "Clé générée avec succès !",
-        "license_key": license_key
-    }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Erreur DB: {str(e)}")
 
 @app.post("/api/license/verify")
 @app.post("/api/license/verify/")
 def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(get_db)):
-    clean_key = req.key.strip().upper()
-    license_entry = db.query(LicenseKey).filter(LicenseKey.key == clean_key).first()
-
-    if not license_entry:
-        raise HTTPException(status_code=404, detail="Clé de licence introuvable.")
-
-    if not license_entry.is_active or license_entry.device_uuid == "REVOKED":
-        raise HTTPException(status_code=403, detail="Cette licence a été désactivée ou révoquée.")
-
-    now = get_utc_now()
-    if license_entry.expires_at and now > license_entry.expires_at:
-        raise HTTPException(status_code=403, detail="Cette licence a expiré.")
-
-    if not license_entry.activated_at:
-        license_entry.activated_at = now
-        license_entry.expires_at = now + timedelta(days=license_entry.duration_days or 30)
-
     try:
-        devices = json.loads(license_entry.device_uuid or "[]") if isinstance(license_entry.device_uuid, str) else []
-    except Exception:
-        devices = []
+        clean_key = req.key.strip().upper()
+        license_entry = db.query(LicenseKey).filter(LicenseKey.key == clean_key).first()
 
-    max_dev = license_entry.max_devices or 1
-    if req.device_id not in devices:
-        if len(devices) >= max_dev:
-            raise HTTPException(status_code=403, detail="Limite d'appareils atteinte pour cette clé.")
-        devices.append(req.device_id)
-        license_entry.device_uuid = json.dumps(devices)
+        if not license_entry:
+            raise HTTPException(status_code=404, detail="Clé de licence introuvable.")
 
-    db.commit()
+        if not license_entry.is_active or license_entry.device_uuid == "REVOKED":
+            raise HTTPException(status_code=403, detail="Cette licence a été désactivée ou révoquée.")
 
-    return {
-        "status": "valid",
-        "phone_number": license_entry.phone_number or "",
-        "expires_at": license_entry.expires_at.strftime("%Y-%m-%d %H:%M:%S") if license_entry.expires_at else None
-    }
+        now = get_utc_now()
+        if license_entry.expires_at and now > license_entry.expires_at:
+            raise HTTPException(status_code=403, detail="Cette licence a expiré.")
+
+        if not license_entry.activated_at:
+            license_entry.activated_at = now
+            license_entry.expires_at = now + timedelta(days=license_entry.duration_days or 30)
+
+        try:
+            devices = json.loads(license_entry.device_uuid or "[]") if isinstance(license_entry.device_uuid, str) else []
+        except Exception:
+            devices = []
+
+        max_dev = license_entry.max_devices or 1
+        if req.device_id not in devices:
+            if len(devices) >= max_dev:
+                raise HTTPException(status_code=403, detail="Limite d'appareils atteinte pour cette clé.")
+            devices.append(req.device_id)
+            license_entry.device_uuid = json.dumps(devices)
+
+        db.commit()
+
+        return {
+            "status": "valid",
+            "phone_number": license_entry.phone_number or "",
+            "expires_at": license_entry.expires_at.strftime("%Y-%m-%d %H:%M:%S") if license_entry.expires_at else None
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Erreur DB: {str(e)}")
 
 # ==========================================
 # ROUTES ADMINISTRATION DES LICENCES (GUI)
@@ -263,38 +281,42 @@ def get_admin_licenses(db: Session = Depends(get_db)):
 @app.post("/api/admin/licenses/create")
 @app.post("/api/admin/licenses/create/")
 def create_admin_license(req: AdminCreateLicenseRequest, db: Session = Depends(get_db)):
-    part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
-    license_key = f"{part1}-{part2}-{part3}-{part4}"
+    try:
+        part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
+        license_key = f"{part1}-{part2}-{part3}-{part4}"
 
-    days = 30
-    unit = req.duration_unit.lower()
-    if "mois" in unit:
-        days = req.duration_val * 30
-    elif "an" in unit:
-        days = req.duration_val * 365
-    elif "jour" in unit:
-        days = req.duration_val
-    else:
-        days = req.duration_val
+        days = 30
+        unit = req.duration_unit.lower()
+        if "mois" in unit:
+            days = req.duration_val * 30
+        elif "an" in unit:
+            days = req.duration_val * 365
+        elif "jour" in unit:
+            days = req.duration_val
+        else:
+            days = req.duration_val
 
-    new_lic = LicenseKey(
-        key=license_key,
-        phone_number=req.phone_number.strip().replace(" ", ""),
-        is_active=True,
-        device_uuid="[]",
-        max_devices=req.max_devices,
-        duration_days=days,
-        created_at=get_utc_now()
-    )
-    db.add(new_lic)
-    db.commit()
-    db.refresh(new_lic)
+        new_lic = LicenseKey(
+            key=license_key,
+            phone_number=req.phone_number.strip().replace(" ", ""),
+            is_active=True,
+            device_uuid="[]",
+            max_devices=req.max_devices,
+            duration_days=days,
+            created_at=get_utc_now()
+        )
+        db.add(new_lic)
+        db.commit()
+        db.refresh(new_lic)
 
-    return {
-        "id": new_lic.id,
-        "key": license_key,
-        "phone_number": new_lic.phone_number
-    }
+        return {
+            "id": new_lic.id,
+            "key": license_key,
+            "phone_number": new_lic.phone_number
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Erreur DB: {str(e)}")
 
 @app.post("/api/admin/licenses/{key}/status")
 def toggle_admin_license_status(key: str, db: Session = Depends(get_db)):
