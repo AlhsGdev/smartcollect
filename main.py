@@ -10,6 +10,9 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
+# ==========================================
+# CONFIGURATION BASE DE DONNÉES
+# ==========================================
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./licenses.db")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
@@ -28,6 +31,9 @@ Base = declarative_base()
 def get_utc_now():
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
+# ==========================================
+# MODÈLES SQLALCHEMY
+# ==========================================
 class LicenseKey(Base):
     __tablename__ = "licenses"
 
@@ -54,7 +60,13 @@ def get_db():
     finally:
         db.close()
 
-app = FastAPI(title="SmartCollect WhatsApp License Server")
+# ==========================================
+# APPLICATION FASTAPI
+# ==========================================
+app = FastAPI(
+    title="SmartCollect License Server",
+    redirect_slashes=True,
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -64,6 +76,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ==========================================
+# SCHÉMAS PYDANTIC
+# ==========================================
 class SelfRegisterPhoneRequest(BaseModel):
     first_name: str
     last_name: str
@@ -77,11 +92,22 @@ class FlutterVerifyRequest(BaseModel):
     last_name: Optional[str] = ""
     organization: Optional[str] = ""
 
-@app.post("/api/license/request-key")
-def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get_db)):
-    clean_phone = req.phone_number.strip()
+# ==========================================
+# ROUTES
+# ==========================================
+@app.get("/")
+def home():
+    return {"status": "online", "message": "SmartCollect API is running"}
 
-    # Vérifier si une clé existe déjà pour ce numéro
+@app.get("/health")
+def health():
+    return {"status": "healthy"}
+
+@app.post("/api/license/request-key")
+@app.post("/api/license/request-key/")
+def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get_db)):
+    clean_phone = req.phone_number.strip().replace(" ", "")
+
     existing_lic = db.query(LicenseKey).filter(LicenseKey.phone_number == clean_phone).first()
     if existing_lic:
         return {
@@ -90,7 +116,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
             "license_key": existing_lic.key
         }
 
-    # Générer une nouvelle clé unique
     part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
     license_key = f"{part1}-{part2}-{part3}-{part4}"
 
@@ -117,6 +142,7 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
     }
 
 @app.post("/api/license/verify")
+@app.post("/api/license/verify/")
 def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(get_db)):
     clean_key = req.key.strip().upper()
     license_entry = db.query(LicenseKey).filter(LicenseKey.key == clean_key).first()
@@ -154,3 +180,7 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
         "phone_number": license_entry.phone_number,
         "expires_at": license_entry.expires_at.strftime("%Y-%m-%d %H:%M:%S") if license_entry.expires_at else None
     }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
