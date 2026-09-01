@@ -7,7 +7,7 @@ from typing import Optional, List
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text, text
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
 # ==========================================
@@ -49,7 +49,8 @@ class LicenseKey(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     key = Column(String(32), unique=True, index=True, nullable=False)
-    phone_number = Column(String(50), nullable=False, index=True)
+    phone_number = Column(String(50), default="", nullable=True, index=True)
+    email = Column(String(150), default="", nullable=True)
     first_name = Column(String(100), default="", nullable=True)
     last_name = Column(String(100), default="", nullable=True)
     organization = Column(String(150), default="", nullable=True)
@@ -75,6 +76,17 @@ class AppNews(Base):
     created_at = Column(DateTime, default=get_utc_now)
 
 
+# Tentative d'auto-migration au démarrage
+try:
+    with engine.connect() as conn:
+        conn.execute(text("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS phone_number VARCHAR(50);"))
+        conn.execute(text("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS first_name VARCHAR(100) DEFAULT '';"))
+        conn.execute(text("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS last_name VARCHAR(100) DEFAULT '';"))
+        conn.execute(text("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS organization VARCHAR(150) DEFAULT '';"))
+        conn.commit()
+except Exception:
+    pass
+
 Base.metadata.create_all(bind=engine)
 
 def get_db():
@@ -87,10 +99,7 @@ def get_db():
 # ==========================================
 # APPLICATION FASTAPI
 # ==========================================
-app = FastAPI(
-    title="SmartCollect API & Admin Server",
-    redirect_slashes=True,
-)
+app = FastAPI(title="SmartCollect API & Admin Server", redirect_slashes=True)
 
 app.add_middleware(
     CORSMiddleware,
@@ -131,7 +140,7 @@ class NewsCreateRequest(BaseModel):
     download_url: Optional[str] = None
 
 # ==========================================
-# ROUTES PUBLIQUES & SANTÉ
+# ROUTES PUBLIQUES
 # ==========================================
 @app.get("/")
 def home():
@@ -146,7 +155,7 @@ def health():
     return {"status": "healthy"}
 
 # ==========================================
-# ROUTES APPLICATION FLUTTER
+# ROUTES FLUTTER
 # ==========================================
 @app.post("/api/license/request-key")
 @app.post("/api/license/request-key/")
@@ -242,11 +251,12 @@ def get_admin_licenses(db: Session = Depends(get_db)):
             dev_list = []
 
         full_name = f"{item.first_name or ''} {item.last_name or ''}".strip()
+        phone_or_email = item.phone_number or item.email or "—"
 
         results.append({
             "id": item.id,
             "key": item.key,
-            "phone_number": item.phone_number,
+            "phone_number": phone_or_email,
             "user_name": full_name if full_name else "Non activé",
             "organization": item.organization if item.organization else "—",
             "used_devices": len(dev_list),
@@ -261,10 +271,7 @@ def get_admin_licenses(db: Session = Depends(get_db)):
 @app.post("/api/admin/licenses/create")
 @app.post("/api/admin/licenses/create/")
 def create_admin_license(req: AdminCreateLicenseRequest, db: Session = Depends(get_db)):
-    part1 = secrets.token_hex(2).upper()
-    part2 = secrets.token_hex(2).upper()
-    part3 = secrets.token_hex(2).upper()
-    part4 = secrets.token_hex(2).upper()
+    part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
     license_key = f"{part1}-{part2}-{part3}-{part4}"
 
     days = 30
