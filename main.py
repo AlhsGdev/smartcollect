@@ -48,8 +48,7 @@ class LicenseKey(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     key = Column(String(32), unique=True, index=True, nullable=False)
-    phone_number = Column(String(50), default="", nullable=True)
-    email = Column(String(150), default="", nullable=True)
+    phone_number = Column(String(50), default="", nullable=False, index=True)
     first_name = Column(String(100), default="", nullable=True)
     last_name = Column(String(100), default="", nullable=True)
     organization = Column(String(150), default="", nullable=True)
@@ -243,12 +242,11 @@ def get_admin_licenses(db: Session = Depends(get_db)):
             first = str(item.first_name or "")
             last = str(item.last_name or "")
             full_name = f"{first} {last}".strip()
-            phone_or_email = str(item.phone_number or item.email or "—")
 
             results.append({
                 "id": item.id,
                 "key": str(item.key or ""),
-                "phone_number": phone_or_email,
+                "phone_number": str(item.phone_number or "—"),
                 "user_name": full_name if full_name else "Non activé",
                 "organization": str(item.organization or "—"),
                 "used_devices": len(dev_list),
