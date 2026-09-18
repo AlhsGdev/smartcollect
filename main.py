@@ -10,6 +10,14 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text, text
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
+# ═══════════════════════════════════════════════════════════
+# CONFIGURATION GLOBALE : Durée d'essai par défaut
+# Modifiez cette valeur pour changer la durée d'essai
+# des nouvelles clés créées par l'app Flutter.
+# ═══════════════════════════════════════════════════════════
+DEFAULT_TRIAL_DAYS = 7
+DEFAULT_TRIAL_UNIT = "Jours"
+
 # ==========================================
 # CONFIGURATION BASE DE DONNÉES (NEON / RENDER)
 # ==========================================
@@ -55,10 +63,9 @@ class LicenseKey(Base):
     is_active = Column(Boolean, default=True)
     device_uuid = Column(Text, default="[]")
     max_devices = Column(Integer, default=1)
-    duration_days = Column(Integer, default=30)
-    # 👇 NOUVEAU : mémoriser la valeur/unité saisies pour l'affichage
-    duration_val = Column(Integer, default=1)
-    duration_unit = Column(String(20), default="Mois")
+    duration_days = Column(Integer, default=DEFAULT_TRIAL_DAYS)
+    duration_val = Column(Integer, default=DEFAULT_TRIAL_DAYS)
+    duration_unit = Column(String(20), default=DEFAULT_TRIAL_UNIT)
     created_at = Column(DateTime, default=get_utc_now)
     activated_at = Column(DateTime, nullable=True)
     expires_at = Column(DateTime, nullable=True)
@@ -92,10 +99,14 @@ try:
         ))
         # Ajout des nouvelles colonnes duration_val / duration_unit si absentes
         conn.execute(text(
-            "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS duration_val INTEGER DEFAULT 1;"
+            "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS duration_val INTEGER DEFAULT 7;"
         ))
         conn.execute(text(
-            "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS duration_unit VARCHAR(20) DEFAULT 'Mois';"
+            "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS duration_unit VARCHAR(20) DEFAULT 'Jours';"
+        ))
+        # Alignement de la colonne duration_days sur 7 par défaut
+        conn.execute(text(
+            f"ALTER TABLE licenses ALTER COLUMN duration_days SET DEFAULT {DEFAULT_TRIAL_DAYS};"
         ))
         conn.commit()
 except Exception as e:
@@ -141,10 +152,11 @@ class FlutterVerifyRequest(BaseModel):
 
 class AdminCreateLicenseRequest(BaseModel):
     phone_number: str
-    duration_val: int = 1
-    duration_unit: str = "Mois"
+    # ✅ Plus de valeur par défaut → le client DOIT fournir ces valeurs
+    duration_val: int
+    duration_unit: str
     max_devices: int = 1
-    is_active: Optional[bool] = False  # 👈 Permet de créer en mode inactif
+    is_active: Optional[bool] = False
 
 class AdminUpdateLicenseRequest(BaseModel):
     """Payload souple pour la modification complète depuis le GUI."""
@@ -172,7 +184,8 @@ def home():
     return {
         "status": "online",
         "database": "Neon PostgreSQL",
-        "service": "SmartCollect Unified API"
+        "service": "SmartCollect Unified API",
+        "default_trial_days": DEFAULT_TRIAL_DAYS
     }
 
 @app.get("/health")
@@ -180,7 +193,7 @@ def health():
     return {"status": "healthy"}
 
 # ==========================================
-# ROUTES FLUTTER
+# ROUTES FLUTTER (self-registration)
 # ==========================================
 @app.post("/api/license/request-key")
 @app.post("/api/license/request-key/")
@@ -193,12 +206,14 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
             return {
                 "status": "success",
                 "message": "Une clé existe déjà pour ce numéro de téléphone !",
-                "license_key": existing_lic.key
+                "license_key": existing_lic.key,
+                "trial_days": existing_lic.duration_days or DEFAULT_TRIAL_DAYS
             }
 
         part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
         license_key = f"{part1}-{part2}-{part3}-{part4}"
 
+        # ✅ Utilise la config globale (7 jours par défaut)
         new_lic = LicenseKey(
             key=license_key,
             phone_number=clean_phone,
@@ -208,9 +223,9 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
             is_active=True,
             device_uuid="[]",
             max_devices=1,
-            duration_days=30,
-            duration_val=1,
-            duration_unit="Mois",
+            duration_days=DEFAULT_TRIAL_DAYS,
+            duration_val=DEFAULT_TRIAL_DAYS,
+            duration_unit=DEFAULT_TRIAL_UNIT,
             created_at=get_utc_now()
         )
         db.add(new_lic)
@@ -220,7 +235,9 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
         return {
             "status": "success",
             "message": "Clé générée avec succès !",
-            "license_key": license_key
+            "license_key": license_key,
+            # ✅ La durée d'essai est renvoyée au client Flutter
+            "trial_days": DEFAULT_TRIAL_DAYS
         }
     except Exception as e:
         db.rollback()
@@ -245,7 +262,7 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
 
         if not license_entry.activated_at:
             license_entry.activated_at = now
-            license_entry.expires_at = now + timedelta(days=license_entry.duration_days or 30)
+            license_entry.expires_at = now + timedelta(days=license_entry.duration_days or DEFAULT_TRIAL_DAYS)
 
         try:
             devices = json.loads(license_entry.device_uuid or "[]") if isinstance(license_entry.device_uuid, str) else []
@@ -301,10 +318,10 @@ def get_admin_licenses(db: Session = Depends(get_db)):
                 "organization": str(item.organization or "—"),
                 "used_devices": len(dev_list),
                 "max_devices": item.max_devices if item.max_devices is not None else 1,
-                "duration_days": item.duration_days or 30,
-                # 👇 Champs clés pour l'affichage de la durée dans le GUI
-                "duration_val": item.duration_val if item.duration_val is not None else 1,
-                "duration_unit": item.duration_unit or "Mois",
+                "duration_days": item.duration_days or DEFAULT_TRIAL_DAYS,
+                # ✅ Champs clés pour l'affichage de la durée dans le GUI
+                "duration_val": item.duration_val if item.duration_val is not None else DEFAULT_TRIAL_DAYS,
+                "duration_unit": item.duration_unit or DEFAULT_TRIAL_UNIT,
                 "is_active": bool(item.is_active and str(item.device_uuid) != "REVOKED"),
                 "created_at": item.created_at.isoformat() if item.created_at else "",
                 "expires_at": item.expires_at.isoformat() if item.expires_at else None
@@ -321,7 +338,7 @@ def create_admin_license(req: AdminCreateLicenseRequest, db: Session = Depends(g
         part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
         license_key = f"{part1}-{part2}-{part3}-{part4}"
 
-        days = 30
+        # ✅ Conversion de la durée en jours (basée sur les valeurs REÇUES)
         unit = req.duration_unit.lower()
         if "mois" in unit:
             days = req.duration_val * 30
@@ -334,7 +351,7 @@ def create_admin_license(req: AdminCreateLicenseRequest, db: Session = Depends(g
         else:
             days = req.duration_val
 
-        # 👇 La clé est créée INACTIVE par défaut (sauf si is_active=True envoyé explicitement)
+        # 👇 La clé est créée INACTIVE par défaut
         new_lic = LicenseKey(
             key=license_key,
             phone_number=req.phone_number.strip().replace(" ", ""),
@@ -363,7 +380,7 @@ def create_admin_license(req: AdminCreateLicenseRequest, db: Session = Depends(g
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Erreur DB: {str(e)}")
 
-# 👇 NOUVEL endpoint compatible avec le GUI (PUT /api/admin/licenses/{key})
+# 👇 Endpoint PUT pour la modification complète depuis le GUI
 @app.put("/api/admin/licenses/{key}")
 @app.put("/api/admin/licenses/{key}/")
 def update_admin_license_full(key: str, req: AdminUpdateLicenseRequest, db: Session = Depends(get_db)):
@@ -377,7 +394,6 @@ def update_admin_license_full(key: str, req: AdminUpdateLicenseRequest, db: Sess
     if req.organization is not None:
         lic.organization = req.organization.strip() if req.organization != "—" else ""
     if req.user_name is not None and req.user_name != "Non activé":
-        # On éclate le nom complet en first/last
         parts = req.user_name.strip().split(" ", 1)
         lic.first_name = parts[0] if len(parts) > 0 else ""
         lic.last_name = parts[1] if len(parts) > 1 else ""
@@ -386,7 +402,7 @@ def update_admin_license_full(key: str, req: AdminUpdateLicenseRequest, db: Sess
     if req.is_active is not None:
         lic.is_active = bool(req.is_active)
 
-    # Prolongation de la durée (ajoute au duration_days existant)
+    # Prolongation de la durée
     if req.extend_duration_val and req.extend_duration_unit:
         val = int(req.extend_duration_val)
         unit = req.extend_duration_unit.lower()
@@ -399,12 +415,10 @@ def update_admin_license_full(key: str, req: AdminUpdateLicenseRequest, db: Sess
         else:
             extra_days = val
 
-        lic.duration_days = (lic.duration_days or 30) + extra_days
-        # Mise à jour de l'affichage unitaire
+        lic.duration_days = (lic.duration_days or DEFAULT_TRIAL_DAYS) + extra_days
         lic.duration_val = val
         lic.duration_unit = req.extend_duration_unit
         if lic.activated_at:
-            # Recalcule la date d'expiration
             lic.expires_at = lic.activated_at + timedelta(days=lic.duration_days)
 
     db.commit()
@@ -421,7 +435,6 @@ def update_admin_license_full(key: str, req: AdminUpdateLicenseRequest, db: Sess
         "expires_at": lic.expires_at.isoformat() if lic.expires_at else None
     }
 
-# Conservé pour compatibilité avec l'ancienne API
 @app.put("/api/admin/licenses/{key}/update")
 @app.put("/api/admin/licenses/{key}/update/")
 def update_admin_license_legacy(key: str, req: AdminUpdateLicenseRequest, db: Session = Depends(get_db)):
