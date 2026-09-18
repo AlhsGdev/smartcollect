@@ -56,6 +56,9 @@ class LicenseKey(Base):
     device_uuid = Column(Text, default="[]")
     max_devices = Column(Integer, default=1)
     duration_days = Column(Integer, default=30)
+    # 👇 NOUVEAU : mémoriser la valeur/unité saisies pour l'affichage
+    duration_val = Column(Integer, default=1)
+    duration_unit = Column(String(20), default="Mois")
     created_at = Column(DateTime, default=get_utc_now)
     activated_at = Column(DateTime, nullable=True)
     expires_at = Column(DateTime, nullable=True)
@@ -74,12 +77,29 @@ class AppNews(Base):
     created_at = Column(DateTime, default=get_utc_now)
 
 
+# ==========================================
+# MIGRATIONS AUTOMATIQUES
+# ==========================================
 try:
     with engine.connect() as conn:
-        conn.execute(text("DO $$ BEGIN IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='licenses' AND column_name='email') THEN ALTER TABLE licenses ALTER COLUMN email DROP NOT NULL; END IF; END $$;"))
+        # Nettoyage ancien champ email
+        conn.execute(text(
+            "DO $$ BEGIN "
+            "IF EXISTS (SELECT 1 FROM information_schema.columns "
+            "WHERE table_name='licenses' AND column_name='email') "
+            "THEN ALTER TABLE licenses ALTER COLUMN email DROP NOT NULL; "
+            "END IF; END $$;"
+        ))
+        # Ajout des nouvelles colonnes duration_val / duration_unit si absentes
+        conn.execute(text(
+            "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS duration_val INTEGER DEFAULT 1;"
+        ))
+        conn.execute(text(
+            "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS duration_unit VARCHAR(20) DEFAULT 'Mois';"
+        ))
         conn.commit()
-except Exception:
-    pass
+except Exception as e:
+    print(f"[migration] {e}")
 
 Base.metadata.create_all(bind=engine)
 
@@ -124,11 +144,17 @@ class AdminCreateLicenseRequest(BaseModel):
     duration_val: int = 1
     duration_unit: str = "Mois"
     max_devices: int = 1
+    is_active: Optional[bool] = False  # 👈 Permet de créer en mode inactif
 
 class AdminUpdateLicenseRequest(BaseModel):
-    duration_val: int = 1
-    duration_unit: str = "Mois"
-    max_devices: int = 1
+    """Payload souple pour la modification complète depuis le GUI."""
+    phone_number: Optional[str] = None
+    user_name: Optional[str] = None
+    organization: Optional[str] = None
+    max_devices: Optional[int] = None
+    is_active: Optional[bool] = None
+    extend_duration_val: Optional[int] = None
+    extend_duration_unit: Optional[str] = None
 
 class NewsCreateRequest(BaseModel):
     title: str
@@ -183,6 +209,8 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
             device_uuid="[]",
             max_devices=1,
             duration_days=30,
+            duration_val=1,
+            duration_unit="Mois",
             created_at=get_utc_now()
         )
         db.add(new_lic)
@@ -274,6 +302,9 @@ def get_admin_licenses(db: Session = Depends(get_db)):
                 "used_devices": len(dev_list),
                 "max_devices": item.max_devices if item.max_devices is not None else 1,
                 "duration_days": item.duration_days or 30,
+                # 👇 Champs clés pour l'affichage de la durée dans le GUI
+                "duration_val": item.duration_val if item.duration_val is not None else 1,
+                "duration_unit": item.duration_unit or "Mois",
                 "is_active": bool(item.is_active and str(item.device_uuid) != "REVOKED"),
                 "created_at": item.created_at.isoformat() if item.created_at else "",
                 "expires_at": item.expires_at.isoformat() if item.expires_at else None
@@ -303,13 +334,16 @@ def create_admin_license(req: AdminCreateLicenseRequest, db: Session = Depends(g
         else:
             days = req.duration_val
 
+        # 👇 La clé est créée INACTIVE par défaut (sauf si is_active=True envoyé explicitement)
         new_lic = LicenseKey(
             key=license_key,
             phone_number=req.phone_number.strip().replace(" ", ""),
-            is_active=True,
+            is_active=bool(req.is_active) if req.is_active is not None else False,
             device_uuid="[]",
             max_devices=req.max_devices,
             duration_days=days,
+            duration_val=req.duration_val,
+            duration_unit=req.duration_unit,
             created_at=get_utc_now()
         )
         db.add(new_lic)
@@ -319,45 +353,79 @@ def create_admin_license(req: AdminCreateLicenseRequest, db: Session = Depends(g
         return {
             "id": new_lic.id,
             "key": license_key,
-            "phone_number": new_lic.phone_number
+            "phone_number": new_lic.phone_number,
+            "duration_val": new_lic.duration_val,
+            "duration_unit": new_lic.duration_unit,
+            "duration_days": new_lic.duration_days,
+            "is_active": new_lic.is_active
         }
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Erreur DB: {str(e)}")
 
-@app.put("/api/admin/licenses/{key}/update")
-@app.put("/api/admin/licenses/{key}/update/")
-def update_admin_license(key: str, req: AdminUpdateLicenseRequest, db: Session = Depends(get_db)):
+# 👇 NOUVEL endpoint compatible avec le GUI (PUT /api/admin/licenses/{key})
+@app.put("/api/admin/licenses/{key}")
+@app.put("/api/admin/licenses/{key}/")
+def update_admin_license_full(key: str, req: AdminUpdateLicenseRequest, db: Session = Depends(get_db)):
     lic = db.query(LicenseKey).filter(LicenseKey.key == key.strip().upper()).first()
     if not lic:
         raise HTTPException(status_code=404, detail="Licence introuvable.")
 
-    days = 30
-    unit = req.duration_unit.lower()
-    if "mois" in unit:
-        days = req.duration_val * 30
-    elif "an" in unit:
-        days = req.duration_val * 365
-    elif "jour" in unit:
-        days = req.duration_val
-    else:
-        days = req.duration_val
+    # Mise à jour des champs facultatifs
+    if req.phone_number is not None:
+        lic.phone_number = req.phone_number.strip().replace(" ", "")
+    if req.organization is not None:
+        lic.organization = req.organization.strip() if req.organization != "—" else ""
+    if req.user_name is not None and req.user_name != "Non activé":
+        # On éclate le nom complet en first/last
+        parts = req.user_name.strip().split(" ", 1)
+        lic.first_name = parts[0] if len(parts) > 0 else ""
+        lic.last_name = parts[1] if len(parts) > 1 else ""
+    if req.max_devices is not None:
+        lic.max_devices = int(req.max_devices)
+    if req.is_active is not None:
+        lic.is_active = bool(req.is_active)
 
-    lic.max_devices = req.max_devices
-    lic.duration_days = days
+    # Prolongation de la durée (ajoute au duration_days existant)
+    if req.extend_duration_val and req.extend_duration_unit:
+        val = int(req.extend_duration_val)
+        unit = req.extend_duration_unit.lower()
+        if "mois" in unit:
+            extra_days = val * 30
+        elif "an" in unit:
+            extra_days = val * 365
+        elif "jour" in unit:
+            extra_days = val
+        else:
+            extra_days = val
 
-    # Si la licence a déjà été activée, on recalcule la date d'expiration à partir de la date d'activation
-    if lic.activated_at:
-        lic.expires_at = lic.activated_at + timedelta(days=days)
+        lic.duration_days = (lic.duration_days or 30) + extra_days
+        # Mise à jour de l'affichage unitaire
+        lic.duration_val = val
+        lic.duration_unit = req.extend_duration_unit
+        if lic.activated_at:
+            # Recalcule la date d'expiration
+            lic.expires_at = lic.activated_at + timedelta(days=lic.duration_days)
 
     db.commit()
+    db.refresh(lic)
     return {
         "status": "success",
         "message": "Licence mise à jour avec succès !",
+        "key": lic.key,
+        "is_active": lic.is_active,
         "max_devices": lic.max_devices,
+        "duration_val": lic.duration_val,
+        "duration_unit": lic.duration_unit,
         "duration_days": lic.duration_days,
         "expires_at": lic.expires_at.isoformat() if lic.expires_at else None
     }
+
+# Conservé pour compatibilité avec l'ancienne API
+@app.put("/api/admin/licenses/{key}/update")
+@app.put("/api/admin/licenses/{key}/update/")
+def update_admin_license_legacy(key: str, req: AdminUpdateLicenseRequest, db: Session = Depends(get_db)):
+    return update_admin_license_full(key, req, db)
 
 @app.post("/api/admin/licenses/{key}/status")
 def toggle_admin_license_status(key: str, db: Session = Depends(get_db)):
