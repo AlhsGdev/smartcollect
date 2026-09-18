@@ -1,175 +1,704 @@
-def _build_devices_tab(self):
-    tab = QWidget()
-    layout = QVBoxLayout(tab)
-    layout.setContentsMargins(10, 10, 10, 10)
-    layout.setSpacing(12)
+import os
+import json
+import secrets
+from datetime import datetime, timedelta, timezone
+from typing import Optional, List
 
-    info_frame = QFrame()
-    info_frame.setStyleSheet(
-        "background-color: #111827; border: 1px solid #4f46e5; border-radius: 8px;"
-    )
-    info_layout = QVBoxLayout(info_frame)
-    info_layout.setContentsMargins(14, 12, 14, 12)
-    info_layout.setSpacing(6)
-    
-    title = QLabel("🔒 Appareils ayant tenté un essai gratuit")
-    title.setStyleSheet(
-        "color: #a5b4fc; font-size: 14px; font-weight: bold; border: none;"
-    )
-    info_layout.addWidget(title)
-    
-    subtitle = QLabel(
-        "Ces appareils sont identifiés par un ID unique. "
-        "Un appareil bloqué ne peut plus créer de nouvelle clé d'essai."
-    )
-    subtitle.setStyleSheet("color: #94a3b8; font-size: 11px; border: none;")
-    subtitle.setWordWrap(True)
-    info_layout.addWidget(subtitle)
-    
-    layout.addWidget(info_frame)
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text, text
+from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
-    self.devices_table = QTableWidget()
-    self.devices_table.setColumnCount(6)
-    self.devices_table.setHorizontalHeaderLabels([
-        "ID", "Device ID", "Téléphone", "Tentatives", "Statut", "Notes"
-    ])
-    self.devices_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-    self.devices_table.setSelectionBehavior(QTableWidget.SelectRows)
-    self.devices_table.setSelectionMode(QTableWidget.SingleSelection)
-    self.devices_table.verticalHeader().setVisible(False)
-    self.devices_table.horizontalHeader().setStretchLastSection(True)
+# ═══════════════════════════════════════════════════════════
+# CONFIGURATION GLOBALE
+# ═══════════════════════════════════════════════════════════
+DEFAULT_TRIAL_DAYS = 7
+DEFAULT_TRIAL_UNIT = "Jours"
 
-    dh = self.devices_table.horizontalHeader()
-    dh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-    dh.setSectionResizeMode(1, QHeaderView.Stretch)
-    dh.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-    dh.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-    dh.setSectionResizeMode(4, QHeaderView.ResizeToContents)
-    dh.setSectionResizeMode(5, QHeaderView.Stretch)
+# Niveau 4 — Limitations d'essai
+TRIAL_MAX_TABLES = 1        # 1 seul tableau autorisé pendant l'essai
+TRIAL_MAX_ROWS_PER_TABLE = 50   # 50 lignes max par tableau pendant l'essai
+TRIAL_ALLOW_EXPORT = False  # Export PDF/Excel désactivé pendant l'essai
 
-    layout.addWidget(self.devices_table, 1)
+# ==========================================
+# CONFIGURATION BASE DE DONNÉES (NEON / RENDER)
+# ==========================================
+DEFAULT_DB_URL = "postgresql://neondb_owner:npg_NmxZaUb7n1Co@ep-odd-rice-axq1ordl-pooler.c-4.us-east-2.aws.neon.tech/neondb?sslmode=require"
+DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_DB_URL)
 
-    actions = QHBoxLayout()
-    actions.setSpacing(8)
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-    btn_refresh = QPushButton("↻ Actualiser")
-    btn_refresh.setObjectName("btn_secondary")
-    btn_refresh.clicked.connect(self.load_devices)
-    actions.addWidget(btn_refresh)
+if "&channel_binding=require" in DATABASE_URL:
+    DATABASE_URL = DATABASE_URL.replace("&channel_binding=require", "")
+if "?channel_binding=require" in DATABASE_URL:
+    DATABASE_URL = DATABASE_URL.replace("?channel_binding=require", "")
 
-    btn_unblock = QPushButton("✅ Débloquer")
-    btn_unblock.setObjectName("btn_success")
-    btn_unblock.clicked.connect(self.unblock_device)
-    actions.addWidget(btn_unblock)
+engine_kwargs = {}
+if DATABASE_URL.startswith("sqlite"):
+    engine_kwargs["connect_args"] = {"check_same_thread": False}
+else:
+    engine_kwargs["pool_pre_ping"] = True
+    engine_kwargs["pool_recycle"] = 300
+    engine_kwargs["pool_size"] = 5
+    engine_kwargs["max_overflow"] = 10
 
-    btn_block = QPushButton("🚫 Bloquer")
-    btn_block.setObjectName("btn_warning")
-    btn_block.clicked.connect(self.block_device)
-    actions.addWidget(btn_block)
+engine = create_engine(DATABASE_URL, **engine_kwargs)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
 
-    actions.addStretch()
+def get_utc_now():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
-    btn_delete = QPushButton("🗑 Supprimer la trace")
-    btn_delete.setObjectName("btn_danger")
-    btn_delete.clicked.connect(self.delete_device_trace)
-    actions.addWidget(btn_delete)
+# ==========================================
+# MODÈLES SQLALCHEMY
+# ==========================================
+class LicenseKey(Base):
+    __tablename__ = "licenses"
 
-    layout.addLayout(actions)
-    return tab
+    id = Column(Integer, primary_key=True, index=True)
+    key = Column(String(32), unique=True, index=True, nullable=False)
+    phone_number = Column(String(50), default="", nullable=False, index=True)
+    first_name = Column(String(100), default="", nullable=True)
+    last_name = Column(String(100), default="", nullable=True)
+    organization = Column(String(150), default="", nullable=True)
+    is_active = Column(Boolean, default=True)
+    device_uuid = Column(Text, default="[]")
+    max_devices = Column(Integer, default=1)
+    duration_days = Column(Integer, default=DEFAULT_TRIAL_DAYS)
+    duration_val = Column(Integer, default=DEFAULT_TRIAL_DAYS)
+    duration_unit = Column(String(20), default=DEFAULT_TRIAL_UNIT)
+    created_at = Column(DateTime, default=get_utc_now)
+    activated_at = Column(DateTime, nullable=True)
+    expires_at = Column(DateTime, nullable=True)
 
 
-def load_devices(self):
-    def req():
-        r = requests.get(f"{API_URL}/api/admin/devices", timeout=12)
-        return (True, "OK", r.json()) if r.status_code == 200 else (False, r.text, None)
-    self._start_worker(req, self._on_devices_loaded)
+class DeviceAttempt(Base):
+    """Niveau 1 — Trace des tentatives d'essai par device_id."""
+    __tablename__ = "device_attempts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    device_id = Column(String(255), unique=True, index=True, nullable=False)
+    phone_number = Column(String(50), nullable=False)
+    first_attempt_at = Column(DateTime, default=get_utc_now)
+    last_attempt_at = Column(DateTime, default=get_utc_now)
+    attempts_count = Column(Integer, default=1)
+    is_blocked = Column(Boolean, default=False)
+    block_reason = Column(String(255), default="")
+    notes = Column(Text, default="")
 
 
-def _on_devices_loaded(self, data):
-    self.devices_table.setRowCount(0)
-    if not isinstance(data, list):
-        return
-    for row, dev in enumerate(data):
-        self.devices_table.insertRow(row)
-        self.devices_table.setRowHeight(row, 36)
-        is_blocked = bool(dev.get("is_blocked", False))
-        cols = [
-            str(dev.get("id", "")),
-            str(dev.get("device_id", "")),
-            str(dev.get("phone_number", "—")),
-            str(dev.get("attempts_count", 1)),
-            "🔴 BLOQUÉ" if is_blocked else "🟢 Autorisé",
-            str(dev.get("notes") or dev.get("block_reason") or "—"),
-        ]
-        for c_idx, text in enumerate(cols):
-            item = QTableWidgetItem(text)
-            item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
-            item.setTextAlignment(Qt.AlignCenter)
-            if c_idx == 1:
-                item.setFont(QFont("Consolas", 9))
-                item.setForeground(QColor("#818cf8"))
-            elif c_idx == 4:
-                item.setFont(QFont("Segoe UI", 10, QFont.Bold))
-                item.setForeground(
-                    QColor("#f87171") if is_blocked else QColor("#34d399")
+class AppNews(Base):
+    __tablename__ = "news"
+
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(255), nullable=False)
+    summary = Column(Text, nullable=False)
+    content = Column(Text, default="", nullable=True)
+    category = Column(String(50), default="news")
+    version = Column(String(50), nullable=True)
+    download_url = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=get_utc_now)
+
+
+# ==========================================
+# MIGRATIONS AUTOMATIQUES
+# ==========================================
+try:
+    with engine.connect() as conn:
+        # Nettoyage ancien champ email
+        conn.execute(text(
+            "DO $$ BEGIN "
+            "IF EXISTS (SELECT 1 FROM information_schema.columns "
+            "WHERE table_name='licenses' AND column_name='email') "
+            "THEN ALTER TABLE licenses ALTER COLUMN email DROP NOT NULL; "
+            "END IF; END $$;"
+        ))
+        # Ajout des colonnes duration_val / duration_unit
+        conn.execute(text(
+            "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS duration_val INTEGER DEFAULT 7;"
+        ))
+        conn.execute(text(
+            "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS duration_unit VARCHAR(20) DEFAULT 'Jours';"
+        ))
+        conn.execute(text(
+            f"ALTER TABLE licenses ALTER COLUMN duration_days SET DEFAULT {DEFAULT_TRIAL_DAYS};"
+        ))
+        # Table device_attempts (créée automatiquement par Base.metadata.create_all)
+        conn.commit()
+except Exception as e:
+    print(f"[migration] {e}")
+
+Base.metadata.create_all(bind=engine)
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# ==========================================
+# APPLICATION FASTAPI
+# ==========================================
+app = FastAPI(title="SmartCollect API & Admin Server", redirect_slashes=True)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ==========================================
+# SCHÉMAS PYDANTIC
+# ==========================================
+class SelfRegisterPhoneRequest(BaseModel):
+    first_name: str
+    last_name: str
+    phone_number: str
+    organization: Optional[str] = ""
+    device_id: str  # ✅ NOUVEAU : identifiant unique de l'appareil
+
+
+class FlutterVerifyRequest(BaseModel):
+    key: str
+    device_id: str
+    first_name: Optional[str] = ""
+    last_name: Optional[str] = ""
+    organization: Optional[str] = ""
+
+
+class AdminCreateLicenseRequest(BaseModel):
+    phone_number: str
+    duration_val: int
+    duration_unit: str
+    max_devices: int = 1
+    is_active: Optional[bool] = False
+
+
+class AdminUpdateLicenseRequest(BaseModel):
+    phone_number: Optional[str] = None
+    user_name: Optional[str] = None
+    organization: Optional[str] = None
+    max_devices: Optional[int] = None
+    is_active: Optional[bool] = None
+    extend_duration_val: Optional[int] = None
+    extend_duration_unit: Optional[str] = None
+
+
+class NewsCreateRequest(BaseModel):
+    title: str
+    summary: str
+    content: Optional[str] = ""
+    category: str = "news"
+    version: Optional[str] = None
+    download_url: Optional[str] = None
+
+
+class DeviceUpdateRequest(BaseModel):
+    is_blocked: Optional[bool] = None
+    notes: Optional[str] = None
+
+
+# ==========================================
+# ROUTES PUBLIQUES
+# ==========================================
+@app.get("/")
+def home():
+    return {
+        "status": "online",
+        "database": "Neon PostgreSQL",
+        "service": "SmartCollect Unified API",
+        "default_trial_days": DEFAULT_TRIAL_DAYS,
+        "trial_max_tables": TRIAL_MAX_TABLES,
+        "trial_max_rows": TRIAL_MAX_ROWS_PER_TABLE,
+        "trial_allow_export": TRIAL_ALLOW_EXPORT,
+    }
+
+@app.get("/health")
+def health():
+    return {"status": "healthy"}
+
+
+# ==========================================
+# ROUTES FLUTTER
+# ==========================================
+@app.post("/api/license/request-key")
+@app.post("/api/license/request-key/")
+def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get_db)):
+    try:
+        clean_phone = req.phone_number.strip().replace(" ", "")
+        clean_device = req.device_id.strip()
+
+        if not clean_device:
+            raise HTTPException(status_code=400, detail="Identifiant d'appareil requis.")
+
+        # ✅ NIVEAU 1 : Vérifier si cet appareil a déjà eu un essai
+        existing_device = db.query(DeviceAttempt).filter(
+            DeviceAttempt.device_id == clean_device
+        ).first()
+
+        if existing_device:
+            if existing_device.is_blocked:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Cet appareil a déjà utilisé son essai gratuit. Veuillez souscrire à une licence."
                 )
-            self.devices_table.setItem(row, c_idx, item)
 
+            # L'appareil a déjà eu un essai avec un AUTRE numéro → bloquer
+            if existing_device.phone_number != clean_phone:
+                existing_device.attempts_count += 1
+                existing_device.last_attempt_at = get_utc_now()
+                existing_device.is_blocked = True
+                existing_device.block_reason = (
+                    f"Tentative multiple ({existing_device.attempts_count}x) "
+                    f"avec des numéros différents"
+                )
+                db.commit()
+                raise HTTPException(
+                    status_code=403,
+                    detail="Cet appareil a déjà utilisé son essai gratuit avec un autre numéro."
+                )
 
-def unblock_device(self):
-    row = self.devices_table.currentRow()
-    if row < 0:
-        QMessageBox.warning(self, "Sélection requise",
-                            "Sélectionnez un appareil à débloquer.")
-        return
-    device_id = self.devices_table.item(row, 1).text()
-    def req():
-        r = requests.put(
-            f"{API_URL}/api/admin/devices/{device_id}",
-            json={"is_blocked": False, "notes": "Débloqué manuellement"},
-            timeout=12
+            # Même appareil + même numéro → renvoyer la clé existante
+            existing_lic = db.query(LicenseKey).filter(
+                LicenseKey.phone_number == clean_phone
+            ).first()
+            if existing_lic:
+                return {
+                    "status": "success",
+                    "message": "Une clé existe déjà pour ce numéro.",
+                    "license_key": existing_lic.key,
+                    "trial_days": existing_lic.duration_days or DEFAULT_TRIAL_DAYS
+                }
+
+        # Vérifier si le numéro existe déjà sans appareil enregistré
+        existing_lic = db.query(LicenseKey).filter(
+            LicenseKey.phone_number == clean_phone
+        ).first()
+        if existing_lic:
+            # Enregistrer quand même l'appareil s'il est nouveau
+            if not existing_device:
+                new_attempt = DeviceAttempt(
+                    device_id=clean_device,
+                    phone_number=clean_phone,
+                    attempts_count=1,
+                    is_blocked=False
+                )
+                db.add(new_attempt)
+                db.commit()
+            return {
+                "status": "success",
+                "message": "Une clé existe déjà pour ce numéro.",
+                "license_key": existing_lic.key,
+                "trial_days": existing_lic.duration_days or DEFAULT_TRIAL_DAYS
+            }
+
+        # ✅ Enregistrer la tentative de cet appareil
+        new_attempt = DeviceAttempt(
+            device_id=clean_device,
+            phone_number=clean_phone,
+            attempts_count=1,
+            is_blocked=False
         )
-        return (True, "OK", r.json()) if r.status_code == 200 else (False, r.text, None)
-    def on_done(_):
-        self.load_devices()
-        QMessageBox.information(self, "Succès", f"Appareil {device_id} débloqué.")
-    self._start_worker(req, on_done)
+        db.add(new_attempt)
 
+        # Créer la clé avec la durée par défaut
+        part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
+        license_key = f"{part1}-{part2}-{part3}-{part4}"
 
-def block_device(self):
-    row = self.devices_table.currentRow()
-    if row < 0:
-        QMessageBox.warning(self, "Sélection requise",
-                            "Sélectionnez un appareil à bloquer.")
-        return
-    device_id = self.devices_table.item(row, 1).text()
-    def req():
-        r = requests.put(
-            f"{API_URL}/api/admin/devices/{device_id}",
-            json={"is_blocked": True, "notes": "Bloqué manuellement"},
-            timeout=12
+        new_lic = LicenseKey(
+            key=license_key,
+            phone_number=clean_phone,
+            first_name=req.first_name.strip(),
+            last_name=req.last_name.strip(),
+            organization=req.organization.strip() if req.organization else "",
+            is_active=True,
+            device_uuid="[]",
+            max_devices=1,
+            duration_days=DEFAULT_TRIAL_DAYS,
+            duration_val=DEFAULT_TRIAL_DAYS,
+            duration_unit=DEFAULT_TRIAL_UNIT,
+            created_at=get_utc_now()
         )
-        return (True, "OK", r.json()) if r.status_code == 200 else (False, r.text, None)
-    def on_done(_):
-        self.load_devices()
-        QMessageBox.information(self, "Succès", f"Appareil {device_id} bloqué.")
-    self._start_worker(req, on_done)
+        db.add(new_lic)
+        db.commit()
+        db.refresh(new_lic)
+
+        return {
+            "status": "success",
+            "message": "Clé générée avec succès !",
+            "license_key": license_key,
+            "trial_days": DEFAULT_TRIAL_DAYS
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Erreur DB: {str(e)}")
 
 
-def delete_device_trace(self):
-    row = self.devices_table.currentRow()
-    if row < 0:
-        QMessageBox.warning(self, "Sélection requise",
-                            "Sélectionnez un appareil à supprimer.")
-        return
-    device_id = self.devices_table.item(row, 1).text()
-    if QMessageBox.question(
-        self, "Supprimer",
-        f"Supprimer la trace de l'appareil {device_id} ?\n\n"
-        "L'utilisateur pourra recommencer un essai.",
-        QMessageBox.Yes | QMessageBox.No
-    ) == QMessageBox.Yes:
-        def req():
-            r = requests.delete(f"{API_URL}/api/admin/devices/{device_id}", timeout=12)
-            return (True, "OK", r.json()) if r.status_code == 200 else (False, r.text, None)
-        self._start_worker(req, lambda _: self.load_devices())
+@app.post("/api/license/verify")
+@app.post("/api/license/verify/")
+def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(get_db)):
+    try:
+        clean_key = req.key.strip().upper()
+        license_entry = db.query(LicenseKey).filter(LicenseKey.key == clean_key).first()
+
+        if not license_entry:
+            raise HTTPException(status_code=404, detail="Clé de licence introuvable.")
+
+        if not license_entry.is_active or license_entry.device_uuid == "REVOKED":
+            raise HTTPException(status_code=403, detail="Cette licence a été désactivée ou révoquée.")
+
+        now = get_utc_now()
+        if license_entry.expires_at and now > license_entry.expires_at:
+            raise HTTPException(status_code=403, detail="Cette licence a expiré.")
+
+        if not license_entry.activated_at:
+            license_entry.activated_at = now
+            license_entry.expires_at = now + timedelta(
+                days=license_entry.duration_days or DEFAULT_TRIAL_DAYS
+            )
+
+        try:
+            devices = json.loads(license_entry.device_uuid or "[]") if isinstance(license_entry.device_uuid, str) else []
+        except Exception:
+            devices = []
+
+        max_dev = license_entry.max_devices or 1
+        if req.device_id not in devices:
+            if len(devices) >= max_dev:
+                raise HTTPException(status_code=403, detail="Limite d'appareils atteinte pour cette clé.")
+            devices.append(req.device_id)
+            license_entry.device_uuid = json.dumps(devices)
+
+        db.commit()
+
+        # ✅ Niveau 4 : Renvoyer les limitations d'essai à l'app
+        return {
+            "status": "valid",
+            "phone_number": license_entry.phone_number or "",
+            "expires_at": license_entry.expires_at.strftime("%Y-%m-%d %H:%M:%S") if license_entry.expires_at else None,
+            "is_trial": license_entry.activated_at is not None and license_entry.duration_days <= 30,
+            "limits": {
+                "max_tables": TRIAL_MAX_TABLES,
+                "max_rows_per_table": TRIAL_MAX_ROWS_PER_TABLE,
+                "allow_export": TRIAL_ALLOW_EXPORT,
+            }
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Erreur DB: {str(e)}")
+
+
+# ==========================================
+# ROUTES ADMINISTRATION DES LICENCES (GUI)
+# ==========================================
+@app.get("/api/admin/licenses")
+@app.get("/api/admin/licenses/")
+def get_admin_licenses(db: Session = Depends(get_db)):
+    try:
+        licenses = db.query(LicenseKey).order_by(LicenseKey.id.desc()).all()
+        results = []
+
+        for item in licenses:
+            try:
+                raw_dev = str(item.device_uuid or "[]")
+                dev_list = json.loads(raw_dev) if raw_dev not in ["REVOKED", ""] else []
+            except Exception:
+                dev_list = []
+
+            first = str(item.first_name or "")
+            last = str(item.last_name or "")
+            full_name = f"{first} {last}".strip()
+
+            results.append({
+                "id": item.id,
+                "key": str(item.key or ""),
+                "phone_number": str(item.phone_number or "—"),
+                "user_name": full_name if full_name else "Non activé",
+                "organization": str(item.organization or "—"),
+                "used_devices": len(dev_list),
+                "max_devices": item.max_devices if item.max_devices is not None else 1,
+                "duration_days": item.duration_days or DEFAULT_TRIAL_DAYS,
+                "duration_val": item.duration_val if item.duration_val is not None else DEFAULT_TRIAL_DAYS,
+                "duration_unit": item.duration_unit or DEFAULT_TRIAL_UNIT,
+                "is_active": bool(item.is_active and str(item.device_uuid) != "REVOKED"),
+                "created_at": item.created_at.isoformat() if item.created_at else "",
+                "expires_at": item.expires_at.isoformat() if item.expires_at else None
+            })
+
+        return results
+    except Exception as err:
+        raise HTTPException(status_code=500, detail=f"Erreur SQL/Python: {str(err)}")
+
+
+@app.post("/api/admin/licenses/create")
+@app.post("/api/admin/licenses/create/")
+def create_admin_license(req: AdminCreateLicenseRequest, db: Session = Depends(get_db)):
+    try:
+        part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
+        license_key = f"{part1}-{part2}-{part3}-{part4}"
+
+        unit = req.duration_unit.lower()
+        if "mois" in unit:
+            days = req.duration_val * 30
+        elif "an" in unit:
+            days = req.duration_val * 365
+        elif "jour" in unit:
+            days = req.duration_val
+        elif "heure" in unit:
+            days = max(1, req.duration_val // 24)
+        else:
+            days = req.duration_val
+
+        new_lic = LicenseKey(
+            key=license_key,
+            phone_number=req.phone_number.strip().replace(" ", ""),
+            is_active=bool(req.is_active) if req.is_active is not None else False,
+            device_uuid="[]",
+            max_devices=req.max_devices,
+            duration_days=days,
+            duration_val=req.duration_val,
+            duration_unit=req.duration_unit,
+            created_at=get_utc_now()
+        )
+        db.add(new_lic)
+        db.commit()
+        db.refresh(new_lic)
+
+        return {
+            "id": new_lic.id,
+            "key": license_key,
+            "phone_number": new_lic.phone_number,
+            "duration_val": new_lic.duration_val,
+            "duration_unit": new_lic.duration_unit,
+            "duration_days": new_lic.duration_days,
+            "is_active": new_lic.is_active
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Erreur DB: {str(e)}")
+
+
+@app.put("/api/admin/licenses/{key}")
+@app.put("/api/admin/licenses/{key}/")
+def update_admin_license_full(key: str, req: AdminUpdateLicenseRequest, db: Session = Depends(get_db)):
+    lic = db.query(LicenseKey).filter(LicenseKey.key == key.strip().upper()).first()
+    if not lic:
+        raise HTTPException(status_code=404, detail="Licence introuvable.")
+
+    if req.phone_number is not None:
+        lic.phone_number = req.phone_number.strip().replace(" ", "")
+    if req.organization is not None:
+        lic.organization = req.organization.strip() if req.organization != "—" else ""
+    if req.user_name is not None and req.user_name != "Non activé":
+        parts = req.user_name.strip().split(" ", 1)
+        lic.first_name = parts[0] if len(parts) > 0 else ""
+        lic.last_name = parts[1] if len(parts) > 1 else ""
+    if req.max_devices is not None:
+        lic.max_devices = int(req.max_devices)
+    if req.is_active is not None:
+        lic.is_active = bool(req.is_active)
+
+    if req.extend_duration_val and req.extend_duration_unit:
+        val = int(req.extend_duration_val)
+        unit = req.extend_duration_unit.lower()
+        if "mois" in unit:
+            extra_days = val * 30
+        elif "an" in unit:
+            extra_days = val * 365
+        elif "jour" in unit:
+            extra_days = val
+        else:
+            extra_days = val
+
+        lic.duration_days = (lic.duration_days or DEFAULT_TRIAL_DAYS) + extra_days
+        lic.duration_val = val
+        lic.duration_unit = req.extend_duration_unit
+        if lic.activated_at:
+            lic.expires_at = lic.activated_at + timedelta(days=lic.duration_days)
+
+    db.commit()
+    db.refresh(lic)
+    return {
+        "status": "success",
+        "message": "Licence mise à jour avec succès !",
+        "key": lic.key,
+        "is_active": lic.is_active,
+        "max_devices": lic.max_devices,
+        "duration_val": lic.duration_val,
+        "duration_unit": lic.duration_unit,
+        "duration_days": lic.duration_days,
+        "expires_at": lic.expires_at.isoformat() if lic.expires_at else None
+    }
+
+
+@app.post("/api/admin/licenses/{key}/status")
+def toggle_admin_license_status(key: str, db: Session = Depends(get_db)):
+    lic = db.query(LicenseKey).filter(LicenseKey.key == key.strip().upper()).first()
+    if not lic:
+        raise HTTPException(status_code=404, detail="Licence introuvable.")
+
+    lic.is_active = not lic.is_active
+    db.commit()
+    return {"status": "success", "is_active": lic.is_active}
+
+
+@app.post("/api/admin/licenses/{key}/reset-devices")
+def reset_admin_license_devices(key: str, db: Session = Depends(get_db)):
+    lic = db.query(LicenseKey).filter(LicenseKey.key == key.strip().upper()).first()
+    if not lic:
+        raise HTTPException(status_code=404, detail="Licence introuvable.")
+
+    lic.device_uuid = "[]"
+    lic.activated_at = None
+    lic.expires_at = None
+    db.commit()
+    return {"status": "success", "message": "Appareils dissociés."}
+
+
+@app.delete("/api/admin/licenses/{key}")
+def delete_admin_license(key: str, db: Session = Depends(get_db)):
+    lic = db.query(LicenseKey).filter(LicenseKey.key == key.strip().upper()).first()
+    if not lic:
+        raise HTTPException(status_code=404, detail="Licence introuvable.")
+
+    db.delete(lic)
+    db.commit()
+    return {"status": "success", "message": "Licence supprimée définitivement."}
+
+
+# ═══════════════════════════════════════════════════════════
+# ✅ NOUVELLES ROUTES : Gestion des appareils bloqués
+# ═══════════════════════════════════════════════════════════
+@app.get("/api/admin/devices")
+@app.get("/api/admin/devices/")
+def get_admin_devices(db: Session = Depends(get_db)):
+    """Liste tous les appareils qui ont tenté un essai."""
+    try:
+        devices = db.query(DeviceAttempt).order_by(
+            DeviceAttempt.last_attempt_at.desc()
+        ).all()
+        return [
+            {
+                "id": d.id,
+                "device_id": d.device_id,
+                "phone_number": d.phone_number,
+                "attempts_count": d.attempts_count,
+                "is_blocked": d.is_blocked,
+                "block_reason": d.block_reason or "",
+                "notes": d.notes or "",
+                "first_attempt_at": d.first_attempt_at.isoformat() if d.first_attempt_at else "",
+                "last_attempt_at": d.last_attempt_at.isoformat() if d.last_attempt_at else "",
+            }
+            for d in devices
+        ]
+    except Exception as err:
+        raise HTTPException(status_code=500, detail=f"Erreur SQL: {str(err)}")
+
+
+@app.put("/api/admin/devices/{device_id}")
+@app.put("/api/admin/devices/{device_id}/")
+def update_admin_device(device_id: str, req: DeviceUpdateRequest, db: Session = Depends(get_db)):
+    """Débloque ou bloque manuellement un appareil."""
+    dev = db.query(DeviceAttempt).filter(DeviceAttempt.device_id == device_id.strip()).first()
+    if not dev:
+        raise HTTPException(status_code=404, detail="Appareil introuvable.")
+
+    if req.is_blocked is not None:
+        dev.is_blocked = bool(req.is_blocked)
+        if not req.is_blocked:
+            dev.block_reason = ""
+    if req.notes is not None:
+        dev.notes = req.notes
+
+    db.commit()
+    db.refresh(dev)
+    return {
+        "status": "success",
+        "device_id": dev.device_id,
+        "is_blocked": dev.is_blocked,
+        "notes": dev.notes
+    }
+
+
+@app.delete("/api/admin/devices/{device_id}")
+def delete_admin_device(device_id: str, db: Session = Depends(get_db)):
+    """Supprime définitivement la trace d'un appareil (pour tests)."""
+    dev = db.query(DeviceAttempt).filter(DeviceAttempt.device_id == device_id.strip()).first()
+    if not dev:
+        raise HTTPException(status_code=404, detail="Appareil introuvable.")
+
+    db.delete(dev)
+    db.commit()
+    return {"status": "success", "message": "Trace d'appareil supprimée."}
+
+
+# ==========================================
+# ROUTES ACTUALITÉS & ASTUCES
+# ==========================================
+@app.get("/api/news")
+@app.get("/api/news/")
+def get_all_news(db: Session = Depends(get_db)):
+    try:
+        news_items = db.query(AppNews).order_by(AppNews.id.desc()).all()
+        results = []
+        for n in news_items:
+            results.append({
+                "id": str(n.id),
+                "title": str(n.title or ""),
+                "summary": str(n.summary or ""),
+                "content": str(n.content or ""),
+                "category": str(n.category or "news"),
+                "version": n.version,
+                "download_url": n.download_url,
+                "created_at": n.created_at.isoformat() if n.created_at else get_utc_now().isoformat()
+            })
+        return results
+    except Exception as err:
+        raise HTTPException(status_code=500, detail=f"Erreur SQL News: {str(err)}")
+
+
+@app.post("/api/admin/news/create")
+@app.post("/api/admin/news/create/")
+def create_admin_news(req: NewsCreateRequest, db: Session = Depends(get_db)):
+    new_article = AppNews(
+        title=req.title.strip(),
+        summary=req.summary.strip(),
+        content=req.content.strip() if req.content else "",
+        category=req.category,
+        version=req.version.strip() if req.version else None,
+        download_url=req.download_url.strip() if req.download_url else None,
+        created_at=get_utc_now()
+    )
+    db.add(new_article)
+    db.commit()
+    db.refresh(new_article)
+
+    return {
+        "status": "success",
+        "id": new_article.id,
+        "title": new_article.title
+    }
+
+
+@app.delete("/api/admin/news/{news_id}")
+def delete_admin_news(news_id: int, db: Session = Depends(get_db)):
+    item = db.query(AppNews).filter(AppNews.id == news_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Article introuvable.")
+    db.delete(item)
+    db.commit()
+    return {"status": "success", "message": "Actualité supprimée."}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
