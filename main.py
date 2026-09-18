@@ -64,7 +64,7 @@ class LicenseKey(Base):
     last_name = Column(String(100), default="", nullable=True)
     organization = Column(String(150), default="", nullable=True)
     is_active = Column(Boolean, default=True)
-    is_trial = Column(Boolean, default=True)  # ✅ NOUVEAU
+    is_trial = Column(Boolean, default=True)
     device_uuid = Column(Text, default="[]")
     max_devices = Column(Integer, default=1)
     duration_days = Column(Integer, default=DEFAULT_TRIAL_DAYS)
@@ -121,7 +121,6 @@ try:
         conn.execute(text(
             "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS duration_unit VARCHAR(20) DEFAULT 'Jours';"
         ))
-        # ✅ Nouvelle colonne is_trial
         conn.execute(text(
             "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS is_trial BOOLEAN DEFAULT TRUE;"
         ))
@@ -205,8 +204,14 @@ class DeviceUpdateRequest(BaseModel):
     notes: Optional[str] = None
 
 
-# ✅ NOUVEAU : Payload pour "Accorder tous les accès"
+# ✅ Payload pour "Accorder tous les accès"
 class GrantFullAccessRequest(BaseModel):
+    duration_val: int
+    duration_unit: str
+
+
+# ✅ NOUVEAU : Payload pour "Remettre en essai"
+class ResetToTrialRequest(BaseModel):
     duration_val: int
     duration_unit: str
 
@@ -244,7 +249,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
         if not clean_device:
             raise HTTPException(status_code=400, detail="Identifiant d'appareil requis.")
 
-        # ✅ NIVEAU 1 : Vérifier si cet appareil a déjà eu un essai
         existing_device = db.query(DeviceAttempt).filter(
             DeviceAttempt.device_id == clean_device
         ).first()
@@ -319,7 +323,7 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
             last_name=req.last_name.strip(),
             organization=req.organization.strip() if req.organization else "",
             is_active=True,
-            is_trial=True,  # ✅ Essai par défaut
+            is_trial=True,
             device_uuid="[]",
             max_devices=1,
             duration_days=DEFAULT_TRIAL_DAYS,
@@ -381,7 +385,6 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
 
         db.commit()
 
-        # ✅ Niveau 4 : Renvoyer les limitations selon le mode
         is_trial = bool(license_entry.is_trial)
         return {
             "status": "valid",
@@ -434,7 +437,7 @@ def get_admin_licenses(db: Session = Depends(get_db)):
                 "duration_val": item.duration_val if item.duration_val is not None else DEFAULT_TRIAL_DAYS,
                 "duration_unit": item.duration_unit or DEFAULT_TRIAL_UNIT,
                 "is_active": bool(item.is_active and str(item.device_uuid) != "REVOKED"),
-                "is_trial": bool(item.is_trial),  # ✅ NOUVEAU
+                "is_trial": bool(item.is_trial),
                 "created_at": item.created_at.isoformat() if item.created_at else "",
                 "expires_at": item.expires_at.isoformat() if item.expires_at else None
             })
@@ -467,7 +470,7 @@ def create_admin_license(req: AdminCreateLicenseRequest, db: Session = Depends(g
             key=license_key,
             phone_number=req.phone_number.strip().replace(" ", ""),
             is_active=bool(req.is_active) if req.is_active is not None else False,
-            is_trial=True,  # ✅ Essai par défaut
+            is_trial=True,
             device_uuid="[]",
             max_devices=req.max_devices,
             duration_days=days,
@@ -559,7 +562,7 @@ def toggle_admin_license_status(key: str, db: Session = Depends(get_db)):
 
 
 # ═══════════════════════════════════════════════════════════
-# ✅ NOUVELLE ROUTE : Accorder tous les accès
+# ⭐ ACCORDER L'ACCÈS COMPLET
 # ═══════════════════════════════════════════════════════════
 @app.post("/api/admin/licenses/{key}/grant-full-access")
 @app.post("/api/admin/licenses/{key}/grant-full-access/")
@@ -576,7 +579,6 @@ def grant_full_access(
     if not lic:
         raise HTTPException(status_code=404, detail="Licence introuvable.")
 
-    # Convertir la durée en jours
     unit = req.duration_unit.lower()
     if "mois" in unit:
         days = req.duration_val * 30
@@ -589,14 +591,12 @@ def grant_full_access(
     else:
         days = req.duration_val
 
-    # Appliquer les paramètres de licence complète
     lic.is_active = True
-    lic.is_trial = False  # ✅ Sort du mode essai
+    lic.is_trial = False
     lic.duration_val = req.duration_val
     lic.duration_unit = req.duration_unit
     lic.duration_days = days
 
-    # Activer et fixer l'expiration à partir de maintenant
     now = get_utc_now()
     lic.activated_at = now
     lic.expires_at = now + timedelta(days=days)
@@ -607,6 +607,62 @@ def grant_full_access(
     return {
         "status": "success",
         "message": f"Tous les accès accordés pour {req.duration_val} {req.duration_unit}.",
+        "key": lic.key,
+        "is_active": lic.is_active,
+        "is_trial": lic.is_trial,
+        "duration_val": lic.duration_val,
+        "duration_unit": lic.duration_unit,
+        "duration_days": lic.duration_days,
+        "expires_at": lic.expires_at.isoformat() if lic.expires_at else None
+    }
+
+
+# ═══════════════════════════════════════════════════════════
+# ↩ REMETTRE EN MODE ESSAI
+# ═══════════════════════════════════════════════════════════
+@app.post("/api/admin/licenses/{key}/reset-to-trial")
+@app.post("/api/admin/licenses/{key}/reset-to-trial/")
+def reset_license_to_trial(
+    key: str,
+    req: ResetToTrialRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    Repasse une licence en mode ESSAI avec les limitations Niveau 4
+    (1 tableau, 50 lignes, exports bloqués).
+    """
+    lic = db.query(LicenseKey).filter(LicenseKey.key == key.strip().upper()).first()
+    if not lic:
+        raise HTTPException(status_code=404, detail="Licence introuvable.")
+
+    unit = req.duration_unit.lower()
+    if "mois" in unit:
+        days = req.duration_val * 30
+    elif "an" in unit:
+        days = req.duration_val * 365
+    elif "jour" in unit:
+        days = req.duration_val
+    elif "heure" in unit:
+        days = max(1, req.duration_val // 24)
+    else:
+        days = req.duration_val
+
+    lic.is_active = True
+    lic.is_trial = True
+    lic.duration_val = req.duration_val
+    lic.duration_unit = req.duration_unit
+    lic.duration_days = days
+
+    now = get_utc_now()
+    lic.activated_at = now
+    lic.expires_at = now + timedelta(days=days)
+
+    db.commit()
+    db.refresh(lic)
+
+    return {
+        "status": "success",
+        "message": f"Licence remise en essai pour {req.duration_val} {req.duration_unit}.",
         "key": lic.key,
         "is_active": lic.is_active,
         "is_trial": lic.is_trial,
