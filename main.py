@@ -18,13 +18,12 @@ from sqlalchemy.orm import declarative_base, sessionmaker, Session
 DEFAULT_TRIAL_DAYS = 7
 DEFAULT_TRIAL_UNIT = "Jours"
 
-# Niveau 4 — Limitations d'essai
 TRIAL_MAX_TABLES = 1
 TRIAL_MAX_ROWS_PER_TABLE = 50
 TRIAL_ALLOW_EXPORT = False
 
 # ==========================================
-# CONFIGURATION BASE DE DONNÉES (NEON / RENDER)
+# CONFIGURATION BASE DE DONNÉES
 # ==========================================
 DEFAULT_DB_URL = "postgresql://neondb_owner:npg_NmxZaUb7n1Co@ep-odd-rice-axq1ordl-pooler.c-4.us-east-2.aws.neon.tech/neondb?sslmode=require"
 DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_DB_URL)
@@ -54,7 +53,6 @@ else:
     }
 
 
-# ✅ Retry pour Neon (cold start)
 def _create_engine_with_retry(url, kwargs, retries=3):
     for attempt in range(retries):
         try:
@@ -104,12 +102,7 @@ class LicenseKey(Base):
 
 
 class DeviceAttempt(Base):
-    """Trace des tentatives d'essai par device_id matériel.
-    
-    ⚠️ CRITIQUE : le device_id est désormais STABLE après réinstallation
-    (basé sur le fingerprint matériel côté Flutter). Donc cette table
-    empêche réellement les essais multiples.
-    """
+    """Trace des tentatives d'essai par device_id matériel."""
     __tablename__ = "device_attempts"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -121,6 +114,10 @@ class DeviceAttempt(Base):
     is_blocked = Column(Boolean, default=False)
     block_reason = Column(String(255), default="")
     notes = Column(Text, default="")
+    
+    # ✅ NOUVEAU : autorisation admin pour autoriser un nouvel essai
+    admin_unblocked = Column(Boolean, default=False)
+    admin_unblocked_at = Column(DateTime, nullable=True)
 
 
 class AppNews(Base):
@@ -137,7 +134,7 @@ class AppNews(Base):
 
 
 # ==========================================
-# MIGRATIONS ROBUSTES (une par une, isolées)
+# MIGRATIONS ROBUSTES
 # ==========================================
 print("[startup] Début des migrations...")
 
@@ -152,6 +149,9 @@ migrations = [
     ("ADD duration_unit", "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS duration_unit VARCHAR(20) DEFAULT 'Jours'"),
     ("ADD is_trial", "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS is_trial BOOLEAN DEFAULT TRUE"),
     ("SET duration_days default", f"ALTER TABLE licenses ALTER COLUMN duration_days SET DEFAULT {DEFAULT_TRIAL_DAYS}"),
+    # ✅ NOUVELLES COLONNES POUR LE DÉBLOCAGE ADMIN
+    ("ADD admin_unblocked", "ALTER TABLE device_attempts ADD COLUMN IF NOT EXISTS admin_unblocked BOOLEAN DEFAULT FALSE"),
+    ("ADD admin_unblocked_at", "ALTER TABLE device_attempts ADD COLUMN IF NOT EXISTS admin_unblocked_at TIMESTAMP"),
 ]
 
 for name, sql in migrations:
@@ -285,35 +285,43 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
     """
     ⚠️ RÈGLES STRICTES ANTI-ESSAIS MULTIPLES :
     
-    1. Un appareil (device_id) ne peut obtenir QU'UN SEUL essai gratuit, 
-       peu importe le numéro de téléphone utilisé.
-    2. Un numéro de téléphone ne peut obtenir QU'UNE SEULE licence, 
-       peu importe l'appareil utilisé.
-    3. Une réinstallation de l'app NE contourne PAS ces règles car le 
-       device_id est basé sur le fingerprint matériel (stable).
-    4. Seul l'ADMIN peut débloquer un utilisateur :
-       - soit en créant une licence complète via /api/admin/licenses/create
-       - soit en débloquant le device via /api/admin/devices/{id}
-       - soit en modifiant le numéro de téléphone associé à une licence
+    1. Un appareil (device_id) ne peut obtenir QU'UN SEUL essai gratuit.
+    2. Un numéro ne peut obtenir QU'UNE SEULE licence.
+    3. Réinstallation NE contourne PAS (device_id stable).
+    4. L'ADMIN peut :
+       - Débloquer le device (admin_unblocked=True) → nouvel essai autorisé
+       - Créer une licence complète → pas d'essai mais accès complet
     """
     try:
         clean_phone = req.phone_number.strip().replace(" ", "")
         clean_device = req.device_id.strip().upper()
 
         if not clean_device:
-            raise HTTPException(
-                status_code=400,
-                detail="Identifiant d'appareil requis."
-            )
-
+            raise HTTPException(400, "Identifiant d'appareil requis.")
         if not clean_phone or len(clean_phone) < 6:
-            raise HTTPException(
-                status_code=400,
-                detail="Numéro de téléphone invalide."
-            )
+            raise HTTPException(400, "Numéro de téléphone invalide.")
 
         # ═══════════════════════════════════════════════════════════
-        # 1. VÉRIFICATION : L'APPAREIL A-T-IL DÉJÀ ÉTÉ UTILISÉ ?
+        # PRIORITÉ 0 : Licence ADMIN existante pour ce numéro ?
+        # ═══════════════════════════════════════════════════════════
+        admin_lic = db.query(LicenseKey).filter(
+            LicenseKey.phone_number == clean_phone,
+            LicenseKey.is_active == True,
+            LicenseKey.is_trial == False,
+        ).first()
+
+        if admin_lic:
+            print(f"[REQUEST-KEY] Licence admin trouvée pour {clean_phone}")
+            return {
+                "status": "success",
+                "message": "Licence active trouvée.",
+                "license_key": admin_lic.key,
+                "trial_days": 0,
+                "is_trial": False,
+            }
+
+        # ═══════════════════════════════════════════════════════════
+        # PRIORITÉ 1 : Device déjà enregistré ?
         # ═══════════════════════════════════════════════════════════
         existing_device = db.query(DeviceAttempt).filter(
             DeviceAttempt.device_id == clean_device
@@ -321,44 +329,93 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
 
         if existing_device:
             # ─────────────────────────────────────────────────────
-            # CAS 1A : L'appareil est BLOQUÉ → refus systématique
+            # CAS A : Device débloqué par admin → on AUTORISE un nouvel essai
             # ─────────────────────────────────────────────────────
-            if existing_device.is_blocked:
-                # Mais on vérifie d'abord s'il existe une licence
-                # ADMIN (créée manuellement) pour ce numéro
-                admin_lic = db.query(LicenseKey).filter(
-                    LicenseKey.phone_number == clean_phone,
-                    LicenseKey.is_active == True,
-                    LicenseKey.is_trial == False,  # Licence complète
+            if existing_device.admin_unblocked and not existing_device.is_blocked:
+                print(f"[REQUEST-KEY] Device {clean_device} débloqué par admin → nouvel essai autorisé")
+                
+                existing_lic = db.query(LicenseKey).filter(
+                    LicenseKey.phone_number == clean_phone
                 ).first()
-
-                if admin_lic:
+                
+                if existing_lic and existing_lic.is_active:
+                    # Réinitialiser le flag admin_unblocked
+                    existing_device.admin_unblocked = False
+                    existing_device.admin_unblocked_at = None
+                    existing_device.phone_number = clean_phone
+                    existing_device.last_attempt_at = get_utc_now()
+                    db.commit()
+                    
                     return {
                         "status": "success",
-                        "message": "Licence active trouvée.",
-                        "license_key": admin_lic.key,
-                        "trial_days": 0,
-                        "is_trial": False,
+                        "message": "Une clé existe déjà pour ce numéro.",
+                        "license_key": existing_lic.key,
+                        "trial_days": existing_lic.duration_days or DEFAULT_TRIAL_DAYS,
+                        "is_trial": bool(existing_lic.is_trial),
                     }
+                
+                # Créer une nouvelle licence d'essai
+                part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
+                license_key = f"{part1}-{part2}-{part3}-{part4}"
 
-                # Pas de licence admin → refus
+                new_lic = LicenseKey(
+                    key=license_key,
+                    phone_number=clean_phone,
+                    first_name=req.first_name.strip(),
+                    last_name=req.last_name.strip(),
+                    organization=req.organization.strip() if req.organization else "",
+                    is_active=True,
+                    is_trial=True,
+                    device_uuid="[]",
+                    max_devices=1,
+                    duration_days=DEFAULT_TRIAL_DAYS,
+                    duration_val=DEFAULT_TRIAL_DAYS,
+                    duration_unit=DEFAULT_TRIAL_UNIT,
+                    created_at=get_utc_now()
+                )
+                db.add(new_lic)
+                
+                # Réinitialiser le device
+                existing_device.admin_unblocked = False
+                existing_device.admin_unblocked_at = None
+                existing_device.is_blocked = False
+                existing_device.block_reason = ""
+                existing_device.phone_number = clean_phone
+                existing_device.last_attempt_at = get_utc_now()
+                existing_device.attempts_count += 1
+                
+                db.commit()
+                db.refresh(new_lic)
+
+                print(f"[REQUEST-KEY] Nouvel essai accordé (admin) : {license_key}")
+                return {
+                    "status": "success",
+                    "message": "Nouvel essai autorisé par l'administrateur.",
+                    "license_key": license_key,
+                    "trial_days": DEFAULT_TRIAL_DAYS,
+                    "is_trial": True,
+                }
+
+            # ─────────────────────────────────────────────────────
+            # CAS B : Device bloqué → refus
+            # ─────────────────────────────────────────────────────
+            if existing_device.is_blocked:
+                print(f"[REQUEST-KEY] Device {clean_device} bloqué → refus")
                 raise HTTPException(
-                    status_code=403,
-                    detail="Cet appareil a déjà utilisé son essai gratuit. "
-                           "Veuillez souscrire à une licence."
+                    403,
+                    "Cet appareil a déjà utilisé son essai gratuit. "
+                    "Veuillez souscrire à une licence."
                 )
 
             # ─────────────────────────────────────────────────────
-            # CAS 1B : L'appareil N'EST PAS bloqué mais a déjà tenté
+            # CAS C : Device non bloqué, non autorisé admin, déjà tenté → refus + blocage
             # ─────────────────────────────────────────────────────
-
-            # Vérifier si une licence existe déjà pour ce numéro
             existing_lic = db.query(LicenseKey).filter(
                 LicenseKey.phone_number == clean_phone
             ).first()
 
-            if existing_lic and existing_lic.is_active:
-                # Même appareil + même numéro → on renvoie la clé existante
+            if existing_lic and existing_lic.is_active and existing_device.phone_number == clean_phone:
+                # Même device + même numéro + licence active → renvoyer
                 return {
                     "status": "success",
                     "message": "Une clé existe déjà pour ce numéro.",
@@ -367,112 +424,77 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                     "is_trial": bool(existing_lic.is_trial),
                 }
 
-            # ─────────────────────────────────────────────────────
-            # CAS 1C : L'appareil a déjà tenté MAIS avec un autre numéro
-            # ⚠️ C'EST LA FAILLE À BLOQUER
-            # ─────────────────────────────────────────────────────
-            if existing_device.phone_number != clean_phone:
-                # Marquer comme bloqué définitivement
-                existing_device.attempts_count += 1
-                existing_device.last_attempt_at = get_utc_now()
-                existing_device.is_blocked = True
-                existing_device.block_reason = (
-                    f"Tentative de changement de numéro détectée "
-                    f"({existing_device.phone_number} → {clean_phone}) "
-                    f"après {existing_device.attempts_count} tentatives"
-                )
-                db.commit()
-
-                # Vérifier licence admin pour ce nouveau numéro
-                admin_lic = db.query(LicenseKey).filter(
-                    LicenseKey.phone_number == clean_phone,
-                    LicenseKey.is_active == True,
-                    LicenseKey.is_trial == False,
-                ).first()
-
-                if admin_lic:
-                    return {
-                        "status": "success",
-                        "message": "Licence active trouvée.",
-                        "license_key": admin_lic.key,
-                        "trial_days": 0,
-                        "is_trial": False,
-                    }
-
-                raise HTTPException(
-                    status_code=403,
-                    detail="Cet appareil a déjà utilisé son essai gratuit "
-                           "avec un autre numéro. Veuillez souscrire à une licence."
-                )
-
-            # ─────────────────────────────────────────────────────
-            # CAS 1D : Appareil déjà tenté, même numéro, mais la licence
-            # n'existe plus (supprimée par admin) → on refuse aussi
-            # ─────────────────────────────────────────────────────
+            # Blocage automatique
             existing_device.attempts_count += 1
             existing_device.last_attempt_at = get_utc_now()
             existing_device.is_blocked = True
-            existing_device.block_reason = "Essai déjà utilisé - relance non autorisée"
+            
+            if existing_device.phone_number != clean_phone:
+                existing_device.block_reason = (
+                    f"Changement de numéro détecté "
+                    f"({existing_device.phone_number} → {clean_phone})"
+                )
+            else:
+                existing_device.block_reason = "Essai déjà utilisé - relance non autorisée"
+            
             db.commit()
-
+            
+            print(f"[REQUEST-KEY] Device {clean_device} re-bloqué")
             raise HTTPException(
-                status_code=403,
-                detail="Cet appareil a déjà utilisé son essai gratuit. "
-                       "Veuillez souscrire à une licence."
+                403,
+                "Cet appareil a déjà utilisé son essai gratuit. "
+                "Veuillez souscrire à une licence."
             )
 
         # ═══════════════════════════════════════════════════════════
-        # 2. VÉRIFICATION : LE NUMÉRO A-T-IL DÉJÀ EU UNE LICENCE ?
+        # PRIORITÉ 2 : Device jamais vu + numéro déjà utilisé ?
         # ═══════════════════════════════════════════════════════════
         existing_lic = db.query(LicenseKey).filter(
             LicenseKey.phone_number == clean_phone
         ).first()
 
         if existing_lic:
-            if existing_lic.is_active:
-                # Le numéro a déjà une licence active → on la renvoie
-                # MAIS on enregistre le nouveau device dans device_attempts
-                # pour éviter qu'il ne redemande avec un autre numéro
-                new_attempt = DeviceAttempt(
-                    device_id=clean_device,
-                    phone_number=clean_phone,
-                    attempts_count=1,
-                    is_blocked=False,
-                    first_attempt_at=get_utc_now(),
-                    last_attempt_at=get_utc_now(),
-                )
-                db.add(new_attempt)
-                db.commit()
-
-                return {
-                    "status": "success",
-                    "message": "Une clé existe déjà pour ce numéro.",
-                    "license_key": existing_lic.key,
-                    "trial_days": existing_lic.duration_days or DEFAULT_TRIAL_DAYS,
-                    "is_trial": bool(existing_lic.is_trial),
-                }
-            else:
-                # Licence existe mais désactivée
+            if not existing_lic.is_active:
                 raise HTTPException(
-                    status_code=403,
-                    detail="Une licence existe déjà pour ce numéro mais elle "
-                           "est désactivée. Contactez l'administrateur."
+                    403,
+                    "Une licence existe déjà pour ce numéro mais elle "
+                    "est désactivée. Contactez l'administrateur."
                 )
+
+            new_attempt = DeviceAttempt(
+                device_id=clean_device,
+                phone_number=clean_phone,
+                attempts_count=1,
+                is_blocked=False,
+                admin_unblocked=False,
+                first_attempt_at=get_utc_now(),
+                last_attempt_at=get_utc_now(),
+            )
+            db.add(new_attempt)
+            db.commit()
+
+            return {
+                "status": "success",
+                "message": "Une clé existe déjà pour ce numéro.",
+                "license_key": existing_lic.key,
+                "trial_days": existing_lic.duration_days or DEFAULT_TRIAL_DAYS,
+                "is_trial": bool(existing_lic.is_trial),
+            }
 
         # ═══════════════════════════════════════════════════════════
-        # 3. PREMIER ESSAI LÉGITIME : créer device_attempt + licence
+        # PRIORITÉ 3 : Vraiment nouvel appareil + nouveau numéro
         # ═══════════════════════════════════════════════════════════
         new_attempt = DeviceAttempt(
             device_id=clean_device,
             phone_number=clean_phone,
             attempts_count=1,
             is_blocked=False,
+            admin_unblocked=False,
             first_attempt_at=get_utc_now(),
             last_attempt_at=get_utc_now(),
         )
         db.add(new_attempt)
 
-        # Générer la clé au format XXXX-XXXX-XXXX-XXXX
         part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
         license_key = f"{part1}-{part2}-{part3}-{part4}"
 
@@ -495,6 +517,7 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
         db.commit()
         db.refresh(new_lic)
 
+        print(f"[REQUEST-KEY] Nouvel essai : {license_key}")
         return {
             "status": "success",
             "message": "Clé d'essai générée avec succès !",
@@ -508,7 +531,7 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
     except Exception as e:
         db.rollback()
         print(f"[REQUEST-KEY ERROR] {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Erreur DB: {str(e)}")
+        raise HTTPException(500, f"Erreur DB: {str(e)}")
 
 
 @app.post("/api/license/verify")
@@ -519,14 +542,14 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
         license_entry = db.query(LicenseKey).filter(LicenseKey.key == clean_key).first()
 
         if not license_entry:
-            raise HTTPException(status_code=404, detail="Clé de licence introuvable.")
+            raise HTTPException(404, "Clé de licence introuvable.")
 
         if not license_entry.is_active or license_entry.device_uuid == "REVOKED":
-            raise HTTPException(status_code=403, detail="Cette licence a été désactivée ou révoquée.")
+            raise HTTPException(403, "Cette licence a été désactivée ou révoquée.")
 
         now = get_utc_now()
         if license_entry.expires_at and now > license_entry.expires_at:
-            raise HTTPException(status_code=403, detail="Cette licence a expiré.")
+            raise HTTPException(403, "Cette licence a expiré.")
 
         if not license_entry.activated_at:
             license_entry.activated_at = now
@@ -542,7 +565,7 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
         max_dev = license_entry.max_devices or 1
         if req.device_id not in devices:
             if len(devices) >= max_dev:
-                raise HTTPException(status_code=403, detail="Limite d'appareils atteinte pour cette clé.")
+                raise HTTPException(403, "Limite d'appareils atteinte pour cette clé.")
             devices.append(req.device_id)
             license_entry.device_uuid = json.dumps(devices)
 
@@ -566,11 +589,11 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
     except Exception as e:
         db.rollback()
         print(f"[VERIFY ERROR] {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Erreur DB: {str(e)}")
+        raise HTTPException(500, f"Erreur DB: {str(e)}")
 
 
 # ==========================================
-# ROUTES ADMINISTRATION DES LICENCES (GUI)
+# ROUTES ADMINISTRATION DES LICENCES
 # ==========================================
 @app.get("/api/admin/licenses")
 @app.get("/api/admin/licenses/")
@@ -610,7 +633,7 @@ def get_admin_licenses(db: Session = Depends(get_db)):
         return results
     except Exception as err:
         print(f"[ADMIN-LIST ERROR] {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Erreur SQL/Python: {str(err)}")
+        raise HTTPException(500, f"Erreur SQL/Python: {str(err)}")
 
 
 @app.post("/api/admin/licenses/create")
@@ -661,7 +684,7 @@ def create_admin_license(req: AdminCreateLicenseRequest, db: Session = Depends(g
     except Exception as e:
         db.rollback()
         print(f"[ADMIN-CREATE ERROR] {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Erreur DB: {str(e)}")
+        raise HTTPException(500, f"Erreur DB: {str(e)}")
 
 
 @app.put("/api/admin/licenses/{key}")
@@ -669,7 +692,7 @@ def create_admin_license(req: AdminCreateLicenseRequest, db: Session = Depends(g
 def update_admin_license_full(key: str, req: AdminUpdateLicenseRequest, db: Session = Depends(get_db)):
     lic = db.query(LicenseKey).filter(LicenseKey.key == key.strip().upper()).first()
     if not lic:
-        raise HTTPException(status_code=404, detail="Licence introuvable.")
+        raise HTTPException(404, "Licence introuvable.")
 
     if req.phone_number is not None:
         lic.phone_number = req.phone_number.strip().replace(" ", "")
@@ -721,7 +744,7 @@ def update_admin_license_full(key: str, req: AdminUpdateLicenseRequest, db: Sess
 def toggle_admin_license_status(key: str, db: Session = Depends(get_db)):
     lic = db.query(LicenseKey).filter(LicenseKey.key == key.strip().upper()).first()
     if not lic:
-        raise HTTPException(status_code=404, detail="Licence introuvable.")
+        raise HTTPException(404, "Licence introuvable.")
 
     lic.is_active = not lic.is_active
     db.commit()
@@ -737,7 +760,7 @@ def grant_full_access(
 ):
     lic = db.query(LicenseKey).filter(LicenseKey.key == key.strip().upper()).first()
     if not lic:
-        raise HTTPException(status_code=404, detail="Licence introuvable.")
+        raise HTTPException(404, "Licence introuvable.")
 
     unit = req.duration_unit.lower()
     if "mois" in unit:
@@ -786,7 +809,7 @@ def reset_license_to_trial(
 ):
     lic = db.query(LicenseKey).filter(LicenseKey.key == key.strip().upper()).first()
     if not lic:
-        raise HTTPException(status_code=404, detail="Licence introuvable.")
+        raise HTTPException(404, "Licence introuvable.")
 
     unit = req.duration_unit.lower()
     if "mois" in unit:
@@ -830,7 +853,7 @@ def reset_license_to_trial(
 def reset_admin_license_devices(key: str, db: Session = Depends(get_db)):
     lic = db.query(LicenseKey).filter(LicenseKey.key == key.strip().upper()).first()
     if not lic:
-        raise HTTPException(status_code=404, detail="Licence introuvable.")
+        raise HTTPException(404, "Licence introuvable.")
 
     lic.device_uuid = "[]"
     lic.activated_at = None
@@ -843,7 +866,7 @@ def reset_admin_license_devices(key: str, db: Session = Depends(get_db)):
 def delete_admin_license(key: str, db: Session = Depends(get_db)):
     lic = db.query(LicenseKey).filter(LicenseKey.key == key.strip().upper()).first()
     if not lic:
-        raise HTTPException(status_code=404, detail="Licence introuvable.")
+        raise HTTPException(404, "Licence introuvable.")
 
     db.delete(lic)
     db.commit()
@@ -869,6 +892,8 @@ def get_admin_devices(db: Session = Depends(get_db)):
                 "is_blocked": d.is_blocked,
                 "block_reason": d.block_reason or "",
                 "notes": d.notes or "",
+                "admin_unblocked": bool(d.admin_unblocked) if hasattr(d, 'admin_unblocked') else False,
+                "admin_unblocked_at": d.admin_unblocked_at.isoformat() if hasattr(d, 'admin_unblocked_at') and d.admin_unblocked_at else None,
                 "first_attempt_at": d.first_attempt_at.isoformat() if d.first_attempt_at else "",
                 "last_attempt_at": d.last_attempt_at.isoformat() if d.last_attempt_at else "",
             }
@@ -876,7 +901,7 @@ def get_admin_devices(db: Session = Depends(get_db)):
         ]
     except Exception as err:
         print(f"[ADMIN-DEVICES ERROR] {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Erreur SQL: {str(err)}")
+        raise HTTPException(500, f"Erreur SQL: {str(err)}")
 
 
 @app.put("/api/admin/devices/{device_id}")
@@ -884,21 +909,35 @@ def get_admin_devices(db: Session = Depends(get_db)):
 def update_admin_device(device_id: str, req: DeviceUpdateRequest, db: Session = Depends(get_db)):
     dev = db.query(DeviceAttempt).filter(DeviceAttempt.device_id == device_id.strip().upper()).first()
     if not dev:
-        raise HTTPException(status_code=404, detail="Appareil introuvable.")
+        raise HTTPException(404, "Appareil introuvable.")
 
     if req.is_blocked is not None:
         dev.is_blocked = bool(req.is_blocked)
-        if not req.is_blocked:
+        
+        if req.is_blocked:
+            # Blocage manuel → reset admin_unblocked
+            dev.admin_unblocked = False
+            dev.admin_unblocked_at = None
+            if not dev.block_reason:
+                dev.block_reason = "Bloqué manuellement par l'administrateur"
+        else:
+            # ✅ DÉBLOCAGE PAR ADMIN → marque l'autorisation
+            dev.admin_unblocked = True
+            dev.admin_unblocked_at = get_utc_now()
             dev.block_reason = ""
+            print(f"[ADMIN] Device {device_id} débloqué par admin (admin_unblocked=True)")
+    
     if req.notes is not None:
         dev.notes = req.notes
 
     db.commit()
     db.refresh(dev)
+    
     return {
         "status": "success",
         "device_id": dev.device_id,
         "is_blocked": dev.is_blocked,
+        "admin_unblocked": bool(dev.admin_unblocked) if hasattr(dev, 'admin_unblocked') else False,
         "notes": dev.notes
     }
 
@@ -907,7 +946,7 @@ def update_admin_device(device_id: str, req: DeviceUpdateRequest, db: Session = 
 def delete_admin_device(device_id: str, db: Session = Depends(get_db)):
     dev = db.query(DeviceAttempt).filter(DeviceAttempt.device_id == device_id.strip().upper()).first()
     if not dev:
-        raise HTTPException(status_code=404, detail="Appareil introuvable.")
+        raise HTTPException(404, "Appareil introuvable.")
 
     db.delete(dev)
     db.commit()
@@ -937,7 +976,7 @@ def get_all_news(db: Session = Depends(get_db)):
         return results
     except Exception as err:
         print(f"[NEWS ERROR] {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Erreur SQL News: {str(err)}")
+        raise HTTPException(500, f"Erreur SQL News: {str(err)}")
 
 
 @app.post("/api/admin/news/create")
@@ -967,7 +1006,7 @@ def create_admin_news(req: NewsCreateRequest, db: Session = Depends(get_db)):
 def delete_admin_news(news_id: int, db: Session = Depends(get_db)):
     item = db.query(AppNews).filter(AppNews.id == news_id).first()
     if not item:
-        raise HTTPException(status_code=404, detail="Article introuvable.")
+        raise HTTPException(404, "Article introuvable.")
     db.delete(item)
     db.commit()
     return {"status": "success", "message": "Actualité supprimée."}
