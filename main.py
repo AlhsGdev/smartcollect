@@ -1,6 +1,8 @@
 import os
 import json
 import secrets
+import time
+import traceback
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 
@@ -43,13 +45,39 @@ else:
     engine_kwargs["pool_recycle"] = 300
     engine_kwargs["pool_size"] = 5
     engine_kwargs["max_overflow"] = 10
+    engine_kwargs["connect_args"] = {
+        "connect_timeout": 10,
+        "keepalives": 1,
+        "keepalives_idle": 30,
+        "keepalives_interval": 10,
+        "keepalives_count": 5,
+    }
 
-engine = create_engine(DATABASE_URL, **engine_kwargs)
+
+# ✅ FIX n°3 : Retry pour Neon (cold start)
+def _create_engine_with_retry(url, kwargs, retries=3):
+    for attempt in range(retries):
+        try:
+            eng = create_engine(url, **kwargs)
+            with eng.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            print(f"[DB] Connexion réussie (tentative {attempt + 1})")
+            return eng
+        except Exception as e:
+            print(f"[DB] Tentative {attempt + 1}/{retries} échouée: {e}")
+            if attempt == retries - 1:
+                raise
+            time.sleep(2)
+
+
+engine = _create_engine_with_retry(DATABASE_URL, engine_kwargs)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
+
 def get_utc_now():
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
 
 # ==========================================
 # MODÈLES SQLALCHEMY
@@ -104,34 +132,42 @@ class AppNews(Base):
 
 
 # ==========================================
-# MIGRATIONS AUTOMATIQUES
+# ✅ FIX n°1 : MIGRATIONS ROBUSTES
+# Chaque migration dans son propre try/catch
 # ==========================================
-try:
-    with engine.connect() as conn:
-        conn.execute(text(
-            "DO $$ BEGIN "
-            "IF EXISTS (SELECT 1 FROM information_schema.columns "
-            "WHERE table_name='licenses' AND column_name='email') "
-            "THEN ALTER TABLE licenses ALTER COLUMN email DROP NOT NULL; "
-            "END IF; END $$;"
-        ))
-        conn.execute(text(
-            "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS duration_val INTEGER DEFAULT 7;"
-        ))
-        conn.execute(text(
-            "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS duration_unit VARCHAR(20) DEFAULT 'Jours';"
-        ))
-        conn.execute(text(
-            "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS is_trial BOOLEAN DEFAULT TRUE;"
-        ))
-        conn.execute(text(
-            f"ALTER TABLE licenses ALTER COLUMN duration_days SET DEFAULT {DEFAULT_TRIAL_DAYS};"
-        ))
-        conn.commit()
-except Exception as e:
-    print(f"[migration] {e}")
+print("[startup] Début des migrations...")
 
-Base.metadata.create_all(bind=engine)
+migrations = [
+    # Drop NOT NULL sur email si la colonne existe encore
+    ("DROP email NOT NULL",
+     "DO $$ BEGIN "
+     "IF EXISTS (SELECT 1 FROM information_schema.columns "
+     "WHERE table_name='licenses' AND column_name='email') "
+     "THEN ALTER TABLE licenses ALTER COLUMN email DROP NOT NULL; "
+     "END IF; END $$;"),
+    ("ADD duration_val", "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS duration_val INTEGER DEFAULT 7"),
+    ("ADD duration_unit", "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS duration_unit VARCHAR(20) DEFAULT 'Jours'"),
+    ("ADD is_trial", "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS is_trial BOOLEAN DEFAULT TRUE"),
+    ("SET duration_days default", f"ALTER TABLE licenses ALTER COLUMN duration_days SET DEFAULT {DEFAULT_TRIAL_DAYS}"),
+]
+
+for name, sql in migrations:
+    try:
+        with engine.connect() as conn:
+            conn.execute(text(sql))
+            conn.commit()
+        print(f"[migration OK] {name}")
+    except Exception as e:
+        print(f"[migration SKIP] {name} : {e}")
+
+try:
+    Base.metadata.create_all(bind=engine)
+    print("[startup] Tables créées/vérifiées.")
+except Exception as e:
+    print(f"[startup] Erreur create_all : {e}")
+
+print("[startup] Migrations terminées.")
+
 
 def get_db():
     db = SessionLocal()
@@ -139,6 +175,7 @@ def get_db():
         yield db
     finally:
         db.close()
+
 
 # ==========================================
 # APPLICATION FASTAPI
@@ -152,6 +189,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # ==========================================
 # SCHÉMAS PYDANTIC
@@ -204,13 +242,11 @@ class DeviceUpdateRequest(BaseModel):
     notes: Optional[str] = None
 
 
-# ✅ Payload pour "Accorder tous les accès"
 class GrantFullAccessRequest(BaseModel):
     duration_val: int
     duration_unit: str
 
 
-# ✅ NOUVEAU : Payload pour "Remettre en essai"
 class ResetToTrialRequest(BaseModel):
     duration_val: int
     duration_unit: str
@@ -231,6 +267,7 @@ def home():
         "trial_allow_export": TRIAL_ALLOW_EXPORT,
     }
 
+
 @app.get("/health")
 def health():
     return {"status": "healthy"}
@@ -249,6 +286,7 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
         if not clean_device:
             raise HTTPException(status_code=400, detail="Identifiant d'appareil requis.")
 
+        # 1. Vérifier si cet appareil a déjà tenté
         existing_device = db.query(DeviceAttempt).filter(
             DeviceAttempt.device_id == clean_device
         ).first()
@@ -285,6 +323,7 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                     "trial_days": existing_lic.duration_days or DEFAULT_TRIAL_DAYS
                 }
 
+        # 2. Vérifier si une licence existe déjà pour ce numéro
         existing_lic = db.query(LicenseKey).filter(
             LicenseKey.phone_number == clean_phone
         ).first()
@@ -305,6 +344,7 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                 "trial_days": existing_lic.duration_days or DEFAULT_TRIAL_DAYS
             }
 
+        # 3. Nouvel appareil + nouveau numéro → créer la licence d'essai
         new_attempt = DeviceAttempt(
             device_id=clean_device,
             phone_number=clean_phone,
@@ -341,10 +381,13 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
             "license_key": license_key,
             "trial_days": DEFAULT_TRIAL_DAYS
         }
+
     except HTTPException:
         raise
     except Exception as e:
         db.rollback()
+        # ✅ FIX n°2 : Log complet de l'erreur dans Render Logs
+        print(f"[REQUEST-KEY ERROR] {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Erreur DB: {str(e)}")
 
 
@@ -397,10 +440,12 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
                 "allow_export": (not is_trial) or TRIAL_ALLOW_EXPORT,
             }
         }
+
     except HTTPException:
         raise
     except Exception as e:
         db.rollback()
+        print(f"[VERIFY ERROR] {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Erreur DB: {str(e)}")
 
 
@@ -444,6 +489,7 @@ def get_admin_licenses(db: Session = Depends(get_db)):
 
         return results
     except Exception as err:
+        print(f"[ADMIN-LIST ERROR] {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Erreur SQL/Python: {str(err)}")
 
 
@@ -494,6 +540,7 @@ def create_admin_license(req: AdminCreateLicenseRequest, db: Session = Depends(g
         }
     except Exception as e:
         db.rollback()
+        print(f"[ADMIN-CREATE ERROR] {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Erreur DB: {str(e)}")
 
 
@@ -561,9 +608,6 @@ def toggle_admin_license_status(key: str, db: Session = Depends(get_db)):
     return {"status": "success", "is_active": lic.is_active}
 
 
-# ═══════════════════════════════════════════════════════════
-# ⭐ ACCORDER L'ACCÈS COMPLET
-# ═══════════════════════════════════════════════════════════
 @app.post("/api/admin/licenses/{key}/grant-full-access")
 @app.post("/api/admin/licenses/{key}/grant-full-access/")
 def grant_full_access(
@@ -571,10 +615,6 @@ def grant_full_access(
     req: GrantFullAccessRequest,
     db: Session = Depends(get_db)
 ):
-    """
-    Accorde TOUS les accès (illimité en tableaux/lignes/exports)
-    MAIS limité dans le temps à la durée choisie par l'admin.
-    """
     lic = db.query(LicenseKey).filter(LicenseKey.key == key.strip().upper()).first()
     if not lic:
         raise HTTPException(status_code=404, detail="Licence introuvable.")
@@ -617,9 +657,6 @@ def grant_full_access(
     }
 
 
-# ═══════════════════════════════════════════════════════════
-# ↩ REMETTRE EN MODE ESSAI
-# ═══════════════════════════════════════════════════════════
 @app.post("/api/admin/licenses/{key}/reset-to-trial")
 @app.post("/api/admin/licenses/{key}/reset-to-trial/")
 def reset_license_to_trial(
@@ -627,10 +664,6 @@ def reset_license_to_trial(
     req: ResetToTrialRequest,
     db: Session = Depends(get_db)
 ):
-    """
-    Repasse une licence en mode ESSAI avec les limitations Niveau 4
-    (1 tableau, 50 lignes, exports bloqués).
-    """
     lic = db.query(LicenseKey).filter(LicenseKey.key == key.strip().upper()).first()
     if not lic:
         raise HTTPException(status_code=404, detail="Licence introuvable.")
@@ -722,6 +755,7 @@ def get_admin_devices(db: Session = Depends(get_db)):
             for d in devices
         ]
     except Exception as err:
+        print(f"[ADMIN-DEVICES ERROR] {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Erreur SQL: {str(err)}")
 
 
@@ -782,6 +816,7 @@ def get_all_news(db: Session = Depends(get_db)):
             })
         return results
     except Exception as err:
+        print(f"[NEWS ERROR] {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Erreur SQL News: {str(err)}")
 
 
