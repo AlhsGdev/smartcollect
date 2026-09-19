@@ -54,7 +54,7 @@ else:
     }
 
 
-# ✅ FIX n°3 : Retry pour Neon (cold start)
+# ✅ Retry pour Neon (cold start)
 def _create_engine_with_retry(url, kwargs, retries=3):
     for attempt in range(retries):
         try:
@@ -132,13 +132,11 @@ class AppNews(Base):
 
 
 # ==========================================
-# ✅ FIX n°1 : MIGRATIONS ROBUSTES
-# Chaque migration dans son propre try/catch
+# MIGRATIONS ROBUSTES (une par une, isolées)
 # ==========================================
 print("[startup] Début des migrations...")
 
 migrations = [
-    # Drop NOT NULL sur email si la colonne existe encore
     ("DROP email NOT NULL",
      "DO $$ BEGIN "
      "IF EXISTS (SELECT 1 FROM information_schema.columns "
@@ -279,14 +277,24 @@ def health():
 @app.post("/api/license/request-key")
 @app.post("/api/license/request-key/")
 def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get_db)):
+    """
+    Génère une clé d'essai gratuite OU renvoie la clé existante.
+    
+    ⚠️ FIX appliqué :
+    - Normalisation du device_id (uppercase + strip)
+    - Double vérification avant insertion (évite UniqueViolation)
+    - Try/catch sur insertions concurrentes
+    """
     try:
         clean_phone = req.phone_number.strip().replace(" ", "")
-        clean_device = req.device_id.strip()
+        clean_device = req.device_id.strip().upper()  # ✅ Normalisation
 
         if not clean_device:
             raise HTTPException(status_code=400, detail="Identifiant d'appareil requis.")
 
+        # ─────────────────────────────────────────────
         # 1. Vérifier si cet appareil a déjà tenté
+        # ─────────────────────────────────────────────
         existing_device = db.query(DeviceAttempt).filter(
             DeviceAttempt.device_id == clean_device
         ).first()
@@ -323,12 +331,53 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                     "trial_days": existing_lic.duration_days or DEFAULT_TRIAL_DAYS
                 }
 
+        # ─────────────────────────────────────────────
         # 2. Vérifier si une licence existe déjà pour ce numéro
+        # ─────────────────────────────────────────────
         existing_lic = db.query(LicenseKey).filter(
             LicenseKey.phone_number == clean_phone
         ).first()
         if existing_lic:
+            # ✅ FIX : ne créer le device_attempt que s'il n'existe pas
             if not existing_device:
+                try:
+                    new_attempt = DeviceAttempt(
+                        device_id=clean_device,
+                        phone_number=clean_phone,
+                        attempts_count=1,
+                        is_blocked=False
+                    )
+                    db.add(new_attempt)
+                    db.commit()
+                except Exception as inner_e:
+                    # Race condition : un autre thread a inséré entre-temps
+                    db.rollback()
+                    print(f"[REQUEST-KEY] Race condition ignorée: {inner_e}")
+
+            return {
+                "status": "success",
+                "message": "Une clé existe déjà pour ce numéro.",
+                "license_key": existing_lic.key,
+                "trial_days": existing_lic.duration_days or DEFAULT_TRIAL_DAYS
+            }
+
+        # ─────────────────────────────────────────────
+        # 3. Nouvel appareil + nouveau numéro → créer licence d'essai
+        # ─────────────────────────────────────────────
+
+        # ✅ FIX : double-check avant insert (évite la UniqueViolation)
+        double_check = db.query(DeviceAttempt).filter(
+            DeviceAttempt.device_id == clean_device
+        ).first()
+
+        if double_check:
+            # Le device existe déjà (créé entre-temps par un autre thread)
+            double_check.phone_number = clean_phone
+            double_check.last_attempt_at = get_utc_now()
+            db.commit()
+            print(f"[REQUEST-KEY] Device {clean_device} déjà existant → mis à jour")
+        else:
+            try:
                 new_attempt = DeviceAttempt(
                     device_id=clean_device,
                     phone_number=clean_phone,
@@ -337,22 +386,12 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                 )
                 db.add(new_attempt)
                 db.commit()
-            return {
-                "status": "success",
-                "message": "Une clé existe déjà pour ce numéro.",
-                "license_key": existing_lic.key,
-                "trial_days": existing_lic.duration_days or DEFAULT_TRIAL_DAYS
-            }
+            except Exception as insert_err:
+                # Si malgré tout il y a collision (race condition), on continue
+                db.rollback()
+                print(f"[REQUEST-KEY] Insert device ignoré (race): {insert_err}")
 
-        # 3. Nouvel appareil + nouveau numéro → créer la licence d'essai
-        new_attempt = DeviceAttempt(
-            device_id=clean_device,
-            phone_number=clean_phone,
-            attempts_count=1,
-            is_blocked=False
-        )
-        db.add(new_attempt)
-
+        # Générer la clé
         part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
         license_key = f"{part1}-{part2}-{part3}-{part4}"
 
@@ -386,7 +425,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
         raise
     except Exception as e:
         db.rollback()
-        # ✅ FIX n°2 : Log complet de l'erreur dans Render Logs
         print(f"[REQUEST-KEY ERROR] {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Erreur DB: {str(e)}")
 
@@ -762,7 +800,7 @@ def get_admin_devices(db: Session = Depends(get_db)):
 @app.put("/api/admin/devices/{device_id}")
 @app.put("/api/admin/devices/{device_id}/")
 def update_admin_device(device_id: str, req: DeviceUpdateRequest, db: Session = Depends(get_db)):
-    dev = db.query(DeviceAttempt).filter(DeviceAttempt.device_id == device_id.strip()).first()
+    dev = db.query(DeviceAttempt).filter(DeviceAttempt.device_id == device_id.strip().upper()).first()
     if not dev:
         raise HTTPException(status_code=404, detail="Appareil introuvable.")
 
@@ -785,7 +823,7 @@ def update_admin_device(device_id: str, req: DeviceUpdateRequest, db: Session = 
 
 @app.delete("/api/admin/devices/{device_id}")
 def delete_admin_device(device_id: str, db: Session = Depends(get_db)):
-    dev = db.query(DeviceAttempt).filter(DeviceAttempt.device_id == device_id.strip()).first()
+    dev = db.query(DeviceAttempt).filter(DeviceAttempt.device_id == device_id.strip().upper()).first()
     if not dev:
         raise HTTPException(status_code=404, detail="Appareil introuvable.")
 
