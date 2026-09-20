@@ -1238,16 +1238,46 @@ def reset_license_to_trial(key: str, req: ResetToTrialRequest, db: Session = Dep
     }
 
 
+# ═══════════════════════════════════════════════════════════
+# ✅ FIX : reset-devices supprime aussi les traces orphelines
+# ═══════════════════════════════════════════════════════════
 @app.post("/api/admin/licenses/{key}/reset-devices", dependencies=[Depends(require_admin_key)])
 def reset_admin_license_devices(key: str, db: Session = Depends(get_db)):
     lic = db.query(LicenseKey).filter(LicenseKey.key == key.strip().upper()).first()
     if not lic:
         raise HTTPException(404, "Licence introuvable.")
+
+    # Récupérer les devices avant de vider
+    try:
+        devs = json.loads(lic.device_uuid or "[]")
+        if not isinstance(devs, list):
+            devs = []
+    except Exception:
+        devs = []
+
     lic.device_uuid = "[]"
     lic.activated_at = None
     lic.expires_at = None
+
+    # ✅ Supprimer les traces des devices associés
+    #    (elles sont maintenant orphelines)
+    deleted_count = 0
+    for dev_id in devs:
+        dev = db.query(DeviceAttempt).filter(
+            DeviceAttempt.device_id == dev_id
+        ).first()
+        if dev:
+            db.delete(dev)
+            deleted_count += 1
+
     db.commit()
-    return {"status": "success", "message": "Appareils dissociés."}
+    print(f"[ADMIN] Licence {key} : devices dissociés "
+          f"({deleted_count} trace(s) supprimée(s))")
+
+    return {
+        "status": "success",
+        "message": f"Appareils dissociés ({deleted_count} trace(s) supprimée(s))."
+    }
 
 
 @app.delete("/api/admin/licenses/{key}", dependencies=[Depends(require_admin_key)])
@@ -1359,14 +1389,45 @@ def update_admin_device(device_id: str, req: DeviceUpdateRequest, db: Session = 
     }
 
 
+# ═══════════════════════════════════════════════════════════
+# ✅ FIX : delete device retire aussi le device des licences
+# ═══════════════════════════════════════════════════════════
 @app.delete("/api/admin/devices/{device_id}", dependencies=[Depends(require_admin_key)])
 def delete_admin_device(device_id: str, db: Session = Depends(get_db)):
-    dev = db.query(DeviceAttempt).filter(DeviceAttempt.device_id == device_id.strip().upper()).first()
+    clean_dev = device_id.strip().upper()
+
+    dev = db.query(DeviceAttempt).filter(
+        DeviceAttempt.device_id == clean_dev
+    ).first()
     if not dev:
         raise HTTPException(404, "Appareil introuvable.")
+
+    # ✅ Retirer ce device de toutes les licences qui le référencent
+    all_lics = db.query(LicenseKey).all()
+    cleaned = 0
+    for lic in all_lics:
+        try:
+            raw = str(lic.device_uuid or "[]")
+            if raw in ("", "REVOKED"):
+                continue
+            devices = json.loads(raw)
+            if isinstance(devices, list) and clean_dev in devices:
+                devices.remove(clean_dev)
+                lic.device_uuid = json.dumps(devices)
+                cleaned += 1
+        except Exception:
+            continue
+
     db.delete(dev)
     db.commit()
-    return {"status": "success", "message": "Trace d'appareil supprimée."}
+
+    print(f"[ADMIN] Device {clean_dev} supprimé "
+          f"(retiré de {cleaned} licence(s))")
+
+    return {
+        "status": "success",
+        "message": f"Trace d'appareil supprimée (retiré de {cleaned} licence(s))."
+    }
 
 
 # ═══════════════════════════════════════════════════════════
