@@ -318,6 +318,7 @@ class NewsCreateRequest(BaseModel):
     download_url: Optional[str] = None
 
 
+# ✅ MODIFIÉ : ajout de force_trial
 class DeviceUpdateRequest(BaseModel):
     is_blocked: Optional[bool] = None
     notes: Optional[str] = None
@@ -326,6 +327,7 @@ class DeviceUpdateRequest(BaseModel):
     grant_full_access: Optional[bool] = None
     duration_val: Optional[int] = Field(None, ge=1, le=9999)
     duration_unit: Optional[str] = None
+    force_trial: Optional[bool] = None  # ✅ NOUVEAU
 
 
 class GrantFullAccessRequest(BaseModel):
@@ -439,7 +441,6 @@ def _build_access_payload(lic: Optional[LicenseKey]) -> dict:
       - max_tables / max_rows_per_table / allow_export
     """
     if lic is None:
-        # Aucune licence → valeurs d'essai par défaut
         return {
             "mode": "trial",
             "is_trial": True,
@@ -493,26 +494,16 @@ def health():
 
 
 # ═══════════════════════════════════════════════════════════
-# ✅ NOUVEAU : APERÇU DE CE QUI SERA ACCORDÉ
-# Permet à Flutter d'afficher AVANT le clic :
-#   - "Vous allez recevoir un essai de 7 jours"
-#   - "Vous allez recevoir un accès complet de 30 jours"
+# APERÇU DE CE QUI SERA ACCORDÉ
 # ═══════════════════════════════════════════════════════════
 @app.get("/api/license/preview/{device_id}")
 @app.get("/api/license/preview/{device_id}/")
 def preview_access_for_device(device_id: str, db: Session = Depends(get_db)):
-    """
-    Retourne un aperçu SANS consommer de quota :
-      - whether : 'license_active' | 'trial_available' | 'blocked' | 'fresh_device'
-      - access : { mode, is_trial, duration_*, max_*, allow_export }
-      - message : texte humain à afficher côté app
-    """
     try:
         clean_device = (device_id or "").strip().upper()
         if not clean_device:
             raise HTTPException(400, "Identifiant d'appareil requis.")
 
-        # 1) Une clé valide est-elle déjà liée à ce device ?
         existing_lic = _find_license_by_device(clean_device, db)
         if existing_lic:
             now = get_utc_now()
@@ -528,12 +519,9 @@ def preview_access_for_device(device_id: str, db: Session = Depends(get_db)):
                     "status": "success",
                     "whether": "license_active",
                     "access": access,
-                    "message": (
-                        "Vous avez déjà une clé active pour cet appareil."
-                    ),
+                    "message": "Vous avez déjà une clé active pour cet appareil.",
                 }
 
-        # 2) Le device est-il bloqué ?
         dev = db.query(DeviceAttempt).filter(
             DeviceAttempt.device_id == clean_device
         ).first()
@@ -543,7 +531,6 @@ def preview_access_for_device(device_id: str, db: Session = Depends(get_db)):
             attempts = dev.attempts_count or 0
 
             if dev.is_blocked or attempts >= max_allowed:
-                # Cherche une licence admin (full) éventuelle
                 admin_lic = None
                 if dev.phone_number:
                     admin_lic = db.query(LicenseKey).filter(
@@ -571,7 +558,6 @@ def preview_access_for_device(device_id: str, db: Session = Depends(get_db)):
                     ),
                 }
 
-            # Quota restant → essai disponible
             access = _build_access_payload(None)
             return {
                 "status": "success",
@@ -583,7 +569,6 @@ def preview_access_for_device(device_id: str, db: Session = Depends(get_db)):
                 ),
             }
 
-        # 3) Device inconnu du serveur → essai par défaut
         access = _build_access_payload(None)
         return {
             "status": "success",
@@ -604,7 +589,6 @@ def preview_access_for_device(device_id: str, db: Session = Depends(get_db)):
 
 # ═══════════════════════════════════════════════════════════
 # ROUTE : DEMANDE / RENOUVELLEMENT DE CLÉ
-# ✅ ENRICHIE : renvoie maintenant 'access' complet
 # ═══════════════════════════════════════════════════════════
 @app.post("/api/license/request-key")
 @app.post("/api/license/request-key/")
@@ -632,7 +616,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                 or str(existing_device_lic.device_uuid or "") == "REVOKED"
             )
 
-            # CAS 1 : clé valide → renvoyer + maj champs
             if not is_expired and not is_revoked:
                 changed = []
                 _update_license_user_info(existing_device_lic, req, changed)
@@ -656,7 +639,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                     "access": access,
                 }
 
-            # CAS 2 : clé expirée/révoquée → consommer un essai
             dev_trace = db.query(DeviceAttempt).filter(
                 DeviceAttempt.device_id == clean_device
             ).with_for_update().first()
@@ -717,7 +699,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                     "Contactez l'administrateur."
                 )
 
-            # Quota disponible → nouvelle clé
             part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
             new_key = f"{part1}-{part2}-{part3}-{part4}"
 
@@ -1146,7 +1127,7 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
 
 
 # ═══════════════════════════════════════════════════════════
-# ROUTES ADMIN — LICENCES (INCHANGÉ)
+# ROUTES ADMIN — LICENCES
 # ═══════════════════════════════════════════════════════════
 @app.get("/api/admin/licenses", dependencies=[Depends(require_admin_key)])
 @app.get("/api/admin/licenses/", dependencies=[Depends(require_admin_key)])
@@ -1472,6 +1453,77 @@ def get_admin_devices(db: Session = Depends(get_db)):
         raise HTTPException(500, f"Erreur SQL: {str(err)}")
 
 
+# ═══════════════════════════════════════════════════════════
+# ✅ NOUVEAU : force le mode ESSAI sur un device
+# ═══════════════════════════════════════════════════════════
+def _force_trial_to_device(
+    dev: DeviceAttempt,
+    duration_val: int,
+    duration_unit: str,
+    db: Session,
+) -> dict:
+    """
+    Crée ou met à jour une licence en mode ESSAI liée à ce device.
+    Utilisé quand l'admin choisit explicitement "🎟 Essai supplémentaire".
+    """
+    clean_device = dev.device_id.strip().upper()
+    days = _duration_to_days(duration_val, duration_unit)
+    now = get_utc_now()
+
+    existing_lic = _find_license_by_device(clean_device, db)
+
+    if existing_lic:
+        # ✅ Conversion de la licence existante en mode essai
+        existing_lic.is_active = True
+        existing_lic.is_trial = True
+        existing_lic.duration_val = duration_val
+        existing_lic.duration_unit = duration_unit
+        existing_lic.duration_days = days
+        existing_lic.activated_at = now
+        existing_lic.expires_at = now + timedelta(days=days)
+        existing_lic.device_uuid = json.dumps([clean_device])
+        lic = existing_lic
+        action = "updated_to_trial"
+    else:
+        # Création d'une nouvelle licence essai
+        part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
+        new_key = f"{part1}-{part2}-{part3}-{part4}"
+
+        lic = LicenseKey(
+            key=new_key,
+            phone_number=dev.phone_number or "",
+            is_active=True,
+            is_trial=True,
+            device_uuid=json.dumps([clean_device]),
+            max_devices=1,
+            duration_days=days,
+            duration_val=duration_val,
+            duration_unit=duration_unit,
+            created_at=now,
+            activated_at=now,
+            expires_at=now + timedelta(days=days),
+        )
+        db.add(lic)
+        action = "created_as_trial"
+
+    dev.is_blocked = False
+    dev.block_reason = ""
+    dev.admin_unblocked = True
+    dev.admin_unblocked_at = now
+
+    db.commit()
+    db.refresh(lic)
+
+    return {
+        "action": action,
+        "key": lic.key,
+        "expires_at": lic.expires_at.isoformat() if lic.expires_at else None,
+        "duration_val": duration_val,
+        "duration_unit": duration_unit,
+        "duration_days": days,
+    }
+
+
 def _grant_full_access_to_device(
     dev: DeviceAttempt,
     duration_val: int,
@@ -1534,6 +1586,7 @@ def _grant_full_access_to_device(
     }
 
 
+# ✅ MODIFIÉ : gère grant_full_access ET force_trial
 @app.put("/api/admin/devices/{device_id}", dependencies=[Depends(require_admin_key)])
 @app.put("/api/admin/devices/{device_id}/", dependencies=[Depends(require_admin_key)])
 def update_admin_device(device_id: str, req: DeviceUpdateRequest, db: Session = Depends(get_db)):
@@ -1555,6 +1608,17 @@ def update_admin_device(device_id: str, req: DeviceUpdateRequest, db: Session = 
         )
         log_lines.append(
             f"ACCÈS COMPLET {duration_val} {duration_unit} → clé {full_access_info['key']}"
+        )
+    elif req.force_trial is True:
+        # ✅ NOUVEAU : Force le mode ESSAI
+        duration_val = req.duration_val or DEFAULT_TRIAL_DAYS
+        duration_unit = req.duration_unit or DEFAULT_TRIAL_UNIT
+        trial_info = _force_trial_to_device(
+            dev, duration_val, duration_unit, db
+        )
+        full_access_info = trial_info
+        log_lines.append(
+            f"FORCE ESSAI {duration_val} {duration_unit} → clé {trial_info['key']}"
         )
 
     if req.set_max_attempts is not None:
