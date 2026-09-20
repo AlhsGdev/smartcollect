@@ -22,6 +22,11 @@ TRIAL_MAX_TABLES = 1
 TRIAL_MAX_ROWS_PER_TABLE = 50
 TRIAL_ALLOW_EXPORT = False
 
+# ✅ NOUVEAU : quota initial pour un tout nouveau device
+#    - 1 essai consommé immédiatement
+#    - 1 essai encore disponible pour tester
+DEFAULT_INITIAL_QUOTA = 2
+
 # ═══════════════════════════════════════════════════════════
 # 🔐 CLÉ ADMIN — lue depuis les variables d'environnement Render
 # ═══════════════════════════════════════════════════════════
@@ -194,6 +199,12 @@ migrations = [
     ("ADD admin_unblocked", "ALTER TABLE device_attempts ADD COLUMN IF NOT EXISTS admin_unblocked BOOLEAN DEFAULT FALSE"),
     ("ADD admin_unblocked_at", "ALTER TABLE device_attempts ADD COLUMN IF NOT EXISTS admin_unblocked_at TIMESTAMP"),
     ("ADD max_attempts_allowed", "ALTER TABLE device_attempts ADD COLUMN IF NOT EXISTS max_attempts_allowed INTEGER DEFAULT 1"),
+
+    # ✅ FIX : corriger les anciens devices qui ont un quota = 1
+    #    (ils ont été créés avant le fix et sont bloqués à 1/1 par défaut)
+    ("FIX legacy devices quota 1 → 2",
+     "UPDATE device_attempts SET max_attempts_allowed = 2 "
+     "WHERE max_attempts_allowed = 1 AND attempts_count = 1 AND is_blocked = FALSE"),
 ]
 
 for name, sql in migrations:
@@ -331,6 +342,7 @@ def home():
         "database": "PostgreSQL",
         "service": "SmartCollect Unified API",
         "default_trial_days": DEFAULT_TRIAL_DAYS,
+        "default_initial_quota": DEFAULT_INITIAL_QUOTA,
         "trial_max_tables": TRIAL_MAX_TABLES,
         "trial_max_rows": TRIAL_MAX_ROWS_PER_TABLE,
         "trial_allow_export": TRIAL_ALLOW_EXPORT,
@@ -359,7 +371,9 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
 
         check_rate_limit(clean_device)
 
+        # ═══════════════════════════════════════════════════════════
         # PRIORITÉ 0 : Licence admin existante ?
+        # ═══════════════════════════════════════════════════════════
         admin_lic = db.query(LicenseKey).filter(
             LicenseKey.phone_number == clean_phone,
             LicenseKey.is_active == True,
@@ -375,7 +389,9 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                 "is_trial": False,
             }
 
+        # ═══════════════════════════════════════════════════════════
         # PRIORITÉ 1 : Device déjà enregistré ?
+        # ═══════════════════════════════════════════════════════════
         existing_device = db.query(DeviceAttempt).filter(
             DeviceAttempt.device_id == clean_device
         ).first()
@@ -384,6 +400,7 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
             max_allowed = existing_device.max_attempts_allowed or 1
             attempts_count = existing_device.attempts_count or 0
 
+            # ─── CAS A : Quota atteint ou bloqué ───
             if existing_device.is_blocked or attempts_count >= max_allowed:
                 admin_lic = db.query(LicenseKey).filter(
                     LicenseKey.phone_number == clean_phone,
@@ -411,6 +428,7 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                     "Cet appareil a déjà utilisé toutes ses tentatives autorisées."
                 )
 
+            # ─── CAS B : Quota disponible → on autorise un nouvel essai ───
             existing_lic = db.query(LicenseKey).filter(
                 LicenseKey.phone_number == clean_phone
             ).first()
@@ -427,6 +445,7 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                     "is_trial": bool(existing_lic.is_trial),
                 }
 
+            # Créer une nouvelle licence d'essai
             part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
             license_key = f"{part1}-{part2}-{part3}-{part4}"
 
@@ -447,13 +466,26 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
             )
             db.add(new_lic)
 
+            # ✅ Incrément + blocage automatique au quota max
             existing_device.attempts_count = attempts_count + 1
             existing_device.phone_number = clean_phone
             existing_device.last_attempt_at = get_utc_now()
 
+            remaining = max_allowed - existing_device.attempts_count
+
             if existing_device.attempts_count >= max_allowed:
                 existing_device.is_blocked = True
-                existing_device.block_reason = "Quota atteint après ce nouvel essai"
+                existing_device.block_reason = (
+                    f"Quota atteint ({existing_device.attempts_count}/{max_allowed})"
+                )
+                print(f"[REQUEST-KEY] Quota atteint : "
+                      f"{existing_device.attempts_count}/{max_allowed} → device bloqué")
+            else:
+                existing_device.is_blocked = False
+                existing_device.block_reason = ""
+                print(f"[REQUEST-KEY] Nouvel essai accordé : "
+                      f"{existing_device.attempts_count}/{max_allowed} "
+                      f"(reste {remaining} essai)")
 
             db.commit()
             db.refresh(new_lic)
@@ -465,7 +497,9 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                 "is_trial": True,
             }
 
-        # PRIORITÉ 2 : Device nouveau + numéro connu ?
+        # ═══════════════════════════════════════════════════════════
+        # PRIORITÉ 2 : Device nouveau + numéro connu
+        # ═══════════════════════════════════════════════════════════
         existing_lic = db.query(LicenseKey).filter(
             LicenseKey.phone_number == clean_phone
         ).first()
@@ -474,6 +508,8 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
             if not existing_lic.is_active:
                 raise HTTPException(403, "Licence désactivée pour ce numéro.")
 
+            # ✅ FIX : quota = 0 car ce device récupère une clé déjà existante.
+            #          L'admin peut débloquer si c'est légitime (changement de tél).
             new_attempt = DeviceAttempt(
                 device_id=clean_device,
                 phone_number=clean_phone,
@@ -487,6 +523,10 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
             )
             db.add(new_attempt)
             db.commit()
+
+            print(f"[REQUEST-KEY] Device nouveau pour numéro existant : "
+                  f"{clean_device} → clé renvoyée, quota=0")
+
             return {
                 "status": "success",
                 "message": "Une clé existe déjà pour ce numéro.",
@@ -495,12 +535,15 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                 "is_trial": bool(existing_lic.is_trial),
             }
 
+        # ═══════════════════════════════════════════════════════════
         # PRIORITÉ 3 : Nouveau device + nouveau numéro
+        # ═══════════════════════════════════════════════════════════
+        # ✅ FIX : quota = 2 par défaut (1 consommé + 1 disponible)
         new_attempt = DeviceAttempt(
             device_id=clean_device,
             phone_number=clean_phone,
             attempts_count=1,
-            max_attempts_allowed=1,
+            max_attempts_allowed=DEFAULT_INITIAL_QUOTA,
             is_blocked=False,
             admin_unblocked=False,
             first_attempt_at=get_utc_now(),
@@ -529,6 +572,10 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
         db.add(new_lic)
         db.commit()
         db.refresh(new_lic)
+
+        print(f"[REQUEST-KEY] Nouvel essai (nouveau device) : {license_key} "
+              f"(attempts 1/{DEFAULT_INITIAL_QUOTA})")
+
         return {
             "status": "success",
             "message": "Clé d'essai générée avec succès !",
@@ -844,7 +891,7 @@ def get_admin_devices(db: Session = Depends(get_db)):
                 "device_id": d.device_id,
                 "phone_number": d.phone_number,
                 "attempts_count": d.attempts_count,
-                "max_attempts_allowed": d.max_attempts_allowed or 1,
+                "max_attempts_allowed": d.max_attempts_allowed or 0,
                 "is_blocked": d.is_blocked,
                 "block_reason": d.block_reason or "",
                 "notes": d.notes or "",
@@ -866,8 +913,8 @@ def update_admin_device(device_id: str, req: DeviceUpdateRequest, db: Session = 
     """
     Modifie un appareil. Trois modes possibles :
 
-    1. add_attempts      → AJOUTE N au quota actuel (ex: +2 → 1 devient 3)
-    2. set_max_attempts  → DÉFINIT un quota absolu  (ex: 5 → 1 devient 5)
+    1. add_attempts      → AJOUTE N au quota actuel
+    2. set_max_attempts  → DÉFINIT un quota absolu
     3. is_blocked        → bloque / débloque manuellement
 
     Si un mode "déblocage" est demandé, is_blocked est automatiquement
