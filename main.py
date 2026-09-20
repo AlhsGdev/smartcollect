@@ -23,7 +23,8 @@ TRIAL_MAX_TABLES = 1
 TRIAL_MAX_ROWS_PER_TABLE = 50
 TRIAL_ALLOW_EXPORT = False
 
-DEFAULT_INITIAL_QUOTA = 2
+# ✅ MODIFIÉ : 1 essai par appareil (au lieu de 2)
+DEFAULT_INITIAL_QUOTA = 1
 
 # ═══════════════════════════════════════════════════════════
 # 🔐 CLÉ ADMIN
@@ -200,9 +201,25 @@ migrations = [
      "CREATE INDEX IF NOT EXISTS ix_device_attempts_phone "
      "ON device_attempts (phone_number)"),
 
-    ("FIX legacy devices quota 1 → 2",
-     "UPDATE device_attempts SET max_attempts_allowed = 2 "
-     "WHERE max_attempts_allowed = 1 AND attempts_count = 1 AND is_blocked = FALSE"),
+    # ❌ SUPPRIMÉ : "FIX legacy devices quota 1 → 2"
+    # Cette migration forçait le passage à 2 essais pour les anciens devices.
+    # Elle est incompatible avec la nouvelle politique "1 essai par appareil".
+
+    # ✅ NOUVEAU : Aligner tous les devices NON-admin sur 1 essai maximum
+    #    (les devices autorisés manuellement par l'admin sont préservés)
+    ("NORMALIZE all devices quota to 1",
+     "UPDATE device_attempts SET max_attempts_allowed = 1 "
+     "WHERE admin_unblocked = FALSE "
+     "AND (max_attempts_allowed IS NULL OR max_attempts_allowed > 1)"),
+
+    # ✅ NOUVEAU : Marquer comme bloqués les devices ayant déjà consommé leur unique essai
+    ("BLOCK devices that used their only attempt",
+     "UPDATE device_attempts SET is_blocked = TRUE, "
+     "block_reason = COALESCE(NULLIF(block_reason, ''), "
+     "'Quota atteint (1/1) - politique 1 essai/appareil') "
+     "WHERE admin_unblocked = FALSE "
+     "AND attempts_count >= 1 "
+     "AND max_attempts_allowed <= 1"),
 
     ("RELINK licenses to devices (via phone)",
      "DO $$ "
@@ -343,7 +360,6 @@ def _duration_to_days(val: int, unit: str) -> int:
 
 # ═══════════════════════════════════════════════════════════
 # HELPER : trouver une licence par device_id
-#    ✅ FIX : normalise le device_id ET les devices stockés
 # ═══════════════════════════════════════════════════════════
 def _find_license_by_device(device_id: str, db: Session):
     """
@@ -352,7 +368,6 @@ def _find_license_by_device(device_id: str, db: Session):
     Priorité 2 : la plus récente (même expirée/révoquée).
     """
     try:
-        # ✅ Normaliser le device_id
         clean_device = (device_id or "").strip().upper()
         if not clean_device:
             return None
@@ -368,7 +383,6 @@ def _find_license_by_device(device_id: str, db: Session):
                 devices = json.loads(raw)
                 if not isinstance(devices, list):
                     continue
-                # ✅ Normaliser les devices stockés aussi
                 normalized = [str(d).strip().upper() for d in devices]
                 if clean_device in normalized:
                     is_expired = bool(lic.expires_at and now > lic.expires_at)
@@ -842,12 +856,17 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                 )
 
         # PRIORITÉ 3 : Vraiment nouveau device + nouveau numéro
+        # ✅ MODIFIÉ : avec DEFAULT_INITIAL_QUOTA = 1, le device est immédiatement bloqué
         new_attempt = DeviceAttempt(
             device_id=clean_device,
             phone_number=clean_phone,
             attempts_count=1,
             max_attempts_allowed=DEFAULT_INITIAL_QUOTA,
-            is_blocked=False,
+            is_blocked=(1 >= DEFAULT_INITIAL_QUOTA),  # ✅ bloqué dès le 1er essai si quota=1
+            block_reason=(
+                f"Quota atteint (1/{DEFAULT_INITIAL_QUOTA})"
+                if DEFAULT_INITIAL_QUOTA <= 1 else ""
+            ),
             admin_unblocked=False,
             first_attempt_at=get_utc_now(),
             last_attempt_at=get_utc_now(),
@@ -897,17 +916,12 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
 
 # ═══════════════════════════════════════════════════════════
 # ROUTE : VÉRIFICATION / ACTIVATION
-#    ✅ FIX CRITIQUE : normalisation device_id (uppercase)
-#    ✅ Crée la trace si manquante
-#    ✅ Débloque le device si clé valide
-#    ✅ Met à jour les infos utilisateur
 # ═══════════════════════════════════════════════════════════
 @app.post("/api/license/verify")
 @app.post("/api/license/verify/")
 def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(get_db)):
     try:
         clean_key = req.key.strip().upper()
-        # ✅ FIX : normaliser le device_id (uppercase) comme dans /request-key/
         clean_device = req.device_id.strip().upper()
 
         license_entry = db.query(LicenseKey).filter(LicenseKey.key == clean_key).first()
@@ -941,13 +955,11 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
             print(f"[VERIFY] Licence {clean_key} activée pour la première fois "
                   f"(expire {license_entry.expires_at})")
 
-        # Mettre à jour les infos utilisateur si fournies
         changed = []
         _update_license_user_info(license_entry, req, changed)
         if changed:
             print(f"[VERIFY] Licence {clean_key} : mise à jour → {', '.join(changed)}")
 
-        # Gestion explicite de None / "" / "REVOKED"
         raw_dev = license_entry.device_uuid
         if raw_dev in (None, "", "REVOKED"):
             devices = []
@@ -959,12 +971,10 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
             except Exception:
                 devices = []
 
-        # ✅ FIX : normaliser tous les devices en uppercase pour comparer
         devices_normalized = [str(d).strip().upper() for d in devices]
 
         max_dev = license_entry.max_devices or 1
 
-        # ✅ FIX : utilise clean_device (uppercase) pour la comparaison
         if clean_device not in devices_normalized:
             if len(devices_normalized) >= max_dev:
                 print(f"[VERIFY] REFUSÉ : limite d'appareils atteinte "
@@ -982,7 +992,6 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
         else:
             print(f"[VERIFY] Device {clean_device} déjà dans la clé {clean_key}")
 
-        # Création/déblocage auto de la trace device (avec clean_device)
         dev_trace = db.query(DeviceAttempt).filter(
             DeviceAttempt.device_id == clean_device
         ).first()
@@ -1428,10 +1437,8 @@ def delete_admin_device(device_id: str, db: Session = Depends(get_db)):
                 continue
             devices = json.loads(raw)
             if isinstance(devices, list):
-                # Normaliser pour comparaison
                 normalized = [str(d).strip().upper() for d in devices]
                 if clean_dev in normalized:
-                    # Retirer toutes les variantes correspondantes
                     devices = [d for d in devices
                                if str(d).strip().upper() != clean_dev]
                     lic.device_uuid = json.dumps(devices)
