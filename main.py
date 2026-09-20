@@ -343,6 +343,7 @@ def _duration_to_days(val: int, unit: str) -> int:
 
 # ═══════════════════════════════════════════════════════════
 # HELPER : trouver une licence par device_id
+#    ✅ FIX : normalise le device_id ET les devices stockés
 # ═══════════════════════════════════════════════════════════
 def _find_license_by_device(device_id: str, db: Session):
     """
@@ -351,6 +352,11 @@ def _find_license_by_device(device_id: str, db: Session):
     Priorité 2 : la plus récente (même expirée/révoquée).
     """
     try:
+        # ✅ Normaliser le device_id
+        clean_device = (device_id or "").strip().upper()
+        if not clean_device:
+            return None
+
         all_lics = db.query(LicenseKey).order_by(LicenseKey.id.desc()).all()
 
         now = get_utc_now()
@@ -360,7 +366,11 @@ def _find_license_by_device(device_id: str, db: Session):
                 if raw in ("", "REVOKED"):
                     continue
                 devices = json.loads(raw)
-                if isinstance(devices, list) and device_id in devices:
+                if not isinstance(devices, list):
+                    continue
+                # ✅ Normaliser les devices stockés aussi
+                normalized = [str(d).strip().upper() for d in devices]
+                if clean_device in normalized:
                     is_expired = bool(lic.expires_at and now > lic.expires_at)
                     if lic.is_active and not is_expired:
                         return lic
@@ -373,7 +383,10 @@ def _find_license_by_device(device_id: str, db: Session):
                 if raw in ("", "REVOKED"):
                     continue
                 devices = json.loads(raw)
-                if isinstance(devices, list) and device_id in devices:
+                if not isinstance(devices, list):
+                    continue
+                normalized = [str(d).strip().upper() for d in devices]
+                if clean_device in normalized:
                     return lic
             except Exception:
                 continue
@@ -451,9 +464,7 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
 
         check_rate_limit(clean_device)
 
-        # ═══════════════════════════════════════════════════════════
-        # 🔑 PRIORITÉ ABSOLUE : Une clé est-elle déjà liée à ce device ?
-        # ═══════════════════════════════════════════════════════════
+        # PRIORITÉ ABSOLUE : Une clé est-elle déjà liée à ce device ?
         existing_device_lic = _find_license_by_device(clean_device, db)
 
         if existing_device_lic:
@@ -886,6 +897,7 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
 
 # ═══════════════════════════════════════════════════════════
 # ROUTE : VÉRIFICATION / ACTIVATION
+#    ✅ FIX CRITIQUE : normalisation device_id (uppercase)
 #    ✅ Crée la trace si manquante
 #    ✅ Débloque le device si clé valide
 #    ✅ Met à jour les infos utilisateur
@@ -895,6 +907,9 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
 def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(get_db)):
     try:
         clean_key = req.key.strip().upper()
+        # ✅ FIX : normaliser le device_id (uppercase) comme dans /request-key/
+        clean_device = req.device_id.strip().upper()
+
         license_entry = db.query(LicenseKey).filter(LicenseKey.key == clean_key).first()
 
         if not license_entry:
@@ -926,7 +941,7 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
             print(f"[VERIFY] Licence {clean_key} activée pour la première fois "
                   f"(expire {license_entry.expires_at})")
 
-        # ✅ FIX : mettre à jour les infos utilisateur si fournies
+        # Mettre à jour les infos utilisateur si fournies
         changed = []
         _update_license_user_info(license_entry, req, changed)
         if changed:
@@ -944,28 +959,39 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
             except Exception:
                 devices = []
 
+        # ✅ FIX : normaliser tous les devices en uppercase pour comparer
+        devices_normalized = [str(d).strip().upper() for d in devices]
+
         max_dev = license_entry.max_devices or 1
-        if req.device_id not in devices:
-            if len(devices) >= max_dev:
+
+        # ✅ FIX : utilise clean_device (uppercase) pour la comparaison
+        if clean_device not in devices_normalized:
+            if len(devices_normalized) >= max_dev:
+                print(f"[VERIFY] REFUSÉ : limite d'appareils atteinte "
+                      f"({len(devices_normalized)}/{max_dev}) pour {clean_key}")
+                print(f"[VERIFY] Devices enregistrés : {devices_normalized}")
+                print(f"[VERIFY] Device demandé : {clean_device}")
                 raise HTTPException(
                     403,
                     f"Limite d'appareils atteinte pour cette clé "
-                    f"({len(devices)}/{max_dev}). Contactez l'administrateur."
+                    f"({len(devices_normalized)}/{max_dev}). Contactez l'administrateur."
                 )
-            devices.append(req.device_id)
+            devices.append(clean_device)
             license_entry.device_uuid = json.dumps(devices)
-            print(f"[VERIFY] Device {req.device_id} ajouté à la clé {clean_key}")
+            print(f"[VERIFY] Device {clean_device} ajouté à la clé {clean_key}")
+        else:
+            print(f"[VERIFY] Device {clean_device} déjà dans la clé {clean_key}")
 
-        # ✅ FIX : création/déblocage auto de la trace device
+        # Création/déblocage auto de la trace device (avec clean_device)
         dev_trace = db.query(DeviceAttempt).filter(
-            DeviceAttempt.device_id == req.device_id
+            DeviceAttempt.device_id == clean_device
         ).first()
 
         if dev_trace:
             dev_trace.last_attempt_at = get_utc_now()
 
             if dev_trace.is_blocked:
-                print(f"[VERIFY] Device {req.device_id} était bloqué "
+                print(f"[VERIFY] Device {clean_device} était bloqué "
                       f"({dev_trace.block_reason}) → DÉBLOQUÉ car clé valide")
                 dev_trace.is_blocked = False
                 dev_trace.block_reason = ""
@@ -973,7 +999,7 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
                 dev_trace.admin_unblocked_at = get_utc_now()
         else:
             dev_trace = DeviceAttempt(
-                device_id=req.device_id,
+                device_id=clean_device,
                 phone_number=license_entry.phone_number or "",
                 attempts_count=0,
                 max_attempts_allowed=0,
@@ -983,7 +1009,7 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
                 last_attempt_at=get_utc_now(),
             )
             db.add(dev_trace)
-            print(f"[VERIFY] Trace créée pour device {req.device_id} "
+            print(f"[VERIFY] Trace créée pour device {clean_device} "
                   f"(absent en base)")
 
         db.commit()
@@ -1238,16 +1264,12 @@ def reset_license_to_trial(key: str, req: ResetToTrialRequest, db: Session = Dep
     }
 
 
-# ═══════════════════════════════════════════════════════════
-# ✅ FIX : reset-devices supprime aussi les traces orphelines
-# ═══════════════════════════════════════════════════════════
 @app.post("/api/admin/licenses/{key}/reset-devices", dependencies=[Depends(require_admin_key)])
 def reset_admin_license_devices(key: str, db: Session = Depends(get_db)):
     lic = db.query(LicenseKey).filter(LicenseKey.key == key.strip().upper()).first()
     if not lic:
         raise HTTPException(404, "Licence introuvable.")
 
-    # Récupérer les devices avant de vider
     try:
         devs = json.loads(lic.device_uuid or "[]")
         if not isinstance(devs, list):
@@ -1259,8 +1281,6 @@ def reset_admin_license_devices(key: str, db: Session = Depends(get_db)):
     lic.activated_at = None
     lic.expires_at = None
 
-    # ✅ Supprimer les traces des devices associés
-    #    (elles sont maintenant orphelines)
     deleted_count = 0
     for dev_id in devs:
         dev = db.query(DeviceAttempt).filter(
@@ -1389,9 +1409,6 @@ def update_admin_device(device_id: str, req: DeviceUpdateRequest, db: Session = 
     }
 
 
-# ═══════════════════════════════════════════════════════════
-# ✅ FIX : delete device retire aussi le device des licences
-# ═══════════════════════════════════════════════════════════
 @app.delete("/api/admin/devices/{device_id}", dependencies=[Depends(require_admin_key)])
 def delete_admin_device(device_id: str, db: Session = Depends(get_db)):
     clean_dev = device_id.strip().upper()
@@ -1402,7 +1419,6 @@ def delete_admin_device(device_id: str, db: Session = Depends(get_db)):
     if not dev:
         raise HTTPException(404, "Appareil introuvable.")
 
-    # ✅ Retirer ce device de toutes les licences qui le référencent
     all_lics = db.query(LicenseKey).all()
     cleaned = 0
     for lic in all_lics:
@@ -1411,10 +1427,15 @@ def delete_admin_device(device_id: str, db: Session = Depends(get_db)):
             if raw in ("", "REVOKED"):
                 continue
             devices = json.loads(raw)
-            if isinstance(devices, list) and clean_dev in devices:
-                devices.remove(clean_dev)
-                lic.device_uuid = json.dumps(devices)
-                cleaned += 1
+            if isinstance(devices, list):
+                # Normaliser pour comparaison
+                normalized = [str(d).strip().upper() for d in devices]
+                if clean_dev in normalized:
+                    # Retirer toutes les variantes correspondantes
+                    devices = [d for d in devices
+                               if str(d).strip().upper() != clean_dev]
+                    lic.device_uuid = json.dumps(devices)
+                    cleaned += 1
         except Exception:
             continue
 
