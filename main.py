@@ -6,9 +6,9 @@ import traceback
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text, text
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
@@ -22,11 +22,25 @@ TRIAL_MAX_TABLES = 1
 TRIAL_MAX_ROWS_PER_TABLE = 50
 TRIAL_ALLOW_EXPORT = False
 
-# ==========================================
+# ═══════════════════════════════════════════════════════════
+# 🔐 CLÉ ADMIN — lue depuis les variables d'environnement Render
+# ═══════════════════════════════════════════════════════════
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
+
+if not ADMIN_API_KEY:
+    print("⚠️  [WARN] ADMIN_API_KEY non définie.")
+    print("⚠️  [WARN] Ajoute ADMIN_API_KEY=xxxx dans les variables d'environnement Render.")
+    print("⚠️  [WARN] Les routes /api/admin/* seront inaccessibles (401).")
+
+# ═══════════════════════════════════════════════════════════
 # CONFIGURATION BASE DE DONNÉES
-# ==========================================
-DEFAULT_DB_URL = "postgresql://neondb_owner:npg_NmxZaUb7n1Co@ep-odd-rice-axq1ordl-pooler.c-4.us-east-2.aws.neon.tech/neondb?sslmode=require"
-DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_DB_URL)
+# ═══════════════════════════════════════════════════════════
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+
+if not DATABASE_URL:
+    print("❌ [FATAL] DATABASE_URL non définie !")
+    print("❌ [FATAL] Définis DATABASE_URL=postgresql://... dans les variables Render.")
+    raise RuntimeError("DATABASE_URL requis.")
 
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
@@ -77,9 +91,39 @@ def get_utc_now():
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-# ==========================================
+# ═══════════════════════════════════════════════════════════
+# 🛡️  DÉPENDANCE AUTH ADMIN
+# ═══════════════════════════════════════════════════════════
+async def require_admin_key(x_admin_key: str = Header(None, alias="X-Admin-Key")):
+    """Vérifie que la requête admin est authentifiée."""
+    if not ADMIN_API_KEY:
+        raise HTTPException(503, "Service admin désactivé (ADMIN_API_KEY non configurée).")
+    if not x_admin_key or x_admin_key.strip() != ADMIN_API_KEY:
+        raise HTTPException(401, "Clé admin invalide ou manquante.")
+    return True
+
+
+# ═══════════════════════════════════════════════════════════
+# 🛡️  RATE LIMITING (anti-spam)
+# ═══════════════════════════════════════════════════════════
+_rate_limit_store: dict = {}
+RATE_LIMIT_WINDOW_SEC = 60
+RATE_LIMIT_MAX_REQUESTS = 10
+
+
+def check_rate_limit(identifier: str):
+    now = time.time()
+    history = _rate_limit_store.get(identifier, [])
+    history = [t for t in history if now - t < RATE_LIMIT_WINDOW_SEC]
+    if len(history) >= RATE_LIMIT_MAX_REQUESTS:
+        raise HTTPException(429, "Trop de requêtes. Réessayez dans une minute.")
+    history.append(now)
+    _rate_limit_store[identifier] = history
+
+
+# ═══════════════════════════════════════════════════════════
 # MODÈLES SQLALCHEMY
-# ==========================================
+# ═══════════════════════════════════════════════════════════
 class LicenseKey(Base):
     __tablename__ = "licenses"
 
@@ -102,7 +146,6 @@ class LicenseKey(Base):
 
 
 class DeviceAttempt(Base):
-    """Trace des tentatives d'essai par device_id matériel."""
     __tablename__ = "device_attempts"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -111,17 +154,10 @@ class DeviceAttempt(Base):
     first_attempt_at = Column(DateTime, default=get_utc_now)
     last_attempt_at = Column(DateTime, default=get_utc_now)
     attempts_count = Column(Integer, default=1)
-    
-    # ✅ NOUVEAU : quota max d'essais autorisés
-    # Par défaut : 1 (un seul essai gratuit)
-    # L'admin peut augmenter ce nombre pour autoriser plus d'essais
     max_attempts_allowed = Column(Integer, default=1)
-    
     is_blocked = Column(Boolean, default=False)
     block_reason = Column(String(255), default="")
     notes = Column(Text, default="")
-    
-    # Legacy (conservé pour compatibilité)
     admin_unblocked = Column(Boolean, default=False)
     admin_unblocked_at = Column(DateTime, nullable=True)
 
@@ -139,9 +175,9 @@ class AppNews(Base):
     created_at = Column(DateTime, default=get_utc_now)
 
 
-# ==========================================
-# MIGRATIONS ROBUSTES
-# ==========================================
+# ═══════════════════════════════════════════════════════════
+# MIGRATIONS
+# ═══════════════════════════════════════════════════════════
 print("[startup] Début des migrations...")
 
 migrations = [
@@ -157,7 +193,6 @@ migrations = [
     ("SET duration_days default", f"ALTER TABLE licenses ALTER COLUMN duration_days SET DEFAULT {DEFAULT_TRIAL_DAYS}"),
     ("ADD admin_unblocked", "ALTER TABLE device_attempts ADD COLUMN IF NOT EXISTS admin_unblocked BOOLEAN DEFAULT FALSE"),
     ("ADD admin_unblocked_at", "ALTER TABLE device_attempts ADD COLUMN IF NOT EXISTS admin_unblocked_at TIMESTAMP"),
-    # ✅ NOUVELLE COLONNE : quota d'essais autorisés
     ("ADD max_attempts_allowed", "ALTER TABLE device_attempts ADD COLUMN IF NOT EXISTS max_attempts_allowed INTEGER DEFAULT 1"),
 ]
 
@@ -187,44 +222,44 @@ def get_db():
         db.close()
 
 
-# ==========================================
+# ═══════════════════════════════════════════════════════════
 # APPLICATION FASTAPI
-# ==========================================
+# ═══════════════════════════════════════════════════════════
 app = FastAPI(title="SmartCollect API & Admin Server", redirect_slashes=True)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
 
-# ==========================================
+# ═══════════════════════════════════════════════════════════
 # SCHÉMAS PYDANTIC
-# ==========================================
+# ═══════════════════════════════════════════════════════════
 class SelfRegisterPhoneRequest(BaseModel):
-    first_name: str
-    last_name: str
-    phone_number: str
-    organization: Optional[str] = ""
-    device_id: str
+    first_name: str = Field(..., max_length=100)
+    last_name: str = Field(..., max_length=100)
+    phone_number: str = Field(..., min_length=6, max_length=50)
+    organization: Optional[str] = Field("", max_length=150)
+    device_id: str = Field(..., min_length=8, max_length=255)
 
 
 class FlutterVerifyRequest(BaseModel):
-    key: str
-    device_id: str
+    key: str = Field(..., min_length=8, max_length=32)
+    device_id: str = Field(..., min_length=8, max_length=255)
     first_name: Optional[str] = ""
     last_name: Optional[str] = ""
     organization: Optional[str] = ""
 
 
 class AdminCreateLicenseRequest(BaseModel):
-    phone_number: str
-    duration_val: int
-    duration_unit: str
-    max_devices: int = 1
+    phone_number: str = Field(..., min_length=6, max_length=50)
+    duration_val: int = Field(..., ge=1, le=9999)
+    duration_unit: str = Field(..., max_length=20)
+    max_devices: int = Field(1, ge=1, le=50)
     is_active: Optional[bool] = False
 
 
@@ -232,46 +267,68 @@ class AdminUpdateLicenseRequest(BaseModel):
     phone_number: Optional[str] = None
     user_name: Optional[str] = None
     organization: Optional[str] = None
-    max_devices: Optional[int] = None
+    max_devices: Optional[int] = Field(None, ge=1, le=50)
     is_active: Optional[bool] = None
-    extend_duration_val: Optional[int] = None
+    extend_duration_val: Optional[int] = Field(None, ge=0, le=9999)
     extend_duration_unit: Optional[str] = None
 
 
 class NewsCreateRequest(BaseModel):
-    title: str
-    summary: str
+    title: str = Field(..., max_length=255)
+    summary: str = Field(..., max_length=2000)
     content: Optional[str] = ""
-    category: str = "news"
+    category: str = Field("news", max_length=50)
     version: Optional[str] = None
     download_url: Optional[str] = None
 
 
 class DeviceUpdateRequest(BaseModel):
+    """Payload pour modifier un appareil.
+    - add_attempts      : ajoute N au quota actuel
+    - set_max_attempts  : remplace le quota par une valeur absolue
+    - is_blocked        : bloque / débloque manuellement
+    - notes             : commentaire libre
+    """
     is_blocked: Optional[bool] = None
     notes: Optional[str] = None
-    # ✅ NOUVEAU : nombre de tentatives à ajouter au quota
-    add_attempts: Optional[int] = None
+    add_attempts: Optional[int] = Field(None, ge=0, le=100)
+    set_max_attempts: Optional[int] = Field(None, ge=0, le=100)
 
 
 class GrantFullAccessRequest(BaseModel):
-    duration_val: int
-    duration_unit: str
+    duration_val: int = Field(..., ge=1, le=9999)
+    duration_unit: str = Field(..., max_length=20)
 
 
 class ResetToTrialRequest(BaseModel):
-    duration_val: int
-    duration_unit: str
+    duration_val: int = Field(..., ge=1, le=9999)
+    duration_unit: str = Field(..., max_length=20)
 
 
-# ==========================================
+# ═══════════════════════════════════════════════════════════
+# HELPER : durée → jours
+# ═══════════════════════════════════════════════════════════
+def _duration_to_days(val: int, unit: str) -> int:
+    u = unit.lower()
+    if "mois" in u:
+        return val * 30
+    if "an" in u:
+        return val * 365
+    if "jour" in u:
+        return val
+    if "heure" in u:
+        return max(1, val // 24)
+    return val
+
+
+# ═══════════════════════════════════════════════════════════
 # ROUTES PUBLIQUES
-# ==========================================
+# ═══════════════════════════════════════════════════════════
 @app.get("/")
 def home():
     return {
         "status": "online",
-        "database": "Neon PostgreSQL",
+        "database": "PostgreSQL",
         "service": "SmartCollect Unified API",
         "default_trial_days": DEFAULT_TRIAL_DAYS,
         "trial_max_tables": TRIAL_MAX_TABLES,
@@ -285,20 +342,12 @@ def health():
     return {"status": "healthy"}
 
 
-# ==========================================
+# ═══════════════════════════════════════════════════════════
 # ROUTES FLUTTER
-# ==========================================
+# ═══════════════════════════════════════════════════════════
 @app.post("/api/license/request-key")
 @app.post("/api/license/request-key/")
 def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get_db)):
-    """
-    RÈGLES :
-    1. Device ne peut obtenir qu'autant d'essais que `max_attempts_allowed`.
-    2. Par défaut : 1 seul essai (quota=1).
-    3. Admin peut augmenter le quota pour autoriser plus d'essais.
-    4. Réinstallation NE contourne PAS (device_id stable).
-    5. Admin peut aussi créer une licence complète (pas de compteur).
-    """
     try:
         clean_phone = req.phone_number.strip().replace(" ", "")
         clean_device = req.device_id.strip().upper()
@@ -308,9 +357,9 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
         if not clean_phone or len(clean_phone) < 6:
             raise HTTPException(400, "Numéro de téléphone invalide.")
 
-        # ═══════════════════════════════════════════════════════════
-        # PRIORITÉ 0 : Licence ADMIN existante pour ce numéro ?
-        # ═══════════════════════════════════════════════════════════
+        check_rate_limit(clean_device)
+
+        # PRIORITÉ 0 : Licence admin existante ?
         admin_lic = db.query(LicenseKey).filter(
             LicenseKey.phone_number == clean_phone,
             LicenseKey.is_active == True,
@@ -318,7 +367,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
         ).first()
 
         if admin_lic:
-            print(f"[REQUEST-KEY] Licence admin trouvée pour {clean_phone}")
             return {
                 "status": "success",
                 "message": "Licence active trouvée.",
@@ -327,25 +375,16 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                 "is_trial": False,
             }
 
-        # ═══════════════════════════════════════════════════════════
         # PRIORITÉ 1 : Device déjà enregistré ?
-        # ═══════════════════════════════════════════════════════════
         existing_device = db.query(DeviceAttempt).filter(
             DeviceAttempt.device_id == clean_device
         ).first()
 
         if existing_device:
-            # Récupérer le quota (fallback à 1 si colonne absente)
-            max_allowed = getattr(existing_device, 'max_attempts_allowed', 1) or 1
+            max_allowed = existing_device.max_attempts_allowed or 1
             attempts_count = existing_device.attempts_count or 0
 
-            print(f"[REQUEST-KEY] Device {clean_device} : {attempts_count}/{max_allowed} tentatives")
-
-            # ─────────────────────────────────────────────────────
-            # CAS A : Quota atteint ou bloqué → refus
-            # ─────────────────────────────────────────────────────
             if existing_device.is_blocked or attempts_count >= max_allowed:
-                # Vérifier si une licence admin est associée
                 admin_lic = db.query(LicenseKey).filter(
                     LicenseKey.phone_number == clean_phone,
                     LicenseKey.is_active == True,
@@ -361,27 +400,17 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                         "is_trial": False,
                     }
 
-                # Sinon → blocage automatique
                 existing_device.is_blocked = True
                 existing_device.last_attempt_at = get_utc_now()
                 if not existing_device.block_reason:
-                    existing_device.block_reason = (
-                        f"Quota atteint ({attempts_count}/{max_allowed})"
-                    )
+                    existing_device.block_reason = f"Quota atteint ({attempts_count}/{max_allowed})"
                 db.commit()
 
                 raise HTTPException(
                     403,
-                    "Cet appareil a déjà utilisé toutes ses tentatives autorisées. "
-                    "Contactez l'administrateur pour plus d'accès."
+                    "Cet appareil a déjà utilisé toutes ses tentatives autorisées."
                 )
 
-            # ─────────────────────────────────────────────────────
-            # CAS B : Quota disponible → on autorise un nouvel essai
-            # ─────────────────────────────────────────────────────
-            print(f"[REQUEST-KEY] Quota disponible ({attempts_count}/{max_allowed}) → nouvel essai")
-
-            # Vérifier si une licence existe pour ce numéro
             existing_lic = db.query(LicenseKey).filter(
                 LicenseKey.phone_number == clean_phone
             ).first()
@@ -390,7 +419,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                 existing_device.phone_number = clean_phone
                 existing_device.last_attempt_at = get_utc_now()
                 db.commit()
-
                 return {
                     "status": "success",
                     "message": "Une clé existe déjà pour ce numéro.",
@@ -399,7 +427,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                     "is_trial": bool(existing_lic.is_trial),
                 }
 
-            # Créer une nouvelle licence d'essai
             part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
             license_key = f"{part1}-{part2}-{part3}-{part4}"
 
@@ -420,21 +447,16 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
             )
             db.add(new_lic)
 
-            # Incrémenter le compteur
             existing_device.attempts_count = attempts_count + 1
             existing_device.phone_number = clean_phone
             existing_device.last_attempt_at = get_utc_now()
 
-            # Si on atteint le quota, on bloque
             if existing_device.attempts_count >= max_allowed:
                 existing_device.is_blocked = True
                 existing_device.block_reason = "Quota atteint après ce nouvel essai"
-                print(f"[REQUEST-KEY] Quota atteint ({existing_device.attempts_count}/{max_allowed}) → device bloqué")
 
             db.commit()
             db.refresh(new_lic)
-
-            print(f"[REQUEST-KEY] Nouvel essai accordé : {license_key}")
             return {
                 "status": "success",
                 "message": "Nouvel essai accordé.",
@@ -443,34 +465,28 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                 "is_trial": True,
             }
 
-        # ═══════════════════════════════════════════════════════════
-        # PRIORITÉ 2 : Device jamais vu + numéro déjà utilisé ?
-        # ═══════════════════════════════════════════════════════════
+        # PRIORITÉ 2 : Device nouveau + numéro connu ?
         existing_lic = db.query(LicenseKey).filter(
             LicenseKey.phone_number == clean_phone
         ).first()
 
         if existing_lic:
             if not existing_lic.is_active:
-                raise HTTPException(
-                    403,
-                    "Une licence existe déjà pour ce numéro mais elle "
-                    "est désactivée. Contactez l'administrateur."
-                )
+                raise HTTPException(403, "Licence désactivée pour ce numéro.")
 
             new_attempt = DeviceAttempt(
                 device_id=clean_device,
                 phone_number=clean_phone,
-                attempts_count=1,
-                max_attempts_allowed=1,
-                is_blocked=False,
+                attempts_count=0,
+                max_attempts_allowed=0,
+                is_blocked=True,
+                block_reason="Device différent pour numéro déjà utilisé",
                 admin_unblocked=False,
                 first_attempt_at=get_utc_now(),
                 last_attempt_at=get_utc_now(),
             )
             db.add(new_attempt)
             db.commit()
-
             return {
                 "status": "success",
                 "message": "Une clé existe déjà pour ce numéro.",
@@ -479,9 +495,7 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                 "is_trial": bool(existing_lic.is_trial),
             }
 
-        # ═══════════════════════════════════════════════════════════
-        # PRIORITÉ 3 : Vraiment nouvel appareil + nouveau numéro
-        # ═══════════════════════════════════════════════════════════
+        # PRIORITÉ 3 : Nouveau device + nouveau numéro
         new_attempt = DeviceAttempt(
             device_id=clean_device,
             phone_number=clean_phone,
@@ -515,8 +529,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
         db.add(new_lic)
         db.commit()
         db.refresh(new_lic)
-
-        print(f"[REQUEST-KEY] Nouvel essai (nouveau device) : {license_key}")
         return {
             "status": "success",
             "message": "Clé d'essai générée avec succès !",
@@ -591,16 +603,15 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
         raise HTTPException(500, f"Erreur DB: {str(e)}")
 
 
-# ==========================================
-# ROUTES ADMINISTRATION DES LICENCES
-# ==========================================
-@app.get("/api/admin/licenses")
-@app.get("/api/admin/licenses/")
+# ═══════════════════════════════════════════════════════════
+# ROUTES ADMIN (🔐 Protégées par X-Admin-Key)
+# ═══════════════════════════════════════════════════════════
+@app.get("/api/admin/licenses", dependencies=[Depends(require_admin_key)])
+@app.get("/api/admin/licenses/", dependencies=[Depends(require_admin_key)])
 def get_admin_licenses(db: Session = Depends(get_db)):
     try:
         licenses = db.query(LicenseKey).order_by(LicenseKey.id.desc()).all()
         results = []
-
         for item in licenses:
             try:
                 raw_dev = str(item.device_uuid or "[]")
@@ -628,31 +639,20 @@ def get_admin_licenses(db: Session = Depends(get_db)):
                 "created_at": item.created_at.isoformat() if item.created_at else "",
                 "expires_at": item.expires_at.isoformat() if item.expires_at else None
             })
-
         return results
     except Exception as err:
         print(f"[ADMIN-LIST ERROR] {traceback.format_exc()}")
         raise HTTPException(500, f"Erreur SQL/Python: {str(err)}")
 
 
-@app.post("/api/admin/licenses/create")
-@app.post("/api/admin/licenses/create/")
+@app.post("/api/admin/licenses/create", dependencies=[Depends(require_admin_key)])
+@app.post("/api/admin/licenses/create/", dependencies=[Depends(require_admin_key)])
 def create_admin_license(req: AdminCreateLicenseRequest, db: Session = Depends(get_db)):
     try:
         part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
         license_key = f"{part1}-{part2}-{part3}-{part4}"
 
-        unit = req.duration_unit.lower()
-        if "mois" in unit:
-            days = req.duration_val * 30
-        elif "an" in unit:
-            days = req.duration_val * 365
-        elif "jour" in unit:
-            days = req.duration_val
-        elif "heure" in unit:
-            days = max(1, req.duration_val // 24)
-        else:
-            days = req.duration_val
+        days = _duration_to_days(req.duration_val, req.duration_unit)
 
         new_lic = LicenseKey(
             key=license_key,
@@ -669,7 +669,6 @@ def create_admin_license(req: AdminCreateLicenseRequest, db: Session = Depends(g
         db.add(new_lic)
         db.commit()
         db.refresh(new_lic)
-
         return {
             "id": new_lic.id,
             "key": license_key,
@@ -686,8 +685,8 @@ def create_admin_license(req: AdminCreateLicenseRequest, db: Session = Depends(g
         raise HTTPException(500, f"Erreur DB: {str(e)}")
 
 
-@app.put("/api/admin/licenses/{key}")
-@app.put("/api/admin/licenses/{key}/")
+@app.put("/api/admin/licenses/{key}", dependencies=[Depends(require_admin_key)])
+@app.put("/api/admin/licenses/{key}/", dependencies=[Depends(require_admin_key)])
 def update_admin_license_full(key: str, req: AdminUpdateLicenseRequest, db: Session = Depends(get_db)):
     lic = db.query(LicenseKey).filter(LicenseKey.key == key.strip().upper()).first()
     if not lic:
@@ -708,21 +707,13 @@ def update_admin_license_full(key: str, req: AdminUpdateLicenseRequest, db: Sess
 
     if req.extend_duration_val and req.extend_duration_unit:
         val = int(req.extend_duration_val)
-        unit = req.extend_duration_unit.lower()
-        if "mois" in unit:
-            extra_days = val * 30
-        elif "an" in unit:
-            extra_days = val * 365
-        elif "jour" in unit:
-            extra_days = val
-        else:
-            extra_days = val
-
-        lic.duration_days = (lic.duration_days or DEFAULT_TRIAL_DAYS) + extra_days
-        lic.duration_val = val
-        lic.duration_unit = req.extend_duration_unit
+        extra_days = _duration_to_days(val, req.extend_duration_unit)
+        total_days = (lic.duration_days or 0) + extra_days
+        lic.duration_days = total_days
+        lic.duration_val = total_days
+        lic.duration_unit = "Jours"
         if lic.activated_at:
-            lic.expires_at = lic.activated_at + timedelta(days=lic.duration_days)
+            lic.expires_at = lic.activated_at + timedelta(days=total_days)
 
     db.commit()
     db.refresh(lic)
@@ -739,39 +730,24 @@ def update_admin_license_full(key: str, req: AdminUpdateLicenseRequest, db: Sess
     }
 
 
-@app.post("/api/admin/licenses/{key}/status")
+@app.post("/api/admin/licenses/{key}/status", dependencies=[Depends(require_admin_key)])
 def toggle_admin_license_status(key: str, db: Session = Depends(get_db)):
     lic = db.query(LicenseKey).filter(LicenseKey.key == key.strip().upper()).first()
     if not lic:
         raise HTTPException(404, "Licence introuvable.")
-
     lic.is_active = not lic.is_active
     db.commit()
     return {"status": "success", "is_active": lic.is_active}
 
 
-@app.post("/api/admin/licenses/{key}/grant-full-access")
-@app.post("/api/admin/licenses/{key}/grant-full-access/")
-def grant_full_access(
-    key: str,
-    req: GrantFullAccessRequest,
-    db: Session = Depends(get_db)
-):
+@app.post("/api/admin/licenses/{key}/grant-full-access", dependencies=[Depends(require_admin_key)])
+@app.post("/api/admin/licenses/{key}/grant-full-access/", dependencies=[Depends(require_admin_key)])
+def grant_full_access(key: str, req: GrantFullAccessRequest, db: Session = Depends(get_db)):
     lic = db.query(LicenseKey).filter(LicenseKey.key == key.strip().upper()).first()
     if not lic:
         raise HTTPException(404, "Licence introuvable.")
 
-    unit = req.duration_unit.lower()
-    if "mois" in unit:
-        days = req.duration_val * 30
-    elif "an" in unit:
-        days = req.duration_val * 365
-    elif "jour" in unit:
-        days = req.duration_val
-    elif "heure" in unit:
-        days = max(1, req.duration_val // 24)
-    else:
-        days = req.duration_val
+    days = _duration_to_days(req.duration_val, req.duration_unit)
 
     lic.is_active = True
     lic.is_trial = False
@@ -782,7 +758,6 @@ def grant_full_access(
     now = get_utc_now()
     lic.activated_at = now
     lic.expires_at = now + timedelta(days=days)
-
     db.commit()
     db.refresh(lic)
 
@@ -799,28 +774,14 @@ def grant_full_access(
     }
 
 
-@app.post("/api/admin/licenses/{key}/reset-to-trial")
-@app.post("/api/admin/licenses/{key}/reset-to-trial/")
-def reset_license_to_trial(
-    key: str,
-    req: ResetToTrialRequest,
-    db: Session = Depends(get_db)
-):
+@app.post("/api/admin/licenses/{key}/reset-to-trial", dependencies=[Depends(require_admin_key)])
+@app.post("/api/admin/licenses/{key}/reset-to-trial/", dependencies=[Depends(require_admin_key)])
+def reset_license_to_trial(key: str, req: ResetToTrialRequest, db: Session = Depends(get_db)):
     lic = db.query(LicenseKey).filter(LicenseKey.key == key.strip().upper()).first()
     if not lic:
         raise HTTPException(404, "Licence introuvable.")
 
-    unit = req.duration_unit.lower()
-    if "mois" in unit:
-        days = req.duration_val * 30
-    elif "an" in unit:
-        days = req.duration_val * 365
-    elif "jour" in unit:
-        days = req.duration_val
-    elif "heure" in unit:
-        days = max(1, req.duration_val // 24)
-    else:
-        days = req.duration_val
+    days = _duration_to_days(req.duration_val, req.duration_unit)
 
     lic.is_active = True
     lic.is_trial = True
@@ -831,7 +792,6 @@ def reset_license_to_trial(
     now = get_utc_now()
     lic.activated_at = now
     lic.expires_at = now + timedelta(days=days)
-
     db.commit()
     db.refresh(lic)
 
@@ -848,12 +808,11 @@ def reset_license_to_trial(
     }
 
 
-@app.post("/api/admin/licenses/{key}/reset-devices")
+@app.post("/api/admin/licenses/{key}/reset-devices", dependencies=[Depends(require_admin_key)])
 def reset_admin_license_devices(key: str, db: Session = Depends(get_db)):
     lic = db.query(LicenseKey).filter(LicenseKey.key == key.strip().upper()).first()
     if not lic:
         raise HTTPException(404, "Licence introuvable.")
-
     lic.device_uuid = "[]"
     lic.activated_at = None
     lic.expires_at = None
@@ -861,12 +820,11 @@ def reset_admin_license_devices(key: str, db: Session = Depends(get_db)):
     return {"status": "success", "message": "Appareils dissociés."}
 
 
-@app.delete("/api/admin/licenses/{key}")
+@app.delete("/api/admin/licenses/{key}", dependencies=[Depends(require_admin_key)])
 def delete_admin_license(key: str, db: Session = Depends(get_db)):
     lic = db.query(LicenseKey).filter(LicenseKey.key == key.strip().upper()).first()
     if not lic:
         raise HTTPException(404, "Licence introuvable.")
-
     db.delete(lic)
     db.commit()
     return {"status": "success", "message": "Licence supprimée définitivement."}
@@ -875,25 +833,23 @@ def delete_admin_license(key: str, db: Session = Depends(get_db)):
 # ═══════════════════════════════════════════════════════════
 # GESTION DES APPAREILS
 # ═══════════════════════════════════════════════════════════
-@app.get("/api/admin/devices")
-@app.get("/api/admin/devices/")
+@app.get("/api/admin/devices", dependencies=[Depends(require_admin_key)])
+@app.get("/api/admin/devices/", dependencies=[Depends(require_admin_key)])
 def get_admin_devices(db: Session = Depends(get_db)):
     try:
-        devices = db.query(DeviceAttempt).order_by(
-            DeviceAttempt.last_attempt_at.desc()
-        ).all()
+        devices = db.query(DeviceAttempt).order_by(DeviceAttempt.last_attempt_at.desc()).all()
         return [
             {
                 "id": d.id,
                 "device_id": d.device_id,
                 "phone_number": d.phone_number,
                 "attempts_count": d.attempts_count,
-                "max_attempts_allowed": getattr(d, 'max_attempts_allowed', 1) or 1,
+                "max_attempts_allowed": d.max_attempts_allowed or 1,
                 "is_blocked": d.is_blocked,
                 "block_reason": d.block_reason or "",
                 "notes": d.notes or "",
-                "admin_unblocked": bool(d.admin_unblocked) if hasattr(d, 'admin_unblocked') else False,
-                "admin_unblocked_at": d.admin_unblocked_at.isoformat() if hasattr(d, 'admin_unblocked_at') and d.admin_unblocked_at else None,
+                "admin_unblocked": bool(d.admin_unblocked),
+                "admin_unblocked_at": d.admin_unblocked_at.isoformat() if d.admin_unblocked_at else None,
                 "first_attempt_at": d.first_attempt_at.isoformat() if d.first_attempt_at else "",
                 "last_attempt_at": d.last_attempt_at.isoformat() if d.last_attempt_at else "",
             }
@@ -904,76 +860,102 @@ def get_admin_devices(db: Session = Depends(get_db)):
         raise HTTPException(500, f"Erreur SQL: {str(err)}")
 
 
-@app.put("/api/admin/devices/{device_id}")
-@app.put("/api/admin/devices/{device_id}/")
+@app.put("/api/admin/devices/{device_id}", dependencies=[Depends(require_admin_key)])
+@app.put("/api/admin/devices/{device_id}/", dependencies=[Depends(require_admin_key)])
 def update_admin_device(device_id: str, req: DeviceUpdateRequest, db: Session = Depends(get_db)):
+    """
+    Modifie un appareil. Trois modes possibles :
+
+    1. add_attempts      → AJOUTE N au quota actuel (ex: +2 → 1 devient 3)
+    2. set_max_attempts  → DÉFINIT un quota absolu  (ex: 5 → 1 devient 5)
+    3. is_blocked        → bloque / débloque manuellement
+
+    Si un mode "déblocage" est demandé, is_blocked est automatiquement
+    mis à False et le device est marqué comme 'admin_unblocked'.
+    """
     dev = db.query(DeviceAttempt).filter(
         DeviceAttempt.device_id == device_id.strip().upper()
     ).first()
-    
     if not dev:
         raise HTTPException(404, "Appareil introuvable.")
 
-    # ✅ NOUVEAU : mise à jour du quota (add_attempts)
-    if req.add_attempts is not None and req.add_attempts > 0:
-        current = getattr(dev, 'max_attempts_allowed', 1) or 1
+    was_blocked = dev.is_blocked
+    log_lines = []
+
+    # ─── 1. Définir un quota ABSOLU ───
+    if req.set_max_attempts is not None:
+        dev.max_attempts_allowed = max(0, req.set_max_attempts)
+        dev.is_blocked = False
+        dev.block_reason = ""
+        dev.admin_unblocked = True
+        dev.admin_unblocked_at = get_utc_now()
+        log_lines.append(f"quota={dev.max_attempts_allowed} (absolu)")
+
+    # ─── 2. Ajouter N tentatives au quota ───
+    elif req.add_attempts is not None and req.add_attempts > 0:
+        current = dev.max_attempts_allowed or 0
         dev.max_attempts_allowed = current + req.add_attempts
         dev.is_blocked = False
         dev.block_reason = ""
         dev.admin_unblocked = True
         dev.admin_unblocked_at = get_utc_now()
-        print(f"[ADMIN] Device {device_id} : quota augmenté de {req.add_attempts} → {dev.max_attempts_allowed}")
-    
-    # Déblocage classique (compatibilité ancien bouton)
+        log_lines.append(f"+{req.add_attempts} → quota={dev.max_attempts_allowed}")
+
+    # ─── 3. Blocage / Déblocage manuel ───
     if req.is_blocked is not None:
-        dev.is_blocked = bool(req.is_blocked)
-        
-        if req.is_blocked:
-            # Blocage manuel
+        new_blocked = bool(req.is_blocked)
+        if new_blocked and not was_blocked:
+            dev.is_blocked = True
             dev.admin_unblocked = False
             dev.admin_unblocked_at = None
             if not dev.block_reason:
                 dev.block_reason = "Bloqué manuellement par l'administrateur"
-        else:
-            # Déblocage → +1 tentative par défaut
-            current = getattr(dev, 'max_attempts_allowed', 1) or 1
+            log_lines.append("BLOQUÉ")
+        elif not new_blocked and was_blocked:
+            # Déblocage simple : +1 tentative par défaut
+            current = dev.max_attempts_allowed or 0
             dev.max_attempts_allowed = current + 1
+            dev.is_blocked = False
             dev.admin_unblocked = True
             dev.admin_unblocked_at = get_utc_now()
             dev.block_reason = ""
-            print(f"[ADMIN] Device {device_id} débloqué (+1 tentative → {dev.max_attempts_allowed})")
-    
+            log_lines.append(f"DÉBLOQUÉ (+1 → quota={dev.max_attempts_allowed})")
+        else:
+            dev.is_blocked = new_blocked
+
     if req.notes is not None:
         dev.notes = req.notes
 
     db.commit()
     db.refresh(dev)
-    
+
+    if log_lines:
+        print(f"[ADMIN] Device {device_id} : {', '.join(log_lines)}")
+
     return {
         "status": "success",
         "device_id": dev.device_id,
         "is_blocked": dev.is_blocked,
         "attempts_count": dev.attempts_count,
-        "max_attempts_allowed": getattr(dev, 'max_attempts_allowed', 1) or 1,
-        "admin_unblocked": bool(dev.admin_unblocked) if hasattr(dev, 'admin_unblocked') else False,
+        "max_attempts_allowed": dev.max_attempts_allowed or 0,
+        "admin_unblocked": bool(dev.admin_unblocked),
         "notes": dev.notes
     }
 
 
-@app.delete("/api/admin/devices/{device_id}")
+@app.delete("/api/admin/devices/{device_id}", dependencies=[Depends(require_admin_key)])
 def delete_admin_device(device_id: str, db: Session = Depends(get_db)):
     dev = db.query(DeviceAttempt).filter(DeviceAttempt.device_id == device_id.strip().upper()).first()
     if not dev:
         raise HTTPException(404, "Appareil introuvable.")
-
     db.delete(dev)
     db.commit()
     return {"status": "success", "message": "Trace d'appareil supprimée."}
 
 
-# ==========================================
-# ROUTES ACTUALITÉS & ASTUCES
-# ==========================================
+# ═══════════════════════════════════════════════════════════
+# ACTUALITÉS
+# ═══════════════════════════════════════════════════════════
 @app.get("/api/news")
 @app.get("/api/news/")
 def get_all_news(db: Session = Depends(get_db)):
@@ -997,8 +979,8 @@ def get_all_news(db: Session = Depends(get_db)):
         raise HTTPException(500, f"Erreur SQL News: {str(err)}")
 
 
-@app.post("/api/admin/news/create")
-@app.post("/api/admin/news/create/")
+@app.post("/api/admin/news/create", dependencies=[Depends(require_admin_key)])
+@app.post("/api/admin/news/create/", dependencies=[Depends(require_admin_key)])
 def create_admin_news(req: NewsCreateRequest, db: Session = Depends(get_db)):
     new_article = AppNews(
         title=req.title.strip(),
@@ -1012,15 +994,10 @@ def create_admin_news(req: NewsCreateRequest, db: Session = Depends(get_db)):
     db.add(new_article)
     db.commit()
     db.refresh(new_article)
-
-    return {
-        "status": "success",
-        "id": new_article.id,
-        "title": new_article.title
-    }
+    return {"status": "success", "id": new_article.id, "title": new_article.title}
 
 
-@app.delete("/api/admin/news/{news_id}")
+@app.delete("/api/admin/news/{news_id}", dependencies=[Depends(require_admin_key)])
 def delete_admin_news(news_id: int, db: Session = Depends(get_db)):
     item = db.query(AppNews).filter(AppNews.id == news_id).first()
     if not item:
