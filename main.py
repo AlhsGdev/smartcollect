@@ -197,7 +197,7 @@ migrations = [
     ("ADD admin_unblocked_at", "ALTER TABLE device_attempts ADD COLUMN IF NOT EXISTS admin_unblocked_at TIMESTAMP"),
     ("ADD max_attempts_allowed", "ALTER TABLE device_attempts ADD COLUMN IF NOT EXISTS max_attempts_allowed INTEGER DEFAULT 1"),
 
-    # ✅ Index GIN pour accélérer _find_license_by_device (PostgreSQL)
+    # ✅ Index sur device_attempts.phone_number (accélère les lookups)
     ("ADD index device_attempts.phone",
      "CREATE INDEX IF NOT EXISTS ix_device_attempts_phone "
      "ON device_attempts (phone_number)"),
@@ -347,7 +347,7 @@ def _duration_to_days(val: int, unit: str) -> int:
 
 
 # ═══════════════════════════════════════════════════════════
-# HELPER : trouver une licence par device_id (optimisé)
+# HELPER : trouver une licence par device_id
 # ═══════════════════════════════════════════════════════════
 def _find_license_by_device(device_id: str, db: Session):
     """
@@ -502,113 +502,137 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                 DeviceAttempt.device_id == clean_device
             ).with_for_update().first()
 
-            if dev_trace:
-                max_allowed = dev_trace.max_attempts_allowed or 0
-                attempts = dev_trace.attempts_count or 0
-
-                # Quota épuisé ?
-                if dev_trace.is_blocked or attempts >= max_allowed:
-                    # Y a-t-il une licence admin (non-trial) active ?
-                    admin_lic = db.query(LicenseKey).filter(
-                        LicenseKey.phone_number == clean_phone,
-                        LicenseKey.is_active == True,
-                        LicenseKey.is_trial == False,
-                    ).first()
-
-                    if admin_lic:
-                        try:
-                            devs = json.loads(admin_lic.device_uuid or "[]")
-                        except Exception:
-                            devs = []
-                        if clean_device not in devs:
-                            devs.append(clean_device)
-                            admin_lic.device_uuid = json.dumps(devs)
-                        db.commit()
-                        return {
-                            "status": "success",
-                            "message": "Licence active trouvée.",
-                            "license_key": admin_lic.key,
-                            "trial_days": 0,
-                            "is_trial": False,
-                        }
-
-                    dev_trace.is_blocked = True
-                    dev_trace.last_attempt_at = now
-                    if not dev_trace.block_reason:
-                        dev_trace.block_reason = (
-                            f"Quota atteint ({attempts}/{max_allowed})"
-                        )
-                    db.commit()
-
-                    raise HTTPException(
-                        403,
-                        "Cet appareil a déjà utilisé toutes ses tentatives autorisées. "
-                        "Contactez l'administrateur."
-                    )
-
-                # ─── Générer une NOUVELLE clé ───
-                part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
-                new_key = f"{part1}-{part2}-{part3}-{part4}"
-
-                new_lic = LicenseKey(
-                    key=new_key,
-                    phone_number=clean_phone,
-                    first_name=(req.first_name or "").strip(),
-                    last_name=(req.last_name or "").strip(),
-                    organization=(req.organization or "").strip(),
-                    is_active=True,
-                    is_trial=True,
-                    device_uuid=json.dumps([clean_device]),
-                    max_devices=1,
-                    duration_days=DEFAULT_TRIAL_DAYS,
-                    duration_val=DEFAULT_TRIAL_DAYS,
-                    duration_unit=DEFAULT_TRIAL_UNIT,
-                    created_at=now,
+            # ⚠️ FIX CRITIQUE : clé orpheline sans trace device
+            #    → on REFUSE au lieu de créer une clé gratuite
+            if not dev_trace:
+                print(f"[REQUEST-KEY] Device {clean_device} : clé orpheline "
+                      f"sans trace → REFUSÉ")
+                raise HTTPException(
+                    403,
+                    "Cet appareil est marqué comme inconnu par le serveur. "
+                    "Contactez l'administrateur pour réinitialiser votre accès."
                 )
-                db.add(new_lic)
 
-                # Consommer un essai
-                dev_trace.attempts_count = attempts + 1
-                dev_trace.phone_number = clean_phone
-                dev_trace.last_attempt_at = now
+            max_allowed = dev_trace.max_attempts_allowed or 0
+            attempts = dev_trace.attempts_count or 0
 
-                if dev_trace.attempts_count >= max_allowed:
-                    dev_trace.is_blocked = True
-                    dev_trace.block_reason = (
-                        f"Quota atteint ({dev_trace.attempts_count}/{max_allowed})"
-                    )
-                else:
+            # ⚠️ FIX CRITIQUE : vérification stricte du quota
+            if dev_trace.is_blocked or attempts >= max_allowed:
+                # Y a-t-il une licence admin (non-trial) active ?
+                admin_lic = db.query(LicenseKey).filter(
+                    LicenseKey.phone_number == clean_phone,
+                    LicenseKey.is_active == True,
+                    LicenseKey.is_trial == False,
+                ).first()
+
+                if admin_lic:
+                    try:
+                        devs = json.loads(admin_lic.device_uuid or "[]")
+                    except Exception:
+                        devs = []
+                    if clean_device not in devs:
+                        devs.append(clean_device)
+                        admin_lic.device_uuid = json.dumps(devs)
+
+                    # Débloquer aussi le device
                     dev_trace.is_blocked = False
                     dev_trace.block_reason = ""
+                    dev_trace.admin_unblocked = True
+                    dev_trace.admin_unblocked_at = get_utc_now()
 
-                # Dissocier l'ancienne clé expirée de ce device
-                try:
-                    old_devs = json.loads(existing_device_lic.device_uuid or "[]")
-                    if isinstance(old_devs, list) and clean_device in old_devs:
-                        old_devs.remove(clean_device)
-                        existing_device_lic.device_uuid = json.dumps(old_devs)
-                except Exception:
-                    pass
+                    db.commit()
+                    print(f"[REQUEST-KEY] Device {clean_device} débloqué "
+                          f"car licence admin {admin_lic.key} trouvée")
+                    return {
+                        "status": "success",
+                        "message": "Licence active trouvée.",
+                        "license_key": admin_lic.key,
+                        "trial_days": 0,
+                        "is_trial": False,
+                    }
 
+                dev_trace.is_blocked = True
+                dev_trace.last_attempt_at = now
+                if not dev_trace.block_reason:
+                    dev_trace.block_reason = (
+                        f"Quota atteint ({attempts}/{max_allowed})"
+                    )
                 db.commit()
-                db.refresh(new_lic)
 
-                print(f"[REQUEST-KEY] Nouvelle clé accordée (renouvellement) : "
-                      f"{new_key} — essai {dev_trace.attempts_count}/{max_allowed}")
+                print(f"[REQUEST-KEY] REFUSÉ : quota atteint "
+                      f"({attempts}/{max_allowed}) pour {clean_device}")
 
-                return {
-                    "status": "success",
-                    "message": "Nouvelle clé d'essai accordée (renouvellement).",
-                    "license_key": new_key,
-                    "trial_days": DEFAULT_TRIAL_DAYS,
-                    "is_trial": True,
-                }
+                raise HTTPException(
+                    403,
+                    "Cet appareil a déjà utilisé toutes ses tentatives autorisées. "
+                    "Contactez l'administrateur."
+                )
 
-            # Pas de trace device ? → on tombe dans les priorités suivantes
-            print(f"[REQUEST-KEY] Clé existante sans trace device pour {clean_device}")
+            # ─── Quota disponible → générer une NOUVELLE clé ───
+            part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
+            new_key = f"{part1}-{part2}-{part3}-{part4}"
+
+            new_lic = LicenseKey(
+                key=new_key,
+                phone_number=clean_phone,
+                first_name=(req.first_name or "").strip(),
+                last_name=(req.last_name or "").strip(),
+                organization=(req.organization or "").strip(),
+                is_active=True,
+                is_trial=True,
+                device_uuid=json.dumps([clean_device]),
+                max_devices=1,
+                duration_days=DEFAULT_TRIAL_DAYS,
+                duration_val=DEFAULT_TRIAL_DAYS,
+                duration_unit=DEFAULT_TRIAL_UNIT,
+                created_at=now,
+            )
+            db.add(new_lic)
+
+            # Consommer un essai
+            dev_trace.attempts_count = attempts + 1
+            dev_trace.phone_number = clean_phone
+            dev_trace.last_attempt_at = now
+
+            if dev_trace.attempts_count >= max_allowed:
+                dev_trace.is_blocked = True
+                dev_trace.block_reason = (
+                    f"Quota atteint ({dev_trace.attempts_count}/{max_allowed})"
+                )
+                print(f"[REQUEST-KEY] Nouvelle clé accordée MAIS device bloqué : "
+                      f"{dev_trace.attempts_count}/{max_allowed}")
+            else:
+                dev_trace.is_blocked = False
+                dev_trace.block_reason = ""
+                print(f"[REQUEST-KEY] Nouvelle clé accordée : "
+                      f"{dev_trace.attempts_count}/{max_allowed}")
+
+            # Dissocier l'ancienne clé expirée de ce device
+            try:
+                old_devs = json.loads(existing_device_lic.device_uuid or "[]")
+                if isinstance(old_devs, list) and clean_device in old_devs:
+                    old_devs.remove(clean_device)
+                    existing_device_lic.device_uuid = json.dumps(old_devs)
+            except Exception:
+                pass
+
+            db.commit()
+            db.refresh(new_lic)
+
+            return {
+                "status": "success",
+                "message": "Nouvelle clé d'essai accordée (renouvellement).",
+                "license_key": new_key,
+                "trial_days": DEFAULT_TRIAL_DAYS,
+                "is_trial": True,
+            }
+
+            # ⚠️ FIN DU CAS 2 — toute exécution sort par return ou raise.
+            #    Aucun fallthrough possible vers les PRIORITÉS suivantes.
 
         # ═══════════════════════════════════════════════════════════
         # PRIORITÉ 0 : Licence admin existante pour ce numéro ?
+        #    → On débloque le device si bloqué (licence admin prime)
         # ═══════════════════════════════════════════════════════════
         admin_lic = db.query(LicenseKey).filter(
             LicenseKey.phone_number == clean_phone,
@@ -617,6 +641,19 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
         ).first()
 
         if admin_lic:
+            # Vérifie si le device est bloqué → le débloquer
+            dev_check = db.query(DeviceAttempt).filter(
+                DeviceAttempt.device_id == clean_device
+            ).first()
+
+            if dev_check and dev_check.is_blocked:
+                print(f"[REQUEST-KEY] Device {clean_device} débloqué "
+                      f"car licence admin {admin_lic.key} trouvée")
+                dev_check.is_blocked = False
+                dev_check.block_reason = ""
+                dev_check.admin_unblocked = True
+                dev_check.admin_unblocked_at = get_utc_now()
+
             try:
                 devs = json.loads(admin_lic.device_uuid or "[]")
             except Exception:
@@ -624,7 +661,8 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
             if clean_device not in devs:
                 devs.append(clean_device)
                 admin_lic.device_uuid = json.dumps(devs)
-                db.commit()
+
+            db.commit()
 
             return {
                 "status": "success",
@@ -646,6 +684,7 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
             attempts_count = existing_device.attempts_count or 0
 
             if existing_device.is_blocked or attempts_count >= max_allowed:
+                # Vérifier une licence admin avant de refuser
                 admin_lic = db.query(LicenseKey).filter(
                     LicenseKey.phone_number == clean_phone,
                     LicenseKey.is_active == True,
@@ -660,6 +699,12 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                     if clean_device not in devs:
                         devs.append(clean_device)
                         admin_lic.device_uuid = json.dumps(devs)
+
+                    existing_device.is_blocked = False
+                    existing_device.block_reason = ""
+                    existing_device.admin_unblocked = True
+                    existing_device.admin_unblocked_at = get_utc_now()
+
                     db.commit()
                     return {
                         "status": "success",
@@ -1035,7 +1080,7 @@ def update_admin_license_full(key: str, req: AdminUpdateLicenseRequest, db: Sess
     if req.is_active is not None:
         lic.is_active = bool(req.is_active)
 
-    # ✅ Utilise `is not None` → permet d'envoyer explicitement 0
+    # ✅ `is not None` → permet d'envoyer explicitement 0
     if req.extend_duration_val is not None and req.extend_duration_val > 0 and req.extend_duration_unit:
         val = int(req.extend_duration_val)
         extra_days = _duration_to_days(val, req.extend_duration_unit)
@@ -1109,7 +1154,6 @@ def grant_full_access(key: str, req: GrantFullAccessRequest, db: Session = Depen
     lic.activated_at = now
     lic.expires_at = now + timedelta(days=days)
 
-    # ✅ Débloquer aussi les devices liés
     _unblock_associated_devices(lic, db)
 
     db.commit()
