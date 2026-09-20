@@ -23,7 +23,6 @@ TRIAL_MAX_TABLES = 1
 TRIAL_MAX_ROWS_PER_TABLE = 50
 TRIAL_ALLOW_EXPORT = False
 
-# ✅ Quota initial pour un tout nouveau device
 DEFAULT_INITIAL_QUOTA = 2
 
 # ═══════════════════════════════════════════════════════════
@@ -197,17 +196,14 @@ migrations = [
     ("ADD admin_unblocked_at", "ALTER TABLE device_attempts ADD COLUMN IF NOT EXISTS admin_unblocked_at TIMESTAMP"),
     ("ADD max_attempts_allowed", "ALTER TABLE device_attempts ADD COLUMN IF NOT EXISTS max_attempts_allowed INTEGER DEFAULT 1"),
 
-    # ✅ Index sur device_attempts.phone_number (accélère les lookups)
     ("ADD index device_attempts.phone",
      "CREATE INDEX IF NOT EXISTS ix_device_attempts_phone "
      "ON device_attempts (phone_number)"),
 
-    # ✅ FIX : corriger les anciens devices qui ont un quota = 1
     ("FIX legacy devices quota 1 → 2",
      "UPDATE device_attempts SET max_attempts_allowed = 2 "
      "WHERE max_attempts_allowed = 1 AND attempts_count = 1 AND is_blocked = FALSE"),
 
-    # ✅ MIGRATION : relier les licences existantes à leur device
     ("RELINK licenses to devices (via phone)",
      "DO $$ "
      "DECLARE lic RECORD; dev RECORD; devs JSONB; "
@@ -330,7 +326,7 @@ class ResetToTrialRequest(BaseModel):
 
 
 # ═══════════════════════════════════════════════════════════
-# HELPER : durée → jours (avec arrondi correct des heures)
+# HELPER : durée → jours
 # ═══════════════════════════════════════════════════════════
 def _duration_to_days(val: int, unit: str) -> int:
     u = (unit or "").lower()
@@ -341,7 +337,6 @@ def _duration_to_days(val: int, unit: str) -> int:
     if "jour" in u:
         return val
     if "heure" in u:
-        # ✅ Arrondi supérieur : 1h → 1j, 25h → 2j
         return max(1, math.ceil(val / 24))
     return val
 
@@ -353,9 +348,27 @@ def _find_license_by_device(device_id: str, db: Session):
     """
     Cherche une licence associée à un device_id.
     Filtre en Python pour éviter les faux positifs du LIKE sur JSON.
+    Priorité : on cherche d'abord une licence ACTIVE et valide.
     """
     try:
         all_lics = db.query(LicenseKey).order_by(LicenseKey.id.desc()).all()
+
+        # 1ère passe : chercher une licence active et non expirée
+        now = get_utc_now()
+        for lic in all_lics:
+            try:
+                raw = str(lic.device_uuid or "[]")
+                if raw in ("", "REVOKED"):
+                    continue
+                devices = json.loads(raw)
+                if isinstance(devices, list) and device_id in devices:
+                    is_expired = bool(lic.expires_at and now > lic.expires_at)
+                    if lic.is_active and not is_expired:
+                        return lic
+            except Exception:
+                continue
+
+        # 2ème passe : sinon renvoyer la plus récente (même expirée/révoquée)
         for lic in all_lics:
             try:
                 raw = str(lic.device_uuid or "[]")
@@ -460,7 +473,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
 
             # ───────────────────────────────────────────────────────
             # CAS 1 : clé ENCORE VALIDE → renvoyer + mettre à jour
-            #         phone / first_name / last_name / organization
             # ───────────────────────────────────────────────────────
             if not is_expired and not is_revoked:
                 changed = []
@@ -492,7 +504,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
 
             # ───────────────────────────────────────────────────────
             # CAS 2 : clé EXPIRÉE / RÉVOQUÉE → consommer un essai
-            #         et générer une nouvelle clé
             # ───────────────────────────────────────────────────────
             print(f"[REQUEST-KEY] Device {clean_device} : ancienne clé "
                   f"{'expirée' if is_expired else 'révoquée'} "
@@ -502,8 +513,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                 DeviceAttempt.device_id == clean_device
             ).with_for_update().first()
 
-            # ⚠️ FIX CRITIQUE : clé orpheline sans trace device
-            #    → on REFUSE au lieu de créer une clé gratuite
             if not dev_trace:
                 print(f"[REQUEST-KEY] Device {clean_device} : clé orpheline "
                       f"sans trace → REFUSÉ")
@@ -516,9 +525,7 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
             max_allowed = dev_trace.max_attempts_allowed or 0
             attempts = dev_trace.attempts_count or 0
 
-            # ⚠️ FIX CRITIQUE : vérification stricte du quota
             if dev_trace.is_blocked or attempts >= max_allowed:
-                # Y a-t-il une licence admin (non-trial) active ?
                 admin_lic = db.query(LicenseKey).filter(
                     LicenseKey.phone_number == clean_phone,
                     LicenseKey.is_active == True,
@@ -534,7 +541,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                         devs.append(clean_device)
                         admin_lic.device_uuid = json.dumps(devs)
 
-                    # Débloquer aussi le device
                     dev_trace.is_blocked = False
                     dev_trace.block_reason = ""
                     dev_trace.admin_unblocked = True
@@ -589,7 +595,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
             )
             db.add(new_lic)
 
-            # Consommer un essai
             dev_trace.attempts_count = attempts + 1
             dev_trace.phone_number = clean_phone
             dev_trace.last_attempt_at = now
@@ -607,7 +612,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                 print(f"[REQUEST-KEY] Nouvelle clé accordée : "
                       f"{dev_trace.attempts_count}/{max_allowed}")
 
-            # Dissocier l'ancienne clé expirée de ce device
             try:
                 old_devs = json.loads(existing_device_lic.device_uuid or "[]")
                 if isinstance(old_devs, list) and clean_device in old_devs:
@@ -627,12 +631,8 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                 "is_trial": True,
             }
 
-            # ⚠️ FIN DU CAS 2 — toute exécution sort par return ou raise.
-            #    Aucun fallthrough possible vers les PRIORITÉS suivantes.
-
         # ═══════════════════════════════════════════════════════════
         # PRIORITÉ 0 : Licence admin existante pour ce numéro ?
-        #    → On débloque le device si bloqué (licence admin prime)
         # ═══════════════════════════════════════════════════════════
         admin_lic = db.query(LicenseKey).filter(
             LicenseKey.phone_number == clean_phone,
@@ -641,7 +641,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
         ).first()
 
         if admin_lic:
-            # Vérifie si le device est bloqué → le débloquer
             dev_check = db.query(DeviceAttempt).filter(
                 DeviceAttempt.device_id == clean_device
             ).first()
@@ -684,7 +683,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
             attempts_count = existing_device.attempts_count or 0
 
             if existing_device.is_blocked or attempts_count >= max_allowed:
-                # Vérifier une licence admin avant de refuser
                 admin_lic = db.query(LicenseKey).filter(
                     LicenseKey.phone_number == clean_phone,
                     LicenseKey.is_active == True,
@@ -905,6 +903,8 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
 
 # ═══════════════════════════════════════════════════════════
 # ROUTE : VÉRIFICATION / ACTIVATION
+#    ✅ FIX MAJEUR : création auto de la trace si manquante
+#    ✅ FIX MAJEUR : déblocage auto si device bloqué mais clé valide
 # ═══════════════════════════════════════════════════════════
 @app.post("/api/license/verify")
 @app.post("/api/license/verify/")
@@ -914,22 +914,35 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
         license_entry = db.query(LicenseKey).filter(LicenseKey.key == clean_key).first()
 
         if not license_entry:
-            raise HTTPException(404, "Clé de licence introuvable.")
+            raise HTTPException(
+                404,
+                "Clé de licence introuvable. Vérifiez les caractères saisis."
+            )
 
         if not license_entry.is_active or license_entry.device_uuid == "REVOKED":
-            raise HTTPException(403, "Cette licence a été désactivée ou révoquée.")
+            raise HTTPException(
+                403,
+                "Cette licence a été désactivée ou révoquée. "
+                "Contactez l'administrateur pour la réactiver."
+            )
 
         now = get_utc_now()
         if license_entry.expires_at and now > license_entry.expires_at:
-            raise HTTPException(403, "Cette licence a expiré.")
+            raise HTTPException(
+                403,
+                "Cette licence a expiré. "
+                "Contactez l'administrateur pour la renouveler."
+            )
 
         if not license_entry.activated_at:
             license_entry.activated_at = now
             license_entry.expires_at = now + timedelta(
                 days=license_entry.duration_days or DEFAULT_TRIAL_DAYS
             )
+            print(f"[VERIFY] Licence {clean_key} activée pour la première fois "
+                  f"(expire {license_entry.expires_at})")
 
-        # ✅ Gestion explicite de None / "" / "REVOKED"
+        # Gestion explicite de None / "" / "REVOKED"
         raw_dev = license_entry.device_uuid
         if raw_dev in (None, "", "REVOKED"):
             devices = []
@@ -944,16 +957,50 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
         max_dev = license_entry.max_devices or 1
         if req.device_id not in devices:
             if len(devices) >= max_dev:
-                raise HTTPException(403, "Limite d'appareils atteinte pour cette clé.")
+                raise HTTPException(
+                    403,
+                    f"Limite d'appareils atteinte pour cette clé "
+                    f"({len(devices)}/{max_dev}). Contactez l'administrateur."
+                )
             devices.append(req.device_id)
             license_entry.device_uuid = json.dumps(devices)
             print(f"[VERIFY] Device {req.device_id} ajouté à la clé {clean_key}")
 
+        # ═══════════════════════════════════════════════════════════
+        # ✅ FIX CRITIQUE : création/déblocage auto de la trace device
+        # ═══════════════════════════════════════════════════════════
         dev_trace = db.query(DeviceAttempt).filter(
             DeviceAttempt.device_id == req.device_id
         ).first()
+
         if dev_trace:
             dev_trace.last_attempt_at = get_utc_now()
+
+            # Si le device était bloqué (ex: quota épuisé par essais précédents),
+            # on le débloque car il possède maintenant une clé VALIDE.
+            # La licence admin prime sur le quota d'essai.
+            if dev_trace.is_blocked:
+                print(f"[VERIFY] Device {req.device_id} était bloqué "
+                      f"({dev_trace.block_reason}) → DÉBLOQUÉ car clé valide")
+                dev_trace.is_blocked = False
+                dev_trace.block_reason = ""
+                dev_trace.admin_unblocked = True
+                dev_trace.admin_unblocked_at = get_utc_now()
+        else:
+            # Créer la trace manquante pour que le quota soit cohérent
+            dev_trace = DeviceAttempt(
+                device_id=req.device_id,
+                phone_number=license_entry.phone_number or "",
+                attempts_count=0,          # La vérification ne consomme rien
+                max_attempts_allowed=0,    # Pas de quota d'essai pour ce device
+                is_blocked=False,
+                admin_unblocked=False,
+                first_attempt_at=get_utc_now(),
+                last_attempt_at=get_utc_now(),
+            )
+            db.add(dev_trace)
+            print(f"[VERIFY] Trace créée pour device {req.device_id} "
+                  f"(absent en base)")
 
         db.commit()
 
@@ -1080,7 +1127,6 @@ def update_admin_license_full(key: str, req: AdminUpdateLicenseRequest, db: Sess
     if req.is_active is not None:
         lic.is_active = bool(req.is_active)
 
-    # ✅ `is not None` → permet d'envoyer explicitement 0
     if req.extend_duration_val is not None and req.extend_duration_val > 0 and req.extend_duration_unit:
         val = int(req.extend_duration_val)
         extra_days = _duration_to_days(val, req.extend_duration_unit)
@@ -1117,7 +1163,6 @@ def toggle_admin_license_status(key: str, db: Session = Depends(get_db)):
 
 
 def _unblock_associated_devices(lic: LicenseKey, db: Session):
-    """✅ Débloque tous les devices liés à cette licence."""
     try:
         devices = json.loads(lic.device_uuid or "[]")
         if not isinstance(devices, list):
@@ -1273,7 +1318,6 @@ def update_admin_device(device_id: str, req: DeviceUpdateRequest, db: Session = 
     was_blocked = dev.is_blocked
     log_lines = []
 
-    # ─── 1. Quota ABSOLU ───
     if req.set_max_attempts is not None:
         dev.max_attempts_allowed = max(0, req.set_max_attempts)
         dev.is_blocked = False
@@ -1282,7 +1326,6 @@ def update_admin_device(device_id: str, req: DeviceUpdateRequest, db: Session = 
         dev.admin_unblocked_at = get_utc_now()
         log_lines.append(f"quota={dev.max_attempts_allowed} (absolu)")
 
-    # ─── 2. Ajouter N au quota ───
     elif req.add_attempts is not None and req.add_attempts > 0:
         current = dev.max_attempts_allowed or 0
         dev.max_attempts_allowed = current + req.add_attempts
@@ -1292,7 +1335,6 @@ def update_admin_device(device_id: str, req: DeviceUpdateRequest, db: Session = 
         dev.admin_unblocked_at = get_utc_now()
         log_lines.append(f"+{req.add_attempts} → quota={dev.max_attempts_allowed}")
 
-    # ─── 3. Bloquer / Débloquer ───
     if req.is_blocked is not None:
         new_blocked = bool(req.is_blocked)
         if new_blocked and not was_blocked:
