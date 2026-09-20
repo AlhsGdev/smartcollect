@@ -23,7 +23,6 @@ TRIAL_MAX_TABLES = 1
 TRIAL_MAX_ROWS_PER_TABLE = 50
 TRIAL_ALLOW_EXPORT = False
 
-# ✅ 1 essai par appareil
 DEFAULT_INITIAL_QUOTA = 1
 
 # ═══════════════════════════════════════════════════════════
@@ -299,6 +298,7 @@ class AdminCreateLicenseRequest(BaseModel):
     is_active: Optional[bool] = False
 
 
+# ✅ MODIFIÉ : ajout de duration_mode ("add" | "replace")
 class AdminUpdateLicenseRequest(BaseModel):
     phone_number: Optional[str] = None
     user_name: Optional[str] = None
@@ -307,6 +307,7 @@ class AdminUpdateLicenseRequest(BaseModel):
     is_active: Optional[bool] = None
     extend_duration_val: Optional[int] = Field(None, ge=0, le=9999)
     extend_duration_unit: Optional[str] = None
+    duration_mode: Optional[str] = Field("add", pattern="^(add|replace)$")
 
 
 class NewsCreateRequest(BaseModel):
@@ -318,26 +319,28 @@ class NewsCreateRequest(BaseModel):
     download_url: Optional[str] = None
 
 
-# ✅ MODIFIÉ : ajout des champs pour l'accès complet temporaire
 class DeviceUpdateRequest(BaseModel):
     is_blocked: Optional[bool] = None
     notes: Optional[str] = None
     add_attempts: Optional[int] = Field(None, ge=0, le=100)
     set_max_attempts: Optional[int] = Field(None, ge=0, le=100)
-    # ✅ NOUVEAU : accès complet temporaire
     grant_full_access: Optional[bool] = None
     duration_val: Optional[int] = Field(None, ge=1, le=9999)
     duration_unit: Optional[str] = None
 
 
+# ✅ MODIFIÉ : ajout de duration_mode
 class GrantFullAccessRequest(BaseModel):
     duration_val: int = Field(..., ge=1, le=9999)
     duration_unit: str = Field(..., max_length=20)
+    duration_mode: Optional[str] = Field("replace", pattern="^(add|replace)$")
 
 
+# ✅ MODIFIÉ : ajout de duration_mode
 class ResetToTrialRequest(BaseModel):
     duration_val: int = Field(..., ge=1, le=9999)
     duration_unit: str = Field(..., max_length=20)
+    duration_mode: Optional[str] = Field("replace", pattern="^(add|replace)$")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -360,11 +363,6 @@ def _duration_to_days(val: int, unit: str) -> int:
 # HELPER : trouver une licence par device_id
 # ═══════════════════════════════════════════════════════════
 def _find_license_by_device(device_id: str, db: Session):
-    """
-    Cherche une licence associée à un device_id.
-    Priorité 1 : licence ACTIVE et NON EXPIRÉE.
-    Priorité 2 : la plus récente (même expirée/révoquée).
-    """
     try:
         clean_device = (device_id or "").strip().upper()
         if not clean_device:
@@ -408,10 +406,6 @@ def _find_license_by_device(device_id: str, db: Session):
 
 
 def _update_license_user_info(lic: LicenseKey, req, changed_log: list):
-    """
-    Met à jour phone/first_name/last_name/organization
-    SI la valeur reçue est non vide ET différente.
-    """
     new_phone = (getattr(req, "phone_number", "") or "").strip()
     old_phone = (lic.phone_number or "").strip()
     if new_phone and new_phone != old_phone:
@@ -476,7 +470,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
 
         check_rate_limit(clean_device)
 
-        # PRIORITÉ ABSOLUE : Une clé est-elle déjà liée à ce device ?
         existing_device_lic = _find_license_by_device(clean_device, db)
 
         if existing_device_lic:
@@ -489,7 +482,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                 or str(existing_device_lic.device_uuid or "") == "REVOKED"
             )
 
-            # CAS 1 : clé valide → renvoyer + maj champs
             if not is_expired and not is_revoked:
                 changed = []
                 _update_license_user_info(existing_device_lic, req, changed)
@@ -518,7 +510,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                     "is_trial": bool(existing_device_lic.is_trial),
                 }
 
-            # CAS 2 : clé expirée/révoquée → consommer un essai
             print(f"[REQUEST-KEY] Device {clean_device} : ancienne clé "
                   f"{'expirée' if is_expired else 'révoquée'} "
                   f"→ nouvelle clé demandée")
@@ -588,7 +579,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                     "Contactez l'administrateur."
                 )
 
-            # Quota disponible → nouvelle clé
             part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
             new_key = f"{part1}-{part2}-{part3}-{part4}"
 
@@ -618,13 +608,9 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                 dev_trace.block_reason = (
                     f"Quota atteint ({dev_trace.attempts_count}/{max_allowed})"
                 )
-                print(f"[REQUEST-KEY] Nouvelle clé accordée MAIS device bloqué : "
-                      f"{dev_trace.attempts_count}/{max_allowed}")
             else:
                 dev_trace.is_blocked = False
                 dev_trace.block_reason = ""
-                print(f"[REQUEST-KEY] Nouvelle clé accordée : "
-                      f"{dev_trace.attempts_count}/{max_allowed}")
 
             try:
                 old_devs = json.loads(existing_device_lic.device_uuid or "[]")
@@ -645,7 +631,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                 "is_trial": True,
             }
 
-        # PRIORITÉ 0 : Licence admin existante pour ce numéro ?
         admin_lic = db.query(LicenseKey).filter(
             LicenseKey.phone_number == clean_phone,
             LicenseKey.is_active == True,
@@ -658,8 +643,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
             ).first()
 
             if dev_check and dev_check.is_blocked:
-                print(f"[REQUEST-KEY] Device {clean_device} débloqué "
-                      f"car licence admin {admin_lic.key} trouvée")
                 dev_check.is_blocked = False
                 dev_check.block_reason = ""
                 dev_check.admin_unblocked = True
@@ -683,7 +666,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                 "is_trial": False,
             }
 
-        # PRIORITÉ 1 : Device déjà enregistré ?
         existing_device = db.query(DeviceAttempt).filter(
             DeviceAttempt.device_id == clean_device
         ).with_for_update().first()
@@ -736,7 +718,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                     "Contactez l'administrateur."
                 )
 
-            # Quota disponible → nouvelle clé
             part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
             license_key = f"{part1}-{part2}-{part3}-{part4}"
 
@@ -767,14 +748,9 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                 existing_device.block_reason = (
                     f"Quota atteint ({existing_device.attempts_count}/{max_allowed})"
                 )
-                print(f"[REQUEST-KEY] Quota atteint : "
-                      f"{existing_device.attempts_count}/{max_allowed} → device bloqué")
             else:
                 existing_device.is_blocked = False
                 existing_device.block_reason = ""
-                print(f"[REQUEST-KEY] Nouvel essai accordé : "
-                      f"{existing_device.attempts_count}/{max_allowed} "
-                      f"(reste {remaining} essai)")
 
             db.commit()
             db.refresh(new_lic)
@@ -786,7 +762,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                 "is_trial": True,
             }
 
-        # PRIORITÉ 2 : Device nouveau + numéro déjà connu ?
         existing_lic_by_phone = db.query(LicenseKey).filter(
             LicenseKey.phone_number == clean_phone
         ).first()
@@ -822,9 +797,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                 db.add(new_attempt)
                 db.commit()
 
-                print(f"[REQUEST-KEY] Device {clean_device} lié à la clé "
-                      f"existante {existing_lic_by_phone.key}")
-
                 return {
                     "status": "success",
                     "message": "Clé existante liée à cet appareil.",
@@ -853,7 +825,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                     "d'appareils est atteinte. Contactez l'administrateur."
                 )
 
-        # PRIORITÉ 3 : Vraiment nouveau device + nouveau numéro
         new_attempt = DeviceAttempt(
             device_id=clean_device,
             phone_number=clean_phone,
@@ -891,9 +862,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
         db.add(new_lic)
         db.commit()
         db.refresh(new_lic)
-
-        print(f"[REQUEST-KEY] Nouvel essai (nouveau device) : {license_key} "
-              f"(attempts 1/{DEFAULT_INITIAL_QUOTA})")
 
         return {
             "status": "success",
@@ -949,8 +917,6 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
             license_entry.expires_at = now + timedelta(
                 days=license_entry.duration_days or DEFAULT_TRIAL_DAYS
             )
-            print(f"[VERIFY] Licence {clean_key} activée pour la première fois "
-                  f"(expire {license_entry.expires_at})")
 
         changed = []
         _update_license_user_info(license_entry, req, changed)
@@ -974,10 +940,6 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
 
         if clean_device not in devices_normalized:
             if len(devices_normalized) >= max_dev:
-                print(f"[VERIFY] REFUSÉ : limite d'appareils atteinte "
-                      f"({len(devices_normalized)}/{max_dev}) pour {clean_key}")
-                print(f"[VERIFY] Devices enregistrés : {devices_normalized}")
-                print(f"[VERIFY] Device demandé : {clean_device}")
                 raise HTTPException(
                     403,
                     f"Limite d'appareils atteinte pour cette clé "
@@ -985,9 +947,8 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
                 )
             devices.append(clean_device)
             license_entry.device_uuid = json.dumps(devices)
-            print(f"[VERIFY] Device {clean_device} ajouté à la clé {clean_key}")
         else:
-            print(f"[VERIFY] Device {clean_device} déjà dans la clé {clean_key}")
+            pass
 
         dev_trace = db.query(DeviceAttempt).filter(
             DeviceAttempt.device_id == clean_device
@@ -997,8 +958,6 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
             dev_trace.last_attempt_at = get_utc_now()
 
             if dev_trace.is_blocked:
-                print(f"[VERIFY] Device {clean_device} était bloqué "
-                      f"({dev_trace.block_reason}) → DÉBLOQUÉ car clé valide")
                 dev_trace.is_blocked = False
                 dev_trace.block_reason = ""
                 dev_trace.admin_unblocked = True
@@ -1015,8 +974,6 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
                 last_attempt_at=get_utc_now(),
             )
             db.add(dev_trace)
-            print(f"[VERIFY] Trace créée pour device {clean_device} "
-                  f"(absent en base)")
 
         db.commit()
 
@@ -1123,6 +1080,7 @@ def create_admin_license(req: AdminCreateLicenseRequest, db: Session = Depends(g
         raise HTTPException(500, f"Erreur DB: {str(e)}")
 
 
+# ✅ MODIFIÉ : support de duration_mode ("add" | "replace")
 @app.put("/api/admin/licenses/{key}", dependencies=[Depends(require_admin_key)])
 @app.put("/api/admin/licenses/{key}/", dependencies=[Depends(require_admin_key)])
 def update_admin_license_full(key: str, req: AdminUpdateLicenseRequest, db: Session = Depends(get_db)):
@@ -1143,15 +1101,27 @@ def update_admin_license_full(key: str, req: AdminUpdateLicenseRequest, db: Sess
     if req.is_active is not None:
         lic.is_active = bool(req.is_active)
 
+    # ✅ Durée : gère "add" (cumul) ou "replace" (remplacement)
     if req.extend_duration_val is not None and req.extend_duration_val > 0 and req.extend_duration_unit:
         val = int(req.extend_duration_val)
-        extra_days = _duration_to_days(val, req.extend_duration_unit)
-        total_days = (lic.duration_days or 0) + extra_days
-        lic.duration_days = total_days
-        lic.duration_val = total_days
-        lic.duration_unit = "Jours"
+        new_days = _duration_to_days(val, req.extend_duration_unit)
+        mode = (req.duration_mode or "add").lower()
+
+        if mode == "replace":
+            # 🔄 Remplacement complet
+            lic.duration_val = val
+            lic.duration_unit = req.extend_duration_unit
+            lic.duration_days = new_days
+        else:
+            # ➕ Ajout au cumul
+            total_days = (lic.duration_days or 0) + new_days
+            lic.duration_days = total_days
+            lic.duration_val = total_days
+            lic.duration_unit = "Jours"
+
+        # Recalcul de l'expiration si déjà activée
         if lic.activated_at:
-            lic.expires_at = lic.activated_at + timedelta(days=total_days)
+            lic.expires_at = lic.activated_at + timedelta(days=lic.duration_days)
 
     db.commit()
     db.refresh(lic)
@@ -1196,6 +1166,7 @@ def _unblock_associated_devices(lic: LicenseKey, db: Session):
         print(f"[_unblock_associated_devices] {e}")
 
 
+# ✅ MODIFIÉ : support de duration_mode ("add" | "replace")
 @app.post("/api/admin/licenses/{key}/grant-full-access", dependencies=[Depends(require_admin_key)])
 @app.post("/api/admin/licenses/{key}/grant-full-access/", dependencies=[Depends(require_admin_key)])
 def grant_full_access(key: str, req: GrantFullAccessRequest, db: Session = Depends(get_db)):
@@ -1203,17 +1174,27 @@ def grant_full_access(key: str, req: GrantFullAccessRequest, db: Session = Depen
     if not lic:
         raise HTTPException(404, "Licence introuvable.")
 
-    days = _duration_to_days(req.duration_val, req.duration_unit)
+    new_days = _duration_to_days(req.duration_val, req.duration_unit)
+    mode = (req.duration_mode or "replace").lower()
 
     lic.is_active = True
     lic.is_trial = False
-    lic.duration_val = req.duration_val
-    lic.duration_unit = req.duration_unit
-    lic.duration_days = days
+
+    if mode == "add":
+        # ➕ Ajout : cumule avec la durée existante
+        total_days = (lic.duration_days or 0) + new_days
+        lic.duration_days = total_days
+        lic.duration_val = total_days
+        lic.duration_unit = "Jours"
+    else:
+        # 🔄 Remplacement : remplace complètement
+        lic.duration_val = req.duration_val
+        lic.duration_unit = req.duration_unit
+        lic.duration_days = new_days
 
     now = get_utc_now()
     lic.activated_at = now
-    lic.expires_at = now + timedelta(days=days)
+    lic.expires_at = now + timedelta(days=lic.duration_days)
 
     _unblock_associated_devices(lic, db)
 
@@ -1222,7 +1203,7 @@ def grant_full_access(key: str, req: GrantFullAccessRequest, db: Session = Depen
 
     return {
         "status": "success",
-        "message": f"Tous les accès accordés pour {req.duration_val} {req.duration_unit}.",
+        "message": f"Accès complet accordé ({mode} : {lic.duration_days} jours).",
         "key": lic.key,
         "is_active": lic.is_active,
         "is_trial": lic.is_trial,
@@ -1233,6 +1214,7 @@ def grant_full_access(key: str, req: GrantFullAccessRequest, db: Session = Depen
     }
 
 
+# ✅ MODIFIÉ : support de duration_mode ("add" | "replace")
 @app.post("/api/admin/licenses/{key}/reset-to-trial", dependencies=[Depends(require_admin_key)])
 @app.post("/api/admin/licenses/{key}/reset-to-trial/", dependencies=[Depends(require_admin_key)])
 def reset_license_to_trial(key: str, req: ResetToTrialRequest, db: Session = Depends(get_db)):
@@ -1240,17 +1222,25 @@ def reset_license_to_trial(key: str, req: ResetToTrialRequest, db: Session = Dep
     if not lic:
         raise HTTPException(404, "Licence introuvable.")
 
-    days = _duration_to_days(req.duration_val, req.duration_unit)
+    new_days = _duration_to_days(req.duration_val, req.duration_unit)
+    mode = (req.duration_mode or "replace").lower()
 
     lic.is_active = True
     lic.is_trial = True
-    lic.duration_val = req.duration_val
-    lic.duration_unit = req.duration_unit
-    lic.duration_days = days
+
+    if mode == "add":
+        total_days = (lic.duration_days or 0) + new_days
+        lic.duration_days = total_days
+        lic.duration_val = total_days
+        lic.duration_unit = "Jours"
+    else:
+        lic.duration_val = req.duration_val
+        lic.duration_unit = req.duration_unit
+        lic.duration_days = new_days
 
     now = get_utc_now()
     lic.activated_at = now
-    lic.expires_at = now + timedelta(days=days)
+    lic.expires_at = now + timedelta(days=lic.duration_days)
 
     _unblock_associated_devices(lic, db)
 
@@ -1259,7 +1249,7 @@ def reset_license_to_trial(key: str, req: ResetToTrialRequest, db: Session = Dep
 
     return {
         "status": "success",
-        "message": f"Licence remise en essai pour {req.duration_val} {req.duration_unit}.",
+        "message": f"Licence remise en essai ({mode} : {lic.duration_days} jours).",
         "key": lic.key,
         "is_active": lic.is_active,
         "is_trial": lic.is_trial,
@@ -1297,8 +1287,6 @@ def reset_admin_license_devices(key: str, db: Session = Depends(get_db)):
             deleted_count += 1
 
     db.commit()
-    print(f"[ADMIN] Licence {key} : devices dissociés "
-          f"({deleted_count} trace(s) supprimée(s))")
 
     return {
         "status": "success",
@@ -1346,31 +1334,19 @@ def get_admin_devices(db: Session = Depends(get_db)):
         raise HTTPException(500, f"Erreur SQL: {str(err)}")
 
 
-# ═══════════════════════════════════════════════════════════
-# ✅ HELPER : créer/mettre à jour une licence complète liée à un device
-# ═══════════════════════════════════════════════════════════
 def _grant_full_access_to_device(
     dev: DeviceAttempt,
     duration_val: int,
     duration_unit: str,
     db: Session,
 ) -> dict:
-    """
-    Crée (ou met à jour) une LicenseKey complète liée à ce device.
-    - is_trial = False
-    - expires_at = now + duration
-    - device_uuid contient le device_id
-    Si une licence complète existe déjà pour ce device, on la prolonge.
-    """
     clean_device = dev.device_id.strip().upper()
     days = _duration_to_days(duration_val, duration_unit)
     now = get_utc_now()
 
-    # Cherche une licence existante liée à ce device (complète ou non)
     existing_lic = _find_license_by_device(clean_device, db)
 
     if existing_lic:
-        # Mise à jour de la licence existante → mode complet
         existing_lic.is_active = True
         existing_lic.is_trial = False
         existing_lic.duration_val = duration_val
@@ -1382,7 +1358,6 @@ def _grant_full_access_to_device(
         lic = existing_lic
         action = "updated"
     else:
-        # Création d'une nouvelle licence complète
         part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
         new_key = f"{part1}-{part2}-{part3}-{part4}"
 
@@ -1403,7 +1378,6 @@ def _grant_full_access_to_device(
         db.add(lic)
         action = "created"
 
-    # Débloque le device
     dev.is_blocked = False
     dev.block_reason = ""
     dev.admin_unblocked = True
@@ -1411,9 +1385,6 @@ def _grant_full_access_to_device(
 
     db.commit()
     db.refresh(lic)
-
-    print(f"[ADMIN] Device {clean_device} → licence complète {lic.key} "
-          f"({duration_val} {duration_unit}, action={action})")
 
     return {
         "action": action,
@@ -1438,7 +1409,6 @@ def update_admin_device(device_id: str, req: DeviceUpdateRequest, db: Session = 
     log_lines = []
     full_access_info = None
 
-    # ✅ PRIORITÉ : Accès complet temporaire
     if req.grant_full_access is True:
         duration_val = req.duration_val or 7
         duration_unit = req.duration_unit or "Jours"
@@ -1449,7 +1419,6 @@ def update_admin_device(device_id: str, req: DeviceUpdateRequest, db: Session = 
             f"ACCÈS COMPLET {duration_val} {duration_unit} → clé {full_access_info['key']}"
         )
 
-    # Quota absolu
     if req.set_max_attempts is not None:
         dev.max_attempts_allowed = max(0, req.set_max_attempts)
         dev.is_blocked = False
@@ -1458,7 +1427,6 @@ def update_admin_device(device_id: str, req: DeviceUpdateRequest, db: Session = 
         dev.admin_unblocked_at = get_utc_now()
         log_lines.append(f"quota={dev.max_attempts_allowed} (absolu)")
 
-    # Ajout de tentatives
     elif req.add_attempts is not None and req.add_attempts > 0:
         current = dev.max_attempts_allowed or 0
         dev.max_attempts_allowed = current + req.add_attempts
@@ -1468,7 +1436,6 @@ def update_admin_device(device_id: str, req: DeviceUpdateRequest, db: Session = 
         dev.admin_unblocked_at = get_utc_now()
         log_lines.append(f"+{req.add_attempts} → quota={dev.max_attempts_allowed}")
 
-    # Blocage/déblocage manuel
     if req.is_blocked is not None:
         new_blocked = bool(req.is_blocked)
         if new_blocked and not was_blocked:
@@ -1489,7 +1456,6 @@ def update_admin_device(device_id: str, req: DeviceUpdateRequest, db: Session = 
         else:
             dev.is_blocked = new_blocked
 
-    # Notes
     if req.notes is not None:
         dev.notes = req.notes
 
@@ -1507,7 +1473,6 @@ def update_admin_device(device_id: str, req: DeviceUpdateRequest, db: Session = 
         "max_attempts_allowed": dev.max_attempts_allowed or 0,
         "admin_unblocked": bool(dev.admin_unblocked),
         "notes": dev.notes,
-        # ✅ Info accès complet si accordé
         "full_access": full_access_info,
     }
 
@@ -1542,9 +1507,6 @@ def delete_admin_device(device_id: str, db: Session = Depends(get_db)):
 
     db.delete(dev)
     db.commit()
-
-    print(f"[ADMIN] Device {clean_dev} supprimé "
-          f"(retiré de {cleaned} licence(s))")
 
     return {
         "status": "success",
