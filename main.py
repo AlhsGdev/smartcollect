@@ -298,7 +298,6 @@ class AdminCreateLicenseRequest(BaseModel):
     is_active: Optional[bool] = False
 
 
-# ✅ MODIFIÉ : ajout de duration_mode ("add" | "replace")
 class AdminUpdateLicenseRequest(BaseModel):
     phone_number: Optional[str] = None
     user_name: Optional[str] = None
@@ -329,14 +328,12 @@ class DeviceUpdateRequest(BaseModel):
     duration_unit: Optional[str] = None
 
 
-# ✅ MODIFIÉ : ajout de duration_mode
 class GrantFullAccessRequest(BaseModel):
     duration_val: int = Field(..., ge=1, le=9999)
     duration_unit: str = Field(..., max_length=20)
     duration_mode: Optional[str] = Field("replace", pattern="^(add|replace)$")
 
 
-# ✅ MODIFIÉ : ajout de duration_mode
 class ResetToTrialRequest(BaseModel):
     duration_val: int = Field(..., ge=1, le=9999)
     duration_unit: str = Field(..., max_length=20)
@@ -432,6 +429,48 @@ def _update_license_user_info(lic: LicenseKey, req, changed_log: list):
 
 
 # ═══════════════════════════════════════════════════════════
+# HELPER : construit le bloc "access" (mode, durée, limites)
+# ═══════════════════════════════════════════════════════════
+def _build_access_payload(lic: Optional[LicenseKey]) -> dict:
+    """
+    Construit le dict standardisé 'access' :
+      - mode : 'trial' ou 'full'
+      - duration_val / duration_unit / duration_days
+      - max_tables / max_rows_per_table / allow_export
+    """
+    if lic is None:
+        # Aucune licence → valeurs d'essai par défaut
+        return {
+            "mode": "trial",
+            "is_trial": True,
+            "duration_val": DEFAULT_TRIAL_DAYS,
+            "duration_unit": DEFAULT_TRIAL_UNIT,
+            "duration_days": DEFAULT_TRIAL_DAYS,
+            "max_tables": TRIAL_MAX_TABLES,
+            "max_rows_per_table": TRIAL_MAX_ROWS_PER_TABLE,
+            "allow_export": TRIAL_ALLOW_EXPORT,
+        }
+
+    is_trial = bool(lic.is_trial)
+    mode = "trial" if is_trial else "full"
+
+    dur_val = lic.duration_val if lic.duration_val is not None else DEFAULT_TRIAL_DAYS
+    dur_unit = lic.duration_unit or DEFAULT_TRIAL_UNIT
+    dur_days = lic.duration_days or DEFAULT_TRIAL_DAYS
+
+    return {
+        "mode": mode,
+        "is_trial": is_trial,
+        "duration_val": dur_val,
+        "duration_unit": dur_unit,
+        "duration_days": dur_days,
+        "max_tables": TRIAL_MAX_TABLES if is_trial else 999999,
+        "max_rows_per_table": TRIAL_MAX_ROWS_PER_TABLE if is_trial else 999999,
+        "allow_export": (not is_trial) or TRIAL_ALLOW_EXPORT,
+    }
+
+
+# ═══════════════════════════════════════════════════════════
 # ROUTES PUBLIQUES
 # ═══════════════════════════════════════════════════════════
 @app.get("/")
@@ -454,7 +493,118 @@ def health():
 
 
 # ═══════════════════════════════════════════════════════════
+# ✅ NOUVEAU : APERÇU DE CE QUI SERA ACCORDÉ
+# Permet à Flutter d'afficher AVANT le clic :
+#   - "Vous allez recevoir un essai de 7 jours"
+#   - "Vous allez recevoir un accès complet de 30 jours"
+# ═══════════════════════════════════════════════════════════
+@app.get("/api/license/preview/{device_id}")
+@app.get("/api/license/preview/{device_id}/")
+def preview_access_for_device(device_id: str, db: Session = Depends(get_db)):
+    """
+    Retourne un aperçu SANS consommer de quota :
+      - whether : 'license_active' | 'trial_available' | 'blocked' | 'fresh_device'
+      - access : { mode, is_trial, duration_*, max_*, allow_export }
+      - message : texte humain à afficher côté app
+    """
+    try:
+        clean_device = (device_id or "").strip().upper()
+        if not clean_device:
+            raise HTTPException(400, "Identifiant d'appareil requis.")
+
+        # 1) Une clé valide est-elle déjà liée à ce device ?
+        existing_lic = _find_license_by_device(clean_device, db)
+        if existing_lic:
+            now = get_utc_now()
+            is_expired = bool(existing_lic.expires_at and now > existing_lic.expires_at)
+            is_revoked = (
+                not existing_lic.is_active
+                or str(existing_lic.device_uuid or "") == "REVOKED"
+            )
+
+            if not is_expired and not is_revoked:
+                access = _build_access_payload(existing_lic)
+                return {
+                    "status": "success",
+                    "whether": "license_active",
+                    "access": access,
+                    "message": (
+                        "Vous avez déjà une clé active pour cet appareil."
+                    ),
+                }
+
+        # 2) Le device est-il bloqué ?
+        dev = db.query(DeviceAttempt).filter(
+            DeviceAttempt.device_id == clean_device
+        ).first()
+
+        if dev:
+            max_allowed = dev.max_attempts_allowed or 0
+            attempts = dev.attempts_count or 0
+
+            if dev.is_blocked or attempts >= max_allowed:
+                # Cherche une licence admin (full) éventuelle
+                admin_lic = None
+                if dev.phone_number:
+                    admin_lic = db.query(LicenseKey).filter(
+                        LicenseKey.phone_number == dev.phone_number,
+                        LicenseKey.is_active == True,
+                        LicenseKey.is_trial == False,
+                    ).first()
+
+                if admin_lic:
+                    access = _build_access_payload(admin_lic)
+                    return {
+                        "status": "success",
+                        "whether": "license_active",
+                        "access": access,
+                        "message": "Une licence admin sera appliquée à cet appareil.",
+                    }
+
+                return {
+                    "status": "success",
+                    "whether": "blocked",
+                    "access": None,
+                    "message": (
+                        f"Quota épuisé ({attempts}/{max_allowed}). "
+                        "Contactez l'administrateur."
+                    ),
+                }
+
+            # Quota restant → essai disponible
+            access = _build_access_payload(None)
+            return {
+                "status": "success",
+                "whether": "trial_available",
+                "access": access,
+                "message": (
+                    f"Un essai de {access['duration_days']} jour(s) "
+                    f"sera accordé."
+                ),
+            }
+
+        # 3) Device inconnu du serveur → essai par défaut
+        access = _build_access_payload(None)
+        return {
+            "status": "success",
+            "whether": "fresh_device",
+            "access": access,
+            "message": (
+                f"Un essai de {access['duration_days']} jour(s) "
+                f"sera accordé pour ce nouvel appareil."
+            ),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[PREVIEW ERROR] {traceback.format_exc()}")
+        raise HTTPException(500, f"Erreur DB: {str(e)}")
+
+
+# ═══════════════════════════════════════════════════════════
 # ROUTE : DEMANDE / RENOUVELLEMENT DE CLÉ
+# ✅ ENRICHIE : renvoie maintenant 'access' complet
 # ═══════════════════════════════════════════════════════════
 @app.post("/api/license/request-key")
 @app.post("/api/license/request-key/")
@@ -482,16 +632,10 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                 or str(existing_device_lic.device_uuid or "") == "REVOKED"
             )
 
+            # CAS 1 : clé valide → renvoyer + maj champs
             if not is_expired and not is_revoked:
                 changed = []
                 _update_license_user_info(existing_device_lic, req, changed)
-
-                if changed:
-                    print(f"[REQUEST-KEY] Device {clean_device} : "
-                          f"mise à jour → {', '.join(changed)}")
-                else:
-                    print(f"[REQUEST-KEY] Device {clean_device} : "
-                          f"clé existante renvoyée (rien à changer)")
 
                 existing_dev = db.query(DeviceAttempt).filter(
                     DeviceAttempt.device_id == clean_device
@@ -502,25 +646,22 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
 
                 db.commit()
 
+                access = _build_access_payload(existing_device_lic)
                 return {
                     "status": "success",
                     "message": "Clé existante renvoyée pour cet appareil.",
                     "license_key": existing_device_lic.key,
                     "trial_days": existing_device_lic.duration_days or DEFAULT_TRIAL_DAYS,
                     "is_trial": bool(existing_device_lic.is_trial),
+                    "access": access,
                 }
 
-            print(f"[REQUEST-KEY] Device {clean_device} : ancienne clé "
-                  f"{'expirée' if is_expired else 'révoquée'} "
-                  f"→ nouvelle clé demandée")
-
+            # CAS 2 : clé expirée/révoquée → consommer un essai
             dev_trace = db.query(DeviceAttempt).filter(
                 DeviceAttempt.device_id == clean_device
             ).with_for_update().first()
 
             if not dev_trace:
-                print(f"[REQUEST-KEY] Device {clean_device} : clé orpheline "
-                      f"sans trace → REFUSÉ")
                 raise HTTPException(
                     403,
                     "Cet appareil est marqué comme inconnu par le serveur. "
@@ -552,14 +693,14 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                     dev_trace.admin_unblocked_at = get_utc_now()
 
                     db.commit()
-                    print(f"[REQUEST-KEY] Device {clean_device} débloqué "
-                          f"car licence admin {admin_lic.key} trouvée")
+                    access = _build_access_payload(admin_lic)
                     return {
                         "status": "success",
                         "message": "Licence active trouvée.",
                         "license_key": admin_lic.key,
                         "trial_days": 0,
                         "is_trial": False,
+                        "access": access,
                     }
 
                 dev_trace.is_blocked = True
@@ -570,15 +711,13 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                     )
                 db.commit()
 
-                print(f"[REQUEST-KEY] REFUSÉ : quota atteint "
-                      f"({attempts}/{max_allowed}) pour {clean_device}")
-
                 raise HTTPException(
                     403,
                     "Cet appareil a déjà utilisé toutes ses tentatives autorisées. "
                     "Contactez l'administrateur."
                 )
 
+            # Quota disponible → nouvelle clé
             part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
             new_key = f"{part1}-{part2}-{part3}-{part4}"
 
@@ -623,12 +762,14 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
             db.commit()
             db.refresh(new_lic)
 
+            access = _build_access_payload(new_lic)
             return {
                 "status": "success",
                 "message": "Nouvelle clé d'essai accordée (renouvellement).",
                 "license_key": new_key,
                 "trial_days": DEFAULT_TRIAL_DAYS,
                 "is_trial": True,
+                "access": access,
             }
 
         admin_lic = db.query(LicenseKey).filter(
@@ -658,12 +799,14 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
 
             db.commit()
 
+            access = _build_access_payload(admin_lic)
             return {
                 "status": "success",
                 "message": "Licence active trouvée.",
                 "license_key": admin_lic.key,
                 "trial_days": 0,
                 "is_trial": False,
+                "access": access,
             }
 
         existing_device = db.query(DeviceAttempt).filter(
@@ -696,12 +839,14 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                     existing_device.admin_unblocked_at = get_utc_now()
 
                     db.commit()
+                    access = _build_access_payload(admin_lic)
                     return {
                         "status": "success",
                         "message": "Licence active trouvée.",
                         "license_key": admin_lic.key,
                         "trial_days": 0,
                         "is_trial": False,
+                        "access": access,
                     }
 
                 existing_device.is_blocked = True
@@ -742,7 +887,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
             existing_device.phone_number = clean_phone
             existing_device.last_attempt_at = get_utc_now()
 
-            remaining = max_allowed - existing_device.attempts_count
             if existing_device.attempts_count >= max_allowed:
                 existing_device.is_blocked = True
                 existing_device.block_reason = (
@@ -754,12 +898,14 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
 
             db.commit()
             db.refresh(new_lic)
+            access = _build_access_payload(new_lic)
             return {
                 "status": "success",
                 "message": "Nouvel essai accordé.",
                 "license_key": license_key,
                 "trial_days": DEFAULT_TRIAL_DAYS,
                 "is_trial": True,
+                "access": access,
             }
 
         existing_lic_by_phone = db.query(LicenseKey).filter(
@@ -797,12 +943,14 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                 db.add(new_attempt)
                 db.commit()
 
+                access = _build_access_payload(existing_lic_by_phone)
                 return {
                     "status": "success",
                     "message": "Clé existante liée à cet appareil.",
                     "license_key": existing_lic_by_phone.key,
                     "trial_days": existing_lic_by_phone.duration_days or DEFAULT_TRIAL_DAYS,
                     "is_trial": bool(existing_lic_by_phone.is_trial),
+                    "access": access,
                 }
             else:
                 new_attempt = DeviceAttempt(
@@ -863,12 +1011,14 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
         db.commit()
         db.refresh(new_lic)
 
+        access = _build_access_payload(new_lic)
         return {
             "status": "success",
             "message": "Clé d'essai générée avec succès !",
             "license_key": license_key,
             "trial_days": DEFAULT_TRIAL_DAYS,
             "is_trial": True,
+            "access": access,
         }
 
     except HTTPException:
@@ -920,8 +1070,6 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
 
         changed = []
         _update_license_user_info(license_entry, req, changed)
-        if changed:
-            print(f"[VERIFY] Licence {clean_key} : mise à jour → {', '.join(changed)}")
 
         raw_dev = license_entry.device_uuid
         if raw_dev in (None, "", "REVOKED"):
@@ -947,8 +1095,6 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
                 )
             devices.append(clean_device)
             license_entry.device_uuid = json.dumps(devices)
-        else:
-            pass
 
         dev_trace = db.query(DeviceAttempt).filter(
             DeviceAttempt.device_id == clean_device
@@ -977,17 +1123,18 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
 
         db.commit()
 
-        is_trial = bool(license_entry.is_trial)
+        access = _build_access_payload(license_entry)
         return {
             "status": "valid",
             "phone_number": license_entry.phone_number or "",
             "expires_at": license_entry.expires_at.strftime("%Y-%m-%d %H:%M:%S") if license_entry.expires_at else None,
-            "is_trial": is_trial,
+            "is_trial": bool(license_entry.is_trial),
+            "access": access,
             "limits": {
-                "max_tables": TRIAL_MAX_TABLES if is_trial else 999999,
-                "max_rows_per_table": TRIAL_MAX_ROWS_PER_TABLE if is_trial else 999999,
-                "allow_export": (not is_trial) or TRIAL_ALLOW_EXPORT,
-            }
+                "max_tables": access["max_tables"],
+                "max_rows_per_table": access["max_rows_per_table"],
+                "allow_export": access["allow_export"],
+            },
         }
 
     except HTTPException:
@@ -999,7 +1146,7 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
 
 
 # ═══════════════════════════════════════════════════════════
-# ROUTES ADMIN — LICENCES
+# ROUTES ADMIN — LICENCES (INCHANGÉ)
 # ═══════════════════════════════════════════════════════════
 @app.get("/api/admin/licenses", dependencies=[Depends(require_admin_key)])
 @app.get("/api/admin/licenses/", dependencies=[Depends(require_admin_key)])
@@ -1080,7 +1227,6 @@ def create_admin_license(req: AdminCreateLicenseRequest, db: Session = Depends(g
         raise HTTPException(500, f"Erreur DB: {str(e)}")
 
 
-# ✅ MODIFIÉ : support de duration_mode ("add" | "replace")
 @app.put("/api/admin/licenses/{key}", dependencies=[Depends(require_admin_key)])
 @app.put("/api/admin/licenses/{key}/", dependencies=[Depends(require_admin_key)])
 def update_admin_license_full(key: str, req: AdminUpdateLicenseRequest, db: Session = Depends(get_db)):
@@ -1101,25 +1247,21 @@ def update_admin_license_full(key: str, req: AdminUpdateLicenseRequest, db: Sess
     if req.is_active is not None:
         lic.is_active = bool(req.is_active)
 
-    # ✅ Durée : gère "add" (cumul) ou "replace" (remplacement)
     if req.extend_duration_val is not None and req.extend_duration_val > 0 and req.extend_duration_unit:
         val = int(req.extend_duration_val)
         new_days = _duration_to_days(val, req.extend_duration_unit)
         mode = (req.duration_mode or "add").lower()
 
         if mode == "replace":
-            # 🔄 Remplacement complet
             lic.duration_val = val
             lic.duration_unit = req.extend_duration_unit
             lic.duration_days = new_days
         else:
-            # ➕ Ajout au cumul
             total_days = (lic.duration_days or 0) + new_days
             lic.duration_days = total_days
             lic.duration_val = total_days
             lic.duration_unit = "Jours"
 
-        # Recalcul de l'expiration si déjà activée
         if lic.activated_at:
             lic.expires_at = lic.activated_at + timedelta(days=lic.duration_days)
 
@@ -1166,7 +1308,6 @@ def _unblock_associated_devices(lic: LicenseKey, db: Session):
         print(f"[_unblock_associated_devices] {e}")
 
 
-# ✅ MODIFIÉ : support de duration_mode ("add" | "replace")
 @app.post("/api/admin/licenses/{key}/grant-full-access", dependencies=[Depends(require_admin_key)])
 @app.post("/api/admin/licenses/{key}/grant-full-access/", dependencies=[Depends(require_admin_key)])
 def grant_full_access(key: str, req: GrantFullAccessRequest, db: Session = Depends(get_db)):
@@ -1181,13 +1322,11 @@ def grant_full_access(key: str, req: GrantFullAccessRequest, db: Session = Depen
     lic.is_trial = False
 
     if mode == "add":
-        # ➕ Ajout : cumule avec la durée existante
         total_days = (lic.duration_days or 0) + new_days
         lic.duration_days = total_days
         lic.duration_val = total_days
         lic.duration_unit = "Jours"
     else:
-        # 🔄 Remplacement : remplace complètement
         lic.duration_val = req.duration_val
         lic.duration_unit = req.duration_unit
         lic.duration_days = new_days
@@ -1214,7 +1353,6 @@ def grant_full_access(key: str, req: GrantFullAccessRequest, db: Session = Depen
     }
 
 
-# ✅ MODIFIÉ : support de duration_mode ("add" | "replace")
 @app.post("/api/admin/licenses/{key}/reset-to-trial", dependencies=[Depends(require_admin_key)])
 @app.post("/api/admin/licenses/{key}/reset-to-trial/", dependencies=[Depends(require_admin_key)])
 def reset_license_to_trial(key: str, req: ResetToTrialRequest, db: Session = Depends(get_db)):
