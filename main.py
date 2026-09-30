@@ -176,7 +176,6 @@ class AppNews(Base):
     created_at = Column(DateTime, default=get_utc_now)
 
 
-# ✅ NOUVELLE TABLE : configuration dynamique
 class AppConfig(Base):
     __tablename__ = "app_config"
 
@@ -205,16 +204,13 @@ migrations = [
     ("ADD admin_unblocked", "ALTER TABLE device_attempts ADD COLUMN IF NOT EXISTS admin_unblocked BOOLEAN DEFAULT FALSE"),
     ("ADD admin_unblocked_at", "ALTER TABLE device_attempts ADD COLUMN IF NOT EXISTS admin_unblocked_at TIMESTAMP"),
     ("ADD max_attempts_allowed", "ALTER TABLE device_attempts ADD COLUMN IF NOT EXISTS max_attempts_allowed INTEGER DEFAULT 1"),
-
     ("ADD index device_attempts.phone",
      "CREATE INDEX IF NOT EXISTS ix_device_attempts_phone "
      "ON device_attempts (phone_number)"),
-
     ("NORMALIZE all devices quota to 1",
      "UPDATE device_attempts SET max_attempts_allowed = 1 "
      "WHERE admin_unblocked = FALSE "
      "AND (max_attempts_allowed IS NULL OR max_attempts_allowed > 1)"),
-
     ("BLOCK devices that used their only attempt",
      "UPDATE device_attempts SET is_blocked = TRUE, "
      "block_reason = COALESCE(NULLIF(block_reason, ''), "
@@ -222,7 +218,6 @@ migrations = [
      "WHERE admin_unblocked = FALSE "
      "AND attempts_count >= 1 "
      "AND max_attempts_allowed <= 1"),
-
     ("RELINK licenses to devices (via phone)",
      "DO $$ "
      "DECLARE lic RECORD; dev RECORD; devs JSONB; "
@@ -520,7 +515,6 @@ def _update_license_user_info(lic: LicenseKey, req, changed_log: list):
 # ═══════════════════════════════════════════════════════════
 def _build_access_payload(lic: Optional[LicenseKey], db: Optional[Session] = None) -> dict:
     if lic is None:
-        # ✅ Lecture DYNAMIQUE depuis la DB
         if db is not None:
             val, unit, days_float = _get_default_trial_config(db)
         else:
@@ -697,7 +691,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
 
         check_rate_limit(clean_device)
 
-        # ✅ Lecture DYNAMIQUE de la config par défaut
         def_val, def_unit, def_days_float = _get_default_trial_config(db)
         def_days = max(1, math.ceil(def_days_float))
 
@@ -799,7 +792,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
             part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
             new_key = f"{part1}-{part2}-{part3}-{part4}"
 
-            # ✅ Utilise la config DYNAMIQUE
             new_lic = LicenseKey(
                 key=new_key,
                 phone_number=clean_phone,
@@ -827,7 +819,8 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                     f"Quota atteint ({dev_trace.attempts_count}/{max_allowed})"
                 )
             else:
-                dev_trace.is_blocked = False                dev_trace.block_reason = ""
+                dev_trace.is_blocked = False
+                dev_trace.block_reason = ""
 
             try:
                 old_devs = json.loads(existing_device_lic.device_uuid or "[]")
@@ -1222,12 +1215,11 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
 
 
 # ═══════════════════════════════════════════════════════════
-# ✅ ROUTE : CONFIG DURÉE PAR DÉFAUT (PUBLIQUE, pour l'app)
+# ✅ ROUTE : CONFIG DURÉE PAR DÉFAUT (PUBLIQUE)
 # ═══════════════════════════════════════════════════════════
 @app.get("/api/config/default-trial")
 @app.get("/api/config/default-trial/")
 def get_public_default_trial(db: Session = Depends(get_db)):
-    """Endpoint public : l'app peut lire la durée d'essai par défaut."""
     val, unit, days = _get_default_trial_config(db)
     return {
         "duration_val": val,
