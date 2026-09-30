@@ -176,6 +176,16 @@ class AppNews(Base):
     created_at = Column(DateTime, default=get_utc_now)
 
 
+# ✅ NOUVELLE TABLE : configuration dynamique
+class AppConfig(Base):
+    __tablename__ = "app_config"
+
+    id = Column(Integer, primary_key=True)
+    key = Column(String(64), unique=True, nullable=False, index=True)
+    value = Column(String(255), default="")
+    updated_at = Column(DateTime, default=get_utc_now, onupdate=get_utc_now)
+
+
 # ═══════════════════════════════════════════════════════════
 # MIGRATIONS
 # ═══════════════════════════════════════════════════════════
@@ -341,17 +351,16 @@ class ResetToTrialRequest(BaseModel):
     duration_mode: Optional[str] = Field("replace", pattern="^(add|replace)$")
 
 
+class DefaultTrialConfigRequest(BaseModel):
+    duration_val: int = Field(..., ge=1, le=9999)
+    duration_unit: str = Field(..., max_length=20)
+
+
 # ═══════════════════════════════════════════════════════════
-# ✅ HELPERS DURÉE — CONVERSIONS EXACTES (support Minutes + Heures)
+# ✅ HELPERS DURÉE — CONVERSIONS EXACTES
 # ═══════════════════════════════════════════════════════════
 def _duration_to_days_float(val: int, unit: str) -> float:
-    """
-    ✅ Conversion EXACTE en jours (float), sans arrondi minimum.
-    Ex: 10 minutes → 0.00694 jours
-        5 heures   → 0.20833 jours
-    """
     u = (unit or "").lower().strip()
-
     if "minute" in u or u == "min" or u == "mn":
         return val / (24 * 60)
     if "heure" in u or u == "h" or u == "hr" or u == "hrs":
@@ -362,16 +371,11 @@ def _duration_to_days_float(val: int, unit: str) -> float:
         return float(val * 30)
     if "an" in u or u == "year" or u == "years":
         return float(val * 365)
-
     return float(val)
 
 
 def _duration_to_timedelta(val: int, unit: str) -> timedelta:
-    """
-    ✅ Conversion EXACTE en timedelta, sans arrondi.
-    """
     u = (unit or "").lower().strip()
-
     if "minute" in u or u == "min" or u == "mn":
         return timedelta(minutes=val)
     if "heure" in u or u == "h" or u == "hr" or u == "hrs":
@@ -382,32 +386,61 @@ def _duration_to_timedelta(val: int, unit: str) -> timedelta:
         return timedelta(days=val * 30)
     if "an" in u or u == "year" or u == "years":
         return timedelta(days=val * 365)
-
     return timedelta(days=val)
 
 
 def _compute_expiry(lic: "LicenseKey", from_now: bool = True) -> datetime:
-    """
-    ✅ Calcule la date d'expiration EXACTE à partir de
-    duration_val + duration_unit (au lieu de duration_days arrondi).
-    """
     val = lic.duration_val or DEFAULT_TRIAL_DAYS
     unit = lic.duration_unit or DEFAULT_TRIAL_UNIT
     delta = _duration_to_timedelta(val, unit)
-
     if from_now or not lic.activated_at:
         base = get_utc_now()
     else:
         base = lic.activated_at
-
     return base + delta
 
 
-# ⚠️ Alias de compatibilité : retourne un int arrondi minimum à 1
 def _duration_to_days(val: int, unit: str) -> int:
-    """Compatibilité legacy : int arrondi minimum à 1."""
     d = _duration_to_days_float(val, unit)
     return max(1, math.ceil(d))
+
+
+# ═══════════════════════════════════════════════════════════
+# ✅ HELPERS CONFIG DYNAMIQUE (table app_config)
+# ═══════════════════════════════════════════════════════════
+def _get_default_trial_config(db: Session) -> tuple:
+    """Lit la config par défaut depuis la DB (modifiable via l'admin)."""
+    defaults = {
+        "default_trial_val": "7",
+        "default_trial_unit": "Jours",
+    }
+    results = {}
+    for k in defaults:
+        row = db.query(AppConfig).filter(AppConfig.key == k).first()
+        results[k] = row.value if row else defaults[k]
+
+    try:
+        val = int(results["default_trial_val"])
+    except ValueError:
+        val = 7
+    unit = results["default_trial_unit"] or "Jours"
+    days = _duration_to_days_float(val, unit)
+
+    return val, unit, days
+
+
+def _set_default_trial_config(db: Session, val: int, unit: str):
+    """Enregistre la config par défaut dans la DB."""
+    for k, v in [
+        ("default_trial_val", str(val)),
+        ("default_trial_unit", unit),
+    ]:
+        row = db.query(AppConfig).filter(AppConfig.key == k).first()
+        if row:
+            row.value = v
+        else:
+            db.add(AppConfig(key=k, value=v))
+    db.commit()
 
 
 # ═══════════════════════════════════════════════════════════
@@ -483,18 +516,25 @@ def _update_license_user_info(lic: LicenseKey, req, changed_log: list):
 
 
 # ═══════════════════════════════════════════════════════════
-# HELPER : construit le bloc "access" (mode, durée, limites)
-# ✅ AJOUT : duration_seconds pour une expiration EXACTE côté Flutter
+# ✅ _build_access_payload — AVEC CONFIG DYNAMIQUE
 # ═══════════════════════════════════════════════════════════
-def _build_access_payload(lic: Optional[LicenseKey]) -> dict:
+def _build_access_payload(lic: Optional[LicenseKey], db: Optional[Session] = None) -> dict:
     if lic is None:
-        delta = _duration_to_timedelta(DEFAULT_TRIAL_DAYS, DEFAULT_TRIAL_UNIT)
+        # ✅ Lecture DYNAMIQUE depuis la DB
+        if db is not None:
+            val, unit, days_float = _get_default_trial_config(db)
+        else:
+            val = DEFAULT_TRIAL_DAYS
+            unit = DEFAULT_TRIAL_UNIT
+            days_float = float(DEFAULT_TRIAL_DAYS)
+
+        delta = _duration_to_timedelta(val, unit)
         return {
             "mode": "trial",
             "is_trial": True,
-            "duration_val": DEFAULT_TRIAL_DAYS,
-            "duration_unit": DEFAULT_TRIAL_UNIT,
-            "duration_days": DEFAULT_TRIAL_DAYS,
+            "duration_val": val,
+            "duration_unit": unit,
+            "duration_days": max(1, math.ceil(days_float)),
             "duration_seconds": int(delta.total_seconds()),
             "max_tables": TRIAL_MAX_TABLES,
             "max_rows_per_table": TRIAL_MAX_ROWS_PER_TABLE,
@@ -508,7 +548,6 @@ def _build_access_payload(lic: Optional[LicenseKey]) -> dict:
     dur_unit = lic.duration_unit or DEFAULT_TRIAL_UNIT
     dur_days = lic.duration_days or DEFAULT_TRIAL_DAYS
 
-    # ✅ Calcule la durée EXACTE en secondes depuis duration_val + duration_unit
     delta = _duration_to_timedelta(dur_val, dur_unit)
     duration_seconds = int(delta.total_seconds())
 
@@ -568,7 +607,7 @@ def preview_access_for_device(device_id: str, db: Session = Depends(get_db)):
             )
 
             if not is_expired and not is_revoked:
-                access = _build_access_payload(existing_lic)
+                access = _build_access_payload(existing_lic, db=db)
                 return {
                     "status": "success",
                     "whether": "license_active",
@@ -594,7 +633,7 @@ def preview_access_for_device(device_id: str, db: Session = Depends(get_db)):
                     ).first()
 
                 if admin_lic:
-                    access = _build_access_payload(admin_lic)
+                    access = _build_access_payload(admin_lic, db=db)
                     return {
                         "status": "success",
                         "whether": "license_active",
@@ -612,24 +651,24 @@ def preview_access_for_device(device_id: str, db: Session = Depends(get_db)):
                     ),
                 }
 
-            access = _build_access_payload(None)
+            access = _build_access_payload(None, db=db)
             return {
                 "status": "success",
                 "whether": "trial_available",
                 "access": access,
                 "message": (
-                    f"Un essai de {access['duration_days']} jour(s) "
+                    f"Un essai de {access['duration_val']} {access['duration_unit']} "
                     f"sera accordé."
                 ),
             }
 
-        access = _build_access_payload(None)
+        access = _build_access_payload(None, db=db)
         return {
             "status": "success",
             "whether": "fresh_device",
             "access": access,
             "message": (
-                f"Un essai de {access['duration_days']} jour(s) "
+                f"Un essai de {access['duration_val']} {access['duration_unit']} "
                 f"sera accordé pour ce nouvel appareil."
             ),
         }
@@ -658,6 +697,10 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
 
         check_rate_limit(clean_device)
 
+        # ✅ Lecture DYNAMIQUE de la config par défaut
+        def_val, def_unit, def_days_float = _get_default_trial_config(db)
+        def_days = max(1, math.ceil(def_days_float))
+
         existing_device_lic = _find_license_by_device(clean_device, db)
 
         if existing_device_lic:
@@ -683,7 +726,7 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
 
                 db.commit()
 
-                access = _build_access_payload(existing_device_lic)
+                access = _build_access_payload(existing_device_lic, db=db)
                 return {
                     "status": "success",
                     "message": "Clé existante renvoyée pour cet appareil.",
@@ -729,7 +772,7 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                     dev_trace.admin_unblocked_at = get_utc_now()
 
                     db.commit()
-                    access = _build_access_payload(admin_lic)
+                    access = _build_access_payload(admin_lic, db=db)
                     return {
                         "status": "success",
                         "message": "Licence active trouvée.",
@@ -756,6 +799,7 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
             part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
             new_key = f"{part1}-{part2}-{part3}-{part4}"
 
+            # ✅ Utilise la config DYNAMIQUE
             new_lic = LicenseKey(
                 key=new_key,
                 phone_number=clean_phone,
@@ -766,9 +810,9 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                 is_trial=True,
                 device_uuid=json.dumps([clean_device]),
                 max_devices=1,
-                duration_days=DEFAULT_TRIAL_DAYS,
-                duration_val=DEFAULT_TRIAL_DAYS,
-                duration_unit=DEFAULT_TRIAL_UNIT,
+                duration_days=def_days,
+                duration_val=def_val,
+                duration_unit=def_unit,
                 created_at=now,
             )
             db.add(new_lic)
@@ -783,8 +827,7 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                     f"Quota atteint ({dev_trace.attempts_count}/{max_allowed})"
                 )
             else:
-                dev_trace.is_blocked = False
-                dev_trace.block_reason = ""
+                dev_trace.is_blocked = False                dev_trace.block_reason = ""
 
             try:
                 old_devs = json.loads(existing_device_lic.device_uuid or "[]")
@@ -797,12 +840,12 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
             db.commit()
             db.refresh(new_lic)
 
-            access = _build_access_payload(new_lic)
+            access = _build_access_payload(new_lic, db=db)
             return {
                 "status": "success",
                 "message": "Nouvelle clé d'essai accordée (renouvellement).",
                 "license_key": new_key,
-                "trial_days": DEFAULT_TRIAL_DAYS,
+                "trial_days": def_days,
                 "is_trial": True,
                 "access": access,
             }
@@ -834,7 +877,7 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
 
             db.commit()
 
-            access = _build_access_payload(admin_lic)
+            access = _build_access_payload(admin_lic, db=db)
             return {
                 "status": "success",
                 "message": "Licence active trouvée.",
@@ -874,7 +917,7 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                     existing_device.admin_unblocked_at = get_utc_now()
 
                     db.commit()
-                    access = _build_access_payload(admin_lic)
+                    access = _build_access_payload(admin_lic, db=db)
                     return {
                         "status": "success",
                         "message": "Licence active trouvée.",
@@ -911,9 +954,9 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                 is_trial=True,
                 device_uuid=json.dumps([clean_device]),
                 max_devices=1,
-                duration_days=DEFAULT_TRIAL_DAYS,
-                duration_val=DEFAULT_TRIAL_DAYS,
-                duration_unit=DEFAULT_TRIAL_UNIT,
+                duration_days=def_days,
+                duration_val=def_val,
+                duration_unit=def_unit,
                 created_at=get_utc_now()
             )
             db.add(new_lic)
@@ -933,12 +976,12 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
 
             db.commit()
             db.refresh(new_lic)
-            access = _build_access_payload(new_lic)
+            access = _build_access_payload(new_lic, db=db)
             return {
                 "status": "success",
                 "message": "Nouvel essai accordé.",
                 "license_key": license_key,
-                "trial_days": DEFAULT_TRIAL_DAYS,
+                "trial_days": def_days,
                 "is_trial": True,
                 "access": access,
             }
@@ -978,7 +1021,7 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                 db.add(new_attempt)
                 db.commit()
 
-                access = _build_access_payload(existing_lic_by_phone)
+                access = _build_access_payload(existing_lic_by_phone, db=db)
                 return {
                     "status": "success",
                     "message": "Clé existante liée à cet appareil.",
@@ -1037,21 +1080,21 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
             is_trial=True,
             device_uuid=json.dumps([clean_device]),
             max_devices=1,
-            duration_days=DEFAULT_TRIAL_DAYS,
-            duration_val=DEFAULT_TRIAL_DAYS,
-            duration_unit=DEFAULT_TRIAL_UNIT,
+            duration_days=def_days,
+            duration_val=def_val,
+            duration_unit=def_unit,
             created_at=get_utc_now()
         )
         db.add(new_lic)
         db.commit()
         db.refresh(new_lic)
 
-        access = _build_access_payload(new_lic)
+        access = _build_access_payload(new_lic, db=db)
         return {
             "status": "success",
             "message": "Clé d'essai générée avec succès !",
             "license_key": license_key,
-            "trial_days": DEFAULT_TRIAL_DAYS,
+            "trial_days": def_days,
             "is_trial": True,
             "access": access,
         }
@@ -1066,7 +1109,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
 
 # ═══════════════════════════════════════════════════════════
 # ROUTE : VÉRIFICATION / ACTIVATION
-# ✅ PATCH : Utilise _compute_expiry au lieu de timedelta(days=...)
 # ═══════════════════════════════════════════════════════════
 @app.post("/api/license/verify")
 @app.post("/api/license/verify/")
@@ -1098,7 +1140,6 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
                 "Contactez l'administrateur pour la renouveler."
             )
 
-        # ✅ PATCH : utilise _compute_expiry pour respecter les minutes/heures
         if not license_entry.activated_at:
             license_entry.activated_at = now
             license_entry.expires_at = _compute_expiry(license_entry, from_now=True)
@@ -1158,7 +1199,7 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
 
         db.commit()
 
-        access = _build_access_payload(license_entry)
+        access = _build_access_payload(license_entry, db=db)
         return {
             "status": "valid",
             "phone_number": license_entry.phone_number or "",
@@ -1178,6 +1219,21 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
         db.rollback()
         print(f"[VERIFY ERROR] {traceback.format_exc()}")
         raise HTTPException(500, f"Erreur DB: {str(e)}")
+
+
+# ═══════════════════════════════════════════════════════════
+# ✅ ROUTE : CONFIG DURÉE PAR DÉFAUT (PUBLIQUE, pour l'app)
+# ═══════════════════════════════════════════════════════════
+@app.get("/api/config/default-trial")
+@app.get("/api/config/default-trial/")
+def get_public_default_trial(db: Session = Depends(get_db)):
+    """Endpoint public : l'app peut lire la durée d'essai par défaut."""
+    val, unit, days = _get_default_trial_config(db)
+    return {
+        "duration_val": val,
+        "duration_unit": unit,
+        "duration_days": max(1, math.ceil(days)),
+    }
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1229,8 +1285,6 @@ def create_admin_license(req: AdminCreateLicenseRequest, db: Session = Depends(g
         part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
         license_key = f"{part1}-{part2}-{part3}-{part4}"
 
-        # ✅ PATCH : garde duration_days en int (colonne INTEGER) mais
-        #    préserve duration_val + duration_unit EXACTS
         days_float = _duration_to_days_float(req.duration_val, req.duration_unit)
         days_int = max(1, math.ceil(days_float))
 
@@ -1290,7 +1344,6 @@ def update_admin_license_full(key: str, req: AdminUpdateLicenseRequest, db: Sess
         new_days = _duration_to_days(val, req.extend_duration_unit)
         mode = (req.duration_mode or "add").lower()
 
-        # ✅ PATCH : préserve duration_val + duration_unit exacts
         if mode == "replace":
             lic.duration_val = val
             lic.duration_unit = req.extend_duration_unit
@@ -1302,7 +1355,6 @@ def update_admin_license_full(key: str, req: AdminUpdateLicenseRequest, db: Sess
             lic.duration_unit = "Jours"
 
         if lic.activated_at:
-            # ✅ PATCH : recalcule avec les secondes exactes
             lic.expires_at = _compute_expiry(lic, from_now=False)
 
     db.commit()
@@ -1361,7 +1413,6 @@ def grant_full_access(key: str, req: GrantFullAccessRequest, db: Session = Depen
     lic.is_active = True
     lic.is_trial = False
 
-    # ✅ PATCH : préserve duration_val + duration_unit exacts
     if mode == "add":
         total_days = (lic.duration_days or 0) + new_days
         lic.duration_days = total_days
@@ -1374,7 +1425,6 @@ def grant_full_access(key: str, req: GrantFullAccessRequest, db: Session = Depen
 
     now = get_utc_now()
     lic.activated_at = now
-    # ✅ PATCH : utilise _compute_expiry (secondes exactes)
     lic.expires_at = _compute_expiry(lic, from_now=True)
 
     _unblock_associated_devices(lic, db)
@@ -1408,7 +1458,6 @@ def reset_license_to_trial(key: str, req: ResetToTrialRequest, db: Session = Dep
     lic.is_active = True
     lic.is_trial = True
 
-    # ✅ PATCH : préserve duration_val + duration_unit exacts
     if mode == "add":
         total_days = (lic.duration_days or 0) + new_days
         lic.duration_days = total_days
@@ -1421,7 +1470,6 @@ def reset_license_to_trial(key: str, req: ResetToTrialRequest, db: Session = Dep
 
     now = get_utc_now()
     lic.activated_at = now
-    # ✅ PATCH : utilise _compute_expiry
     lic.expires_at = _compute_expiry(lic, from_now=True)
 
     _unblock_associated_devices(lic, db)
@@ -1487,6 +1535,34 @@ def delete_admin_license(key: str, db: Session = Depends(get_db)):
 
 
 # ═══════════════════════════════════════════════════════════
+# ✅ ROUTES ADMIN — CONFIG DURÉE PAR DÉFAUT (DYNAMIQUE)
+# ═══════════════════════════════════════════════════════════
+@app.get("/api/admin/config/default-trial", dependencies=[Depends(require_admin_key)])
+@app.get("/api/admin/config/default-trial/", dependencies=[Depends(require_admin_key)])
+def get_default_trial_config(db: Session = Depends(get_db)):
+    val, unit, days = _get_default_trial_config(db)
+    return {
+        "duration_val": val,
+        "duration_unit": unit,
+        "duration_days": max(1, math.ceil(days)),
+    }
+
+
+@app.put("/api/admin/config/default-trial", dependencies=[Depends(require_admin_key)])
+@app.put("/api/admin/config/default-trial/", dependencies=[Depends(require_admin_key)])
+def update_default_trial_config(req: DefaultTrialConfigRequest, db: Session = Depends(get_db)):
+    _set_default_trial_config(db, req.duration_val, req.duration_unit)
+    val, unit, days = _get_default_trial_config(db)
+    return {
+        "status": "success",
+        "message": "Configuration par défaut mise à jour.",
+        "duration_val": val,
+        "duration_unit": unit,
+        "duration_days": max(1, math.ceil(days)),
+    }
+
+
+# ═══════════════════════════════════════════════════════════
 # ROUTES ADMIN — APPAREILS
 # ═══════════════════════════════════════════════════════════
 @app.get("/api/admin/devices", dependencies=[Depends(require_admin_key)])
@@ -1516,10 +1592,6 @@ def get_admin_devices(db: Session = Depends(get_db)):
         raise HTTPException(500, f"Erreur SQL: {str(err)}")
 
 
-# ═══════════════════════════════════════════════════════════
-# FORCE LE MODE ESSAI SUR UN DEVICE
-# ✅ PATCH : utilise _compute_expiry
-# ═══════════════════════════════════════════════════════════
 def _force_trial_to_device(
     dev: DeviceAttempt,
     duration_val: int,
@@ -1540,7 +1612,6 @@ def _force_trial_to_device(
         existing_lic.duration_unit = duration_unit
         existing_lic.duration_days = days
         existing_lic.activated_at = now
-        # ✅ PATCH : secondes exactes
         existing_lic.expires_at = _compute_expiry(existing_lic, from_now=True)
         existing_lic.device_uuid = json.dumps([clean_device])
         lic = existing_lic
@@ -1562,7 +1633,6 @@ def _force_trial_to_device(
             created_at=now,
             activated_at=now,
         )
-        # ✅ PATCH : calcule expires_at après création
         lic.expires_at = _compute_expiry(lic, from_now=True)
         db.add(lic)
         action = "created_as_trial"
@@ -1605,7 +1675,6 @@ def _grant_full_access_to_device(
         existing_lic.duration_unit = duration_unit
         existing_lic.duration_days = days
         existing_lic.activated_at = now
-        # ✅ PATCH : secondes exactes
         existing_lic.expires_at = _compute_expiry(existing_lic, from_now=True)
         existing_lic.device_uuid = json.dumps([clean_device])
         lic = existing_lic
@@ -1627,7 +1696,6 @@ def _grant_full_access_to_device(
             created_at=now,
             activated_at=now,
         )
-        # ✅ PATCH : calcule expires_at après création
         lic.expires_at = _compute_expiry(lic, from_now=True)
         db.add(lic)
         action = "created"
