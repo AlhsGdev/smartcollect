@@ -1,4 +1,4 @@
-import os
+ import os
 import json
 import math
 import secrets
@@ -404,7 +404,6 @@ def _duration_to_days(val: int, unit: str) -> int:
 # ✅ HELPERS CONFIG DYNAMIQUE (table app_config)
 # ═══════════════════════════════════════════════════════════
 def _get_default_trial_config(db: Session) -> tuple:
-    """Lit la config par défaut depuis la DB (modifiable via l'admin)."""
     defaults = {
         "default_trial_val": "7",
         "default_trial_unit": "Jours",
@@ -425,7 +424,6 @@ def _get_default_trial_config(db: Session) -> tuple:
 
 
 def _set_default_trial_config(db: Session, val: int, unit: str):
-    """Enregistre la config par défaut dans la DB."""
     for k, v in [
         ("default_trial_val", str(val)),
         ("default_trial_unit", unit),
@@ -676,6 +674,7 @@ def preview_access_for_device(device_id: str, db: Session = Depends(get_db)):
 
 # ═══════════════════════════════════════════════════════════
 # ROUTE : DEMANDE / RENOUVELLEMENT DE CLÉ
+# ✅ FIX : activated_at + expires_at définis dès la création
 # ═══════════════════════════════════════════════════════════
 @app.post("/api/license/request-key")
 @app.post("/api/license/request-key/")
@@ -792,6 +791,7 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
             part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
             new_key = f"{part1}-{part2}-{part3}-{part4}"
 
+            # ✅ FIX : activated_at + expires_at définis dès la création
             new_lic = LicenseKey(
                 key=new_key,
                 phone_number=clean_phone,
@@ -806,7 +806,9 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                 duration_val=def_val,
                 duration_unit=def_unit,
                 created_at=now,
+                activated_at=now,  # ✅ AJOUT
             )
+            new_lic.expires_at = _compute_expiry(new_lic, from_now=True)  # ✅ AJOUT
             db.add(new_lic)
 
             dev_trace.attempts_count = attempts + 1
@@ -937,6 +939,7 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
             part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
             license_key = f"{part1}-{part2}-{part3}-{part4}"
 
+            # ✅ FIX : activated_at + expires_at définis dès la création
             new_lic = LicenseKey(
                 key=license_key,
                 phone_number=clean_phone,
@@ -950,8 +953,10 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                 duration_days=def_days,
                 duration_val=def_val,
                 duration_unit=def_unit,
-                created_at=get_utc_now()
+                created_at=get_utc_now(),
+                activated_at=get_utc_now(),  # ✅ AJOUT
             )
+            new_lic.expires_at = _compute_expiry(new_lic, from_now=True)  # ✅ AJOUT
             db.add(new_lic)
 
             existing_device.attempts_count = attempts_count + 1
@@ -1063,6 +1068,7 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
         part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
         license_key = f"{part1}-{part2}-{part3}-{part4}"
 
+        # ✅ FIX : activated_at + expires_at définis dès la création
         new_lic = LicenseKey(
             key=license_key,
             phone_number=clean_phone,
@@ -1076,8 +1082,10 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
             duration_days=def_days,
             duration_val=def_val,
             duration_unit=def_unit,
-            created_at=get_utc_now()
+            created_at=get_utc_now(),
+            activated_at=get_utc_now(),  # ✅ AJOUT
         )
+        new_lic.expires_at = _compute_expiry(new_lic, from_now=True)  # ✅ AJOUT
         db.add(new_lic)
         db.commit()
         db.refresh(new_lic)
