@@ -4,4 +4,4 @@ pydantic[email]>=2.6.0
 email-validator>=2.1.0
 sqlalchemy>=2.0.0 
 requests>=2.31.0
-psycopg[binary]==3.2.3
+psycopg[binary]>=3.2.10
