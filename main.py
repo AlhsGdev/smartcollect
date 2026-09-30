@@ -342,35 +342,72 @@ class ResetToTrialRequest(BaseModel):
 
 
 # ═══════════════════════════════════════════════════════════
-# ✅ HELPER : durée → jours (support Minutes + Heures)
+# ✅ HELPERS DURÉE — CONVERSIONS EXACTES (support Minutes + Heures)
 # ═══════════════════════════════════════════════════════════
-def _duration_to_days(val: int, unit: str) -> int:
+def _duration_to_days_float(val: int, unit: str) -> float:
     """
-    Convertit une durée (valeur + unité) en jours (entier).
-    Supporte : Minutes, Heures, Jours, Mois, Ans.
-    Minimum : 1 jour si la durée est inférieure à 1 jour.
+    ✅ Conversion EXACTE en jours (float), sans arrondi minimum.
+    Ex: 10 minutes → 0.00694 jours
+        5 heures   → 0.20833 jours
     """
     u = (unit or "").lower().strip()
 
     if "minute" in u or u == "min" or u == "mn":
-        # ✅ Minutes : au moins 1 jour
-        return max(1, math.ceil(val / (24 * 60)))
-
+        return val / (24 * 60)
     if "heure" in u or u == "h" or u == "hr" or u == "hrs":
-        # ✅ Heures : au moins 1 jour
-        return max(1, math.ceil(val / 24))
-
-    if "mois" in u or u == "month" or u == "months":
-        return val * 30
-
-    if "an" in u or u == "year" or u == "years":
-        return val * 365
-
+        return val / 24
     if "jour" in u or u == "day" or u == "days" or u == "j":
-        return val
+        return float(val)
+    if "mois" in u or u == "month" or u == "months":
+        return float(val * 30)
+    if "an" in u or u == "year" or u == "years":
+        return float(val * 365)
 
-    # Fallback : on assume jours
-    return val
+    return float(val)
+
+
+def _duration_to_timedelta(val: int, unit: str) -> timedelta:
+    """
+    ✅ Conversion EXACTE en timedelta, sans arrondi.
+    """
+    u = (unit or "").lower().strip()
+
+    if "minute" in u or u == "min" or u == "mn":
+        return timedelta(minutes=val)
+    if "heure" in u or u == "h" or u == "hr" or u == "hrs":
+        return timedelta(hours=val)
+    if "jour" in u or u == "day" or u == "days" or u == "j":
+        return timedelta(days=val)
+    if "mois" in u or u == "month" or u == "months":
+        return timedelta(days=val * 30)
+    if "an" in u or u == "year" or u == "years":
+        return timedelta(days=val * 365)
+
+    return timedelta(days=val)
+
+
+def _compute_expiry(lic: "LicenseKey", from_now: bool = True) -> datetime:
+    """
+    ✅ Calcule la date d'expiration EXACTE à partir de
+    duration_val + duration_unit (au lieu de duration_days arrondi).
+    """
+    val = lic.duration_val or DEFAULT_TRIAL_DAYS
+    unit = lic.duration_unit or DEFAULT_TRIAL_UNIT
+    delta = _duration_to_timedelta(val, unit)
+
+    if from_now or not lic.activated_at:
+        base = get_utc_now()
+    else:
+        base = lic.activated_at
+
+    return base + delta
+
+
+# ⚠️ Alias de compatibilité : retourne un int arrondi minimum à 1
+def _duration_to_days(val: int, unit: str) -> int:
+    """Compatibilité legacy : int arrondi minimum à 1."""
+    d = _duration_to_days_float(val, unit)
+    return max(1, math.ceil(d))
 
 
 # ═══════════════════════════════════════════════════════════
@@ -447,15 +484,18 @@ def _update_license_user_info(lic: LicenseKey, req, changed_log: list):
 
 # ═══════════════════════════════════════════════════════════
 # HELPER : construit le bloc "access" (mode, durée, limites)
+# ✅ AJOUT : duration_seconds pour une expiration EXACTE côté Flutter
 # ═══════════════════════════════════════════════════════════
 def _build_access_payload(lic: Optional[LicenseKey]) -> dict:
     if lic is None:
+        delta = _duration_to_timedelta(DEFAULT_TRIAL_DAYS, DEFAULT_TRIAL_UNIT)
         return {
             "mode": "trial",
             "is_trial": True,
             "duration_val": DEFAULT_TRIAL_DAYS,
             "duration_unit": DEFAULT_TRIAL_UNIT,
             "duration_days": DEFAULT_TRIAL_DAYS,
+            "duration_seconds": int(delta.total_seconds()),
             "max_tables": TRIAL_MAX_TABLES,
             "max_rows_per_table": TRIAL_MAX_ROWS_PER_TABLE,
             "allow_export": TRIAL_ALLOW_EXPORT,
@@ -468,12 +508,17 @@ def _build_access_payload(lic: Optional[LicenseKey]) -> dict:
     dur_unit = lic.duration_unit or DEFAULT_TRIAL_UNIT
     dur_days = lic.duration_days or DEFAULT_TRIAL_DAYS
 
+    # ✅ Calcule la durée EXACTE en secondes depuis duration_val + duration_unit
+    delta = _duration_to_timedelta(dur_val, dur_unit)
+    duration_seconds = int(delta.total_seconds())
+
     return {
         "mode": mode,
         "is_trial": is_trial,
         "duration_val": dur_val,
         "duration_unit": dur_unit,
         "duration_days": dur_days,
+        "duration_seconds": duration_seconds,
         "max_tables": TRIAL_MAX_TABLES if is_trial else 999999,
         "max_rows_per_table": TRIAL_MAX_ROWS_PER_TABLE if is_trial else 999999,
         "allow_export": (not is_trial) or TRIAL_ALLOW_EXPORT,
@@ -1021,6 +1066,7 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
 
 # ═══════════════════════════════════════════════════════════
 # ROUTE : VÉRIFICATION / ACTIVATION
+# ✅ PATCH : Utilise _compute_expiry au lieu de timedelta(days=...)
 # ═══════════════════════════════════════════════════════════
 @app.post("/api/license/verify")
 @app.post("/api/license/verify/")
@@ -1052,11 +1098,10 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
                 "Contactez l'administrateur pour la renouveler."
             )
 
+        # ✅ PATCH : utilise _compute_expiry pour respecter les minutes/heures
         if not license_entry.activated_at:
             license_entry.activated_at = now
-            license_entry.expires_at = now + timedelta(
-                days=license_entry.duration_days or DEFAULT_TRIAL_DAYS
-            )
+            license_entry.expires_at = _compute_expiry(license_entry, from_now=True)
 
         changed = []
         _update_license_user_info(license_entry, req, changed)
@@ -1184,7 +1229,10 @@ def create_admin_license(req: AdminCreateLicenseRequest, db: Session = Depends(g
         part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
         license_key = f"{part1}-{part2}-{part3}-{part4}"
 
-        days = _duration_to_days(req.duration_val, req.duration_unit)
+        # ✅ PATCH : garde duration_days en int (colonne INTEGER) mais
+        #    préserve duration_val + duration_unit EXACTS
+        days_float = _duration_to_days_float(req.duration_val, req.duration_unit)
+        days_int = max(1, math.ceil(days_float))
 
         new_lic = LicenseKey(
             key=license_key,
@@ -1193,7 +1241,7 @@ def create_admin_license(req: AdminCreateLicenseRequest, db: Session = Depends(g
             is_trial=True,
             device_uuid="[]",
             max_devices=req.max_devices,
-            duration_days=days,
+            duration_days=days_int,
             duration_val=req.duration_val,
             duration_unit=req.duration_unit,
             created_at=get_utc_now()
@@ -1242,10 +1290,11 @@ def update_admin_license_full(key: str, req: AdminUpdateLicenseRequest, db: Sess
         new_days = _duration_to_days(val, req.extend_duration_unit)
         mode = (req.duration_mode or "add").lower()
 
+        # ✅ PATCH : préserve duration_val + duration_unit exacts
         if mode == "replace":
             lic.duration_val = val
             lic.duration_unit = req.extend_duration_unit
-            lic.duration_days = new_days
+            lic.duration_days = max(1, math.ceil(_duration_to_days_float(val, req.extend_duration_unit)))
         else:
             total_days = (lic.duration_days or 0) + new_days
             lic.duration_days = total_days
@@ -1253,7 +1302,8 @@ def update_admin_license_full(key: str, req: AdminUpdateLicenseRequest, db: Sess
             lic.duration_unit = "Jours"
 
         if lic.activated_at:
-            lic.expires_at = lic.activated_at + timedelta(days=lic.duration_days)
+            # ✅ PATCH : recalcule avec les secondes exactes
+            lic.expires_at = _compute_expiry(lic, from_now=False)
 
     db.commit()
     db.refresh(lic)
@@ -1311,6 +1361,7 @@ def grant_full_access(key: str, req: GrantFullAccessRequest, db: Session = Depen
     lic.is_active = True
     lic.is_trial = False
 
+    # ✅ PATCH : préserve duration_val + duration_unit exacts
     if mode == "add":
         total_days = (lic.duration_days or 0) + new_days
         lic.duration_days = total_days
@@ -1319,11 +1370,12 @@ def grant_full_access(key: str, req: GrantFullAccessRequest, db: Session = Depen
     else:
         lic.duration_val = req.duration_val
         lic.duration_unit = req.duration_unit
-        lic.duration_days = new_days
+        lic.duration_days = max(1, math.ceil(_duration_to_days_float(req.duration_val, req.duration_unit)))
 
     now = get_utc_now()
     lic.activated_at = now
-    lic.expires_at = now + timedelta(days=lic.duration_days)
+    # ✅ PATCH : utilise _compute_expiry (secondes exactes)
+    lic.expires_at = _compute_expiry(lic, from_now=True)
 
     _unblock_associated_devices(lic, db)
 
@@ -1356,6 +1408,7 @@ def reset_license_to_trial(key: str, req: ResetToTrialRequest, db: Session = Dep
     lic.is_active = True
     lic.is_trial = True
 
+    # ✅ PATCH : préserve duration_val + duration_unit exacts
     if mode == "add":
         total_days = (lic.duration_days or 0) + new_days
         lic.duration_days = total_days
@@ -1364,11 +1417,12 @@ def reset_license_to_trial(key: str, req: ResetToTrialRequest, db: Session = Dep
     else:
         lic.duration_val = req.duration_val
         lic.duration_unit = req.duration_unit
-        lic.duration_days = new_days
+        lic.duration_days = max(1, math.ceil(_duration_to_days_float(req.duration_val, req.duration_unit)))
 
     now = get_utc_now()
     lic.activated_at = now
-    lic.expires_at = now + timedelta(days=lic.duration_days)
+    # ✅ PATCH : utilise _compute_expiry
+    lic.expires_at = _compute_expiry(lic, from_now=True)
 
     _unblock_associated_devices(lic, db)
 
@@ -1464,6 +1518,7 @@ def get_admin_devices(db: Session = Depends(get_db)):
 
 # ═══════════════════════════════════════════════════════════
 # FORCE LE MODE ESSAI SUR UN DEVICE
+# ✅ PATCH : utilise _compute_expiry
 # ═══════════════════════════════════════════════════════════
 def _force_trial_to_device(
     dev: DeviceAttempt,
@@ -1472,7 +1527,8 @@ def _force_trial_to_device(
     db: Session,
 ) -> dict:
     clean_device = dev.device_id.strip().upper()
-    days = _duration_to_days(duration_val, duration_unit)
+    days_float = _duration_to_days_float(duration_val, duration_unit)
+    days = max(1, math.ceil(days_float))
     now = get_utc_now()
 
     existing_lic = _find_license_by_device(clean_device, db)
@@ -1484,7 +1540,8 @@ def _force_trial_to_device(
         existing_lic.duration_unit = duration_unit
         existing_lic.duration_days = days
         existing_lic.activated_at = now
-        existing_lic.expires_at = now + timedelta(days=days)
+        # ✅ PATCH : secondes exactes
+        existing_lic.expires_at = _compute_expiry(existing_lic, from_now=True)
         existing_lic.device_uuid = json.dumps([clean_device])
         lic = existing_lic
         action = "updated_to_trial"
@@ -1504,8 +1561,9 @@ def _force_trial_to_device(
             duration_unit=duration_unit,
             created_at=now,
             activated_at=now,
-            expires_at=now + timedelta(days=days),
         )
+        # ✅ PATCH : calcule expires_at après création
+        lic.expires_at = _compute_expiry(lic, from_now=True)
         db.add(lic)
         action = "created_as_trial"
 
@@ -1534,7 +1592,8 @@ def _grant_full_access_to_device(
     db: Session,
 ) -> dict:
     clean_device = dev.device_id.strip().upper()
-    days = _duration_to_days(duration_val, duration_unit)
+    days_float = _duration_to_days_float(duration_val, duration_unit)
+    days = max(1, math.ceil(days_float))
     now = get_utc_now()
 
     existing_lic = _find_license_by_device(clean_device, db)
@@ -1546,7 +1605,8 @@ def _grant_full_access_to_device(
         existing_lic.duration_unit = duration_unit
         existing_lic.duration_days = days
         existing_lic.activated_at = now
-        existing_lic.expires_at = now + timedelta(days=days)
+        # ✅ PATCH : secondes exactes
+        existing_lic.expires_at = _compute_expiry(existing_lic, from_now=True)
         existing_lic.device_uuid = json.dumps([clean_device])
         lic = existing_lic
         action = "updated"
@@ -1566,8 +1626,9 @@ def _grant_full_access_to_device(
             duration_unit=duration_unit,
             created_at=now,
             activated_at=now,
-            expires_at=now + timedelta(days=days),
         )
+        # ✅ PATCH : calcule expires_at après création
+        lic.expires_at = _compute_expiry(lic, from_now=True)
         db.add(lic)
         action = "created"
 
