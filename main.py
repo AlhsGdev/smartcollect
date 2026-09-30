@@ -318,7 +318,6 @@ class NewsCreateRequest(BaseModel):
     download_url: Optional[str] = None
 
 
-# ✅ MODIFIÉ : ajout de force_trial
 class DeviceUpdateRequest(BaseModel):
     is_blocked: Optional[bool] = None
     notes: Optional[str] = None
@@ -327,7 +326,7 @@ class DeviceUpdateRequest(BaseModel):
     grant_full_access: Optional[bool] = None
     duration_val: Optional[int] = Field(None, ge=1, le=9999)
     duration_unit: Optional[str] = None
-    force_trial: Optional[bool] = None  # ✅ NOUVEAU
+    force_trial: Optional[bool] = None
 
 
 class GrantFullAccessRequest(BaseModel):
@@ -343,18 +342,34 @@ class ResetToTrialRequest(BaseModel):
 
 
 # ═══════════════════════════════════════════════════════════
-# HELPER : durée → jours
+# ✅ HELPER : durée → jours (support Minutes + Heures)
 # ═══════════════════════════════════════════════════════════
 def _duration_to_days(val: int, unit: str) -> int:
-    u = (unit or "").lower()
-    if "mois" in u:
-        return val * 30
-    if "an" in u:
-        return val * 365
-    if "jour" in u:
-        return val
-    if "heure" in u:
+    """
+    Convertit une durée (valeur + unité) en jours (entier).
+    Supporte : Minutes, Heures, Jours, Mois, Ans.
+    Minimum : 1 jour si la durée est inférieure à 1 jour.
+    """
+    u = (unit or "").lower().strip()
+
+    if "minute" in u or u == "min" or u == "mn":
+        # ✅ Minutes : au moins 1 jour
+        return max(1, math.ceil(val / (24 * 60)))
+
+    if "heure" in u or u == "h" or u == "hr" or u == "hrs":
+        # ✅ Heures : au moins 1 jour
         return max(1, math.ceil(val / 24))
+
+    if "mois" in u or u == "month" or u == "months":
+        return val * 30
+
+    if "an" in u or u == "year" or u == "years":
+        return val * 365
+
+    if "jour" in u or u == "day" or u == "days" or u == "j":
+        return val
+
+    # Fallback : on assume jours
     return val
 
 
@@ -434,12 +449,6 @@ def _update_license_user_info(lic: LicenseKey, req, changed_log: list):
 # HELPER : construit le bloc "access" (mode, durée, limites)
 # ═══════════════════════════════════════════════════════════
 def _build_access_payload(lic: Optional[LicenseKey]) -> dict:
-    """
-    Construit le dict standardisé 'access' :
-      - mode : 'trial' ou 'full'
-      - duration_val / duration_unit / duration_days
-      - max_tables / max_rows_per_table / allow_export
-    """
     if lic is None:
         return {
             "mode": "trial",
@@ -1454,7 +1463,7 @@ def get_admin_devices(db: Session = Depends(get_db)):
 
 
 # ═══════════════════════════════════════════════════════════
-# ✅ NOUVEAU : force le mode ESSAI sur un device
+# FORCE LE MODE ESSAI SUR UN DEVICE
 # ═══════════════════════════════════════════════════════════
 def _force_trial_to_device(
     dev: DeviceAttempt,
@@ -1462,10 +1471,6 @@ def _force_trial_to_device(
     duration_unit: str,
     db: Session,
 ) -> dict:
-    """
-    Crée ou met à jour une licence en mode ESSAI liée à ce device.
-    Utilisé quand l'admin choisit explicitement "🎟 Essai supplémentaire".
-    """
     clean_device = dev.device_id.strip().upper()
     days = _duration_to_days(duration_val, duration_unit)
     now = get_utc_now()
@@ -1473,7 +1478,6 @@ def _force_trial_to_device(
     existing_lic = _find_license_by_device(clean_device, db)
 
     if existing_lic:
-        # ✅ Conversion de la licence existante en mode essai
         existing_lic.is_active = True
         existing_lic.is_trial = True
         existing_lic.duration_val = duration_val
@@ -1485,7 +1489,6 @@ def _force_trial_to_device(
         lic = existing_lic
         action = "updated_to_trial"
     else:
-        # Création d'une nouvelle licence essai
         part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
         new_key = f"{part1}-{part2}-{part3}-{part4}"
 
@@ -1586,7 +1589,6 @@ def _grant_full_access_to_device(
     }
 
 
-# ✅ MODIFIÉ : gère grant_full_access ET force_trial
 @app.put("/api/admin/devices/{device_id}", dependencies=[Depends(require_admin_key)])
 @app.put("/api/admin/devices/{device_id}/", dependencies=[Depends(require_admin_key)])
 def update_admin_device(device_id: str, req: DeviceUpdateRequest, db: Session = Depends(get_db)):
@@ -1610,7 +1612,6 @@ def update_admin_device(device_id: str, req: DeviceUpdateRequest, db: Session = 
             f"ACCÈS COMPLET {duration_val} {duration_unit} → clé {full_access_info['key']}"
         )
     elif req.force_trial is True:
-        # ✅ NOUVEAU : Force le mode ESSAI
         duration_val = req.duration_val or DEFAULT_TRIAL_DAYS
         duration_unit = req.duration_unit or DEFAULT_TRIAL_UNIT
         trial_info = _force_trial_to_device(
