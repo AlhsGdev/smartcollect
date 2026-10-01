@@ -10,7 +10,9 @@ from typing import Optional, List
 from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text, text
+from sqlalchemy import (
+    create_engine, Column, Integer, String, Boolean, DateTime, Text, Float, text
+)
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
 # ═══════════════════════════════════════════════════════════
@@ -25,9 +27,6 @@ TRIAL_ALLOW_EXPORT = False
 
 DEFAULT_INITIAL_QUOTA = 1
 
-# ═══════════════════════════════════════════════════════════
-# 🔐 CLÉ ADMIN
-# ═══════════════════════════════════════════════════════════
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
 
 if not ADMIN_API_KEY:
@@ -124,6 +123,7 @@ def check_rate_limit(identifier: str):
 
 # ═══════════════════════════════════════════════════════════
 # MODÈLES SQLALCHEMY
+# ✅ duration_days devient Float (garde les vraies valeurs)
 # ═══════════════════════════════════════════════════════════
 class LicenseKey(Base):
     __tablename__ = "licenses"
@@ -138,7 +138,7 @@ class LicenseKey(Base):
     is_trial = Column(Boolean, default=True)
     device_uuid = Column(Text, default="[]")
     max_devices = Column(Integer, default=1)
-    duration_days = Column(Integer, default=DEFAULT_TRIAL_DAYS)
+    duration_days = Column(Float, default=DEFAULT_TRIAL_DAYS)  # ✅ FLOAT
     duration_val = Column(Integer, default=DEFAULT_TRIAL_DAYS)
     duration_unit = Column(String(20), default=DEFAULT_TRIAL_UNIT)
     created_at = Column(DateTime, default=get_utc_now)
@@ -187,6 +187,7 @@ class AppConfig(Base):
 
 # ═══════════════════════════════════════════════════════════
 # MIGRATIONS
+# ✅ ALTER duration_days INTEGER → DOUBLE PRECISION
 # ═══════════════════════════════════════════════════════════
 print("[startup] Début des migrations...")
 
@@ -200,6 +201,9 @@ migrations = [
     ("ADD duration_val", "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS duration_val INTEGER DEFAULT 7"),
     ("ADD duration_unit", "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS duration_unit VARCHAR(20) DEFAULT 'Jours'"),
     ("ADD is_trial", "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS is_trial BOOLEAN DEFAULT TRUE"),
+    # ✅ Migration clé : duration_days → DOUBLE PRECISION
+    ("ALTER duration_days to DOUBLE PRECISION",
+     "ALTER TABLE licenses ALTER COLUMN duration_days TYPE DOUBLE PRECISION USING duration_days::double precision"),
     ("SET duration_days default", f"ALTER TABLE licenses ALTER COLUMN duration_days SET DEFAULT {DEFAULT_TRIAL_DAYS}"),
     ("ADD admin_unblocked", "ALTER TABLE device_attempts ADD COLUMN IF NOT EXISTS admin_unblocked BOOLEAN DEFAULT FALSE"),
     ("ADD admin_unblocked_at", "ALTER TABLE device_attempts ADD COLUMN IF NOT EXISTS admin_unblocked_at TIMESTAMP"),
@@ -395,11 +399,6 @@ def _compute_expiry(lic: "LicenseKey", from_now: bool = True) -> datetime:
     return base + delta
 
 
-def _duration_to_days(val: int, unit: str) -> int:
-    d = _duration_to_days_float(val, unit)
-    return max(1, math.ceil(d))
-
-
 # ═══════════════════════════════════════════════════════════
 # ✅ HELPERS CONFIG DYNAMIQUE (table app_config)
 # ═══════════════════════════════════════════════════════════
@@ -509,7 +508,7 @@ def _update_license_user_info(lic: LicenseKey, req, changed_log: list):
 
 
 # ═══════════════════════════════════════════════════════════
-# ✅ _build_access_payload — AVEC CONFIG DYNAMIQUE
+# ✅ _build_access_payload — duration_days = FLOAT exact
 # ═══════════════════════════════════════════════════════════
 def _build_access_payload(lic: Optional[LicenseKey], db: Optional[Session] = None) -> dict:
     if lic is None:
@@ -526,7 +525,7 @@ def _build_access_payload(lic: Optional[LicenseKey], db: Optional[Session] = Non
             "is_trial": True,
             "duration_val": val,
             "duration_unit": unit,
-            "duration_days": max(1, math.ceil(days_float)),
+            "duration_days": days_float,  # ✅ FLOAT exact
             "duration_seconds": int(delta.total_seconds()),
             "max_tables": TRIAL_MAX_TABLES,
             "max_rows_per_table": TRIAL_MAX_ROWS_PER_TABLE,
@@ -538,7 +537,7 @@ def _build_access_payload(lic: Optional[LicenseKey], db: Optional[Session] = Non
 
     dur_val = lic.duration_val if lic.duration_val is not None else DEFAULT_TRIAL_DAYS
     dur_unit = lic.duration_unit or DEFAULT_TRIAL_UNIT
-    dur_days = lic.duration_days or DEFAULT_TRIAL_DAYS
+    dur_days = lic.duration_days if lic.duration_days is not None else float(DEFAULT_TRIAL_DAYS)
 
     delta = _duration_to_timedelta(dur_val, dur_unit)
     duration_seconds = int(delta.total_seconds())
@@ -548,7 +547,7 @@ def _build_access_payload(lic: Optional[LicenseKey], db: Optional[Session] = Non
         "is_trial": is_trial,
         "duration_val": dur_val,
         "duration_unit": dur_unit,
-        "duration_days": dur_days,
+        "duration_days": float(dur_days),  # ✅ FLOAT exact
         "duration_seconds": duration_seconds,
         "max_tables": TRIAL_MAX_TABLES if is_trial else 999999,
         "max_rows_per_table": TRIAL_MAX_ROWS_PER_TABLE if is_trial else 999999,
@@ -674,7 +673,6 @@ def preview_access_for_device(device_id: str, db: Session = Depends(get_db)):
 
 # ═══════════════════════════════════════════════════════════
 # ROUTE : DEMANDE / RENOUVELLEMENT DE CLÉ
-# ✅ FIX : activated_at + expires_at définis dès la création
 # ═══════════════════════════════════════════════════════════
 @app.post("/api/license/request-key")
 @app.post("/api/license/request-key/")
@@ -691,7 +689,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
         check_rate_limit(clean_device)
 
         def_val, def_unit, def_days_float = _get_default_trial_config(db)
-        def_days = max(1, math.ceil(def_days_float))
 
         existing_device_lic = _find_license_by_device(clean_device, db)
 
@@ -791,7 +788,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
             part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
             new_key = f"{part1}-{part2}-{part3}-{part4}"
 
-            # ✅ FIX : activated_at + expires_at définis dès la création
             new_lic = LicenseKey(
                 key=new_key,
                 phone_number=clean_phone,
@@ -802,13 +798,13 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                 is_trial=True,
                 device_uuid=json.dumps([clean_device]),
                 max_devices=1,
-                duration_days=def_days,
+                duration_days=def_days_float,  # ✅ FLOAT
                 duration_val=def_val,
                 duration_unit=def_unit,
                 created_at=now,
-                activated_at=now,  # ✅ AJOUT
+                activated_at=now,
             )
-            new_lic.expires_at = _compute_expiry(new_lic, from_now=True)  # ✅ AJOUT
+            new_lic.expires_at = _compute_expiry(new_lic, from_now=True)
             db.add(new_lic)
 
             dev_trace.attempts_count = attempts + 1
@@ -840,7 +836,7 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                 "status": "success",
                 "message": "Nouvelle clé d'essai accordée (renouvellement).",
                 "license_key": new_key,
-                "trial_days": def_days,
+                "trial_days": def_days_float,
                 "is_trial": True,
                 "access": access,
             }
@@ -939,7 +935,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
             part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
             license_key = f"{part1}-{part2}-{part3}-{part4}"
 
-            # ✅ FIX : activated_at + expires_at définis dès la création
             new_lic = LicenseKey(
                 key=license_key,
                 phone_number=clean_phone,
@@ -950,13 +945,13 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                 is_trial=True,
                 device_uuid=json.dumps([clean_device]),
                 max_devices=1,
-                duration_days=def_days,
+                duration_days=def_days_float,  # ✅ FLOAT
                 duration_val=def_val,
                 duration_unit=def_unit,
                 created_at=get_utc_now(),
-                activated_at=get_utc_now(),  # ✅ AJOUT
+                activated_at=get_utc_now(),
             )
-            new_lic.expires_at = _compute_expiry(new_lic, from_now=True)  # ✅ AJOUT
+            new_lic.expires_at = _compute_expiry(new_lic, from_now=True)
             db.add(new_lic)
 
             existing_device.attempts_count = attempts_count + 1
@@ -979,7 +974,7 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                 "status": "success",
                 "message": "Nouvel essai accordé.",
                 "license_key": license_key,
-                "trial_days": def_days,
+                "trial_days": def_days_float,
                 "is_trial": True,
                 "access": access,
             }
@@ -1068,7 +1063,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
         part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
         license_key = f"{part1}-{part2}-{part3}-{part4}"
 
-        # ✅ FIX : activated_at + expires_at définis dès la création
         new_lic = LicenseKey(
             key=license_key,
             phone_number=clean_phone,
@@ -1079,13 +1073,13 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
             is_trial=True,
             device_uuid=json.dumps([clean_device]),
             max_devices=1,
-            duration_days=def_days,
+            duration_days=def_days_float,  # ✅ FLOAT
             duration_val=def_val,
             duration_unit=def_unit,
             created_at=get_utc_now(),
-            activated_at=get_utc_now(),  # ✅ AJOUT
+            activated_at=get_utc_now(),
         )
-        new_lic.expires_at = _compute_expiry(new_lic, from_now=True)  # ✅ AJOUT
+        new_lic.expires_at = _compute_expiry(new_lic, from_now=True)
         db.add(new_lic)
         db.commit()
         db.refresh(new_lic)
@@ -1095,7 +1089,7 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
             "status": "success",
             "message": "Clé d'essai générée avec succès !",
             "license_key": license_key,
-            "trial_days": def_days,
+            "trial_days": def_days_float,
             "is_trial": True,
             "access": access,
         }
@@ -1232,7 +1226,7 @@ def get_public_default_trial(db: Session = Depends(get_db)):
     return {
         "duration_val": val,
         "duration_unit": unit,
-        "duration_days": max(1, math.ceil(days)),
+        "duration_days": days,  # ✅ FLOAT
     }
 
 
@@ -1264,7 +1258,7 @@ def get_admin_licenses(db: Session = Depends(get_db)):
                 "organization": str(item.organization or "—"),
                 "used_devices": len(dev_list),
                 "max_devices": item.max_devices if item.max_devices is not None else 1,
-                "duration_days": item.duration_days or DEFAULT_TRIAL_DAYS,
+                "duration_days": float(item.duration_days) if item.duration_days is not None else float(DEFAULT_TRIAL_DAYS),
                 "duration_val": item.duration_val if item.duration_val is not None else DEFAULT_TRIAL_DAYS,
                 "duration_unit": item.duration_unit or DEFAULT_TRIAL_UNIT,
                 "is_active": bool(item.is_active and str(item.device_uuid) != "REVOKED"),
@@ -1285,8 +1279,8 @@ def create_admin_license(req: AdminCreateLicenseRequest, db: Session = Depends(g
         part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
         license_key = f"{part1}-{part2}-{part3}-{part4}"
 
+        # ✅ duration_days = FLOAT exact (pas d'arrondi)
         days_float = _duration_to_days_float(req.duration_val, req.duration_unit)
-        days_int = max(1, math.ceil(days_float))
 
         new_lic = LicenseKey(
             key=license_key,
@@ -1295,7 +1289,7 @@ def create_admin_license(req: AdminCreateLicenseRequest, db: Session = Depends(g
             is_trial=True,
             device_uuid="[]",
             max_devices=req.max_devices,
-            duration_days=days_int,
+            duration_days=days_float,  # ✅ FLOAT
             duration_val=req.duration_val,
             duration_unit=req.duration_unit,
             created_at=get_utc_now()
@@ -1309,7 +1303,7 @@ def create_admin_license(req: AdminCreateLicenseRequest, db: Session = Depends(g
             "phone_number": new_lic.phone_number,
             "duration_val": new_lic.duration_val,
             "duration_unit": new_lic.duration_unit,
-            "duration_days": new_lic.duration_days,
+            "duration_days": float(new_lic.duration_days),
             "is_active": new_lic.is_active,
             "is_trial": new_lic.is_trial
         }
@@ -1341,21 +1335,33 @@ def update_admin_license_full(key: str, req: AdminUpdateLicenseRequest, db: Sess
 
     if req.extend_duration_val is not None and req.extend_duration_val > 0 and req.extend_duration_unit:
         val = int(req.extend_duration_val)
-        new_days = _duration_to_days(val, req.extend_duration_unit)
         mode = (req.duration_mode or "add").lower()
 
         if mode == "replace":
             lic.duration_val = val
             lic.duration_unit = req.extend_duration_unit
-            lic.duration_days = max(1, math.ceil(_duration_to_days_float(val, req.extend_duration_unit)))
+            lic.duration_days = _duration_to_days_float(val, req.extend_duration_unit)  # ✅ FLOAT
         else:
-            total_days = (lic.duration_days or 0) + new_days
-            lic.duration_days = total_days
-            lic.duration_val = total_days
-            lic.duration_unit = "Jours"
+            # ✅ Addition intelligente : si même unité, on additionne les vals
+            if (lic.duration_unit or "").lower() == req.extend_duration_unit.lower():
+                lic.duration_val = (lic.duration_val or 0) + val
+                # duration_unit reste identique
+            else:
+                # Unités différentes : on additionne en jours (float)
+                current_days = float(lic.duration_days or 0)
+                new_days_float = _duration_to_days_float(val, req.extend_duration_unit)
+                total_days = current_days + new_days_float
+                lic.duration_days = total_days
+                # On garde duration_val/unit d'origine (moins précis mais OK)
+            # Recalcule duration_days à partir de duration_val+unit
+            lic.duration_days = _duration_to_days_float(
+                lic.duration_val or 0, lic.duration_unit or "Jours"
+            )
 
-        if lic.activated_at:
-            lic.expires_at = _compute_expiry(lic, from_now=False)
+        # ✅ TOUT changement réinitialise le compteur
+        now = get_utc_now()
+        lic.activated_at = now
+        lic.expires_at = _compute_expiry(lic, from_now=True)
 
     db.commit()
     db.refresh(lic)
@@ -1367,7 +1373,7 @@ def update_admin_license_full(key: str, req: AdminUpdateLicenseRequest, db: Sess
         "max_devices": lic.max_devices,
         "duration_val": lic.duration_val,
         "duration_unit": lic.duration_unit,
-        "duration_days": lic.duration_days,
+        "duration_days": float(lic.duration_days) if lic.duration_days is not None else 0,
         "expires_at": lic.expires_at.isoformat() if lic.expires_at else None
     }
 
@@ -1407,21 +1413,26 @@ def grant_full_access(key: str, req: GrantFullAccessRequest, db: Session = Depen
     if not lic:
         raise HTTPException(404, "Licence introuvable.")
 
-    new_days = _duration_to_days(req.duration_val, req.duration_unit)
     mode = (req.duration_mode or "replace").lower()
 
     lic.is_active = True
     lic.is_trial = False
 
     if mode == "add":
-        total_days = (lic.duration_days or 0) + new_days
-        lic.duration_days = total_days
-        lic.duration_val = total_days
-        lic.duration_unit = "Jours"
+        # ✅ Addition intelligente
+        if (lic.duration_unit or "").lower() == req.duration_unit.lower():
+            lic.duration_val = (lic.duration_val or 0) + req.duration_val
+        else:
+            current_days = float(lic.duration_days or 0)
+            new_days_float = _duration_to_days_float(req.duration_val, req.duration_unit)
+            lic.duration_days = current_days + new_days_float
+        lic.duration_days = _duration_to_days_float(
+            lic.duration_val or 0, lic.duration_unit or "Jours"
+        )
     else:
         lic.duration_val = req.duration_val
         lic.duration_unit = req.duration_unit
-        lic.duration_days = max(1, math.ceil(_duration_to_days_float(req.duration_val, req.duration_unit)))
+        lic.duration_days = _duration_to_days_float(req.duration_val, req.duration_unit)
 
     now = get_utc_now()
     lic.activated_at = now
@@ -1434,13 +1445,13 @@ def grant_full_access(key: str, req: GrantFullAccessRequest, db: Session = Depen
 
     return {
         "status": "success",
-        "message": f"Accès complet accordé ({mode} : {lic.duration_days} jours).",
+        "message": f"Accès complet accordé.",
         "key": lic.key,
         "is_active": lic.is_active,
         "is_trial": lic.is_trial,
         "duration_val": lic.duration_val,
         "duration_unit": lic.duration_unit,
-        "duration_days": lic.duration_days,
+        "duration_days": float(lic.duration_days),
         "expires_at": lic.expires_at.isoformat() if lic.expires_at else None
     }
 
@@ -1452,21 +1463,25 @@ def reset_license_to_trial(key: str, req: ResetToTrialRequest, db: Session = Dep
     if not lic:
         raise HTTPException(404, "Licence introuvable.")
 
-    new_days = _duration_to_days(req.duration_val, req.duration_unit)
     mode = (req.duration_mode or "replace").lower()
 
     lic.is_active = True
     lic.is_trial = True
 
     if mode == "add":
-        total_days = (lic.duration_days or 0) + new_days
-        lic.duration_days = total_days
-        lic.duration_val = total_days
-        lic.duration_unit = "Jours"
+        if (lic.duration_unit or "").lower() == req.duration_unit.lower():
+            lic.duration_val = (lic.duration_val or 0) + req.duration_val
+        else:
+            current_days = float(lic.duration_days or 0)
+            new_days_float = _duration_to_days_float(req.duration_val, req.duration_unit)
+            lic.duration_days = current_days + new_days_float
+        lic.duration_days = _duration_to_days_float(
+            lic.duration_val or 0, lic.duration_unit or "Jours"
+        )
     else:
         lic.duration_val = req.duration_val
         lic.duration_unit = req.duration_unit
-        lic.duration_days = max(1, math.ceil(_duration_to_days_float(req.duration_val, req.duration_unit)))
+        lic.duration_days = _duration_to_days_float(req.duration_val, req.duration_unit)
 
     now = get_utc_now()
     lic.activated_at = now
@@ -1479,13 +1494,13 @@ def reset_license_to_trial(key: str, req: ResetToTrialRequest, db: Session = Dep
 
     return {
         "status": "success",
-        "message": f"Licence remise en essai ({mode} : {lic.duration_days} jours).",
+        "message": f"Licence remise en essai.",
         "key": lic.key,
         "is_active": lic.is_active,
         "is_trial": lic.is_trial,
         "duration_val": lic.duration_val,
         "duration_unit": lic.duration_unit,
-        "duration_days": lic.duration_days,
+        "duration_days": float(lic.duration_days),
         "expires_at": lic.expires_at.isoformat() if lic.expires_at else None
     }
 
@@ -1544,7 +1559,7 @@ def get_default_trial_config(db: Session = Depends(get_db)):
     return {
         "duration_val": val,
         "duration_unit": unit,
-        "duration_days": max(1, math.ceil(days)),
+        "duration_days": days,  # ✅ FLOAT
     }
 
 
@@ -1558,7 +1573,7 @@ def update_default_trial_config(req: DefaultTrialConfigRequest, db: Session = De
         "message": "Configuration par défaut mise à jour.",
         "duration_val": val,
         "duration_unit": unit,
-        "duration_days": max(1, math.ceil(days)),
+        "duration_days": days,
     }
 
 
@@ -1599,8 +1614,7 @@ def _force_trial_to_device(
     db: Session,
 ) -> dict:
     clean_device = dev.device_id.strip().upper()
-    days_float = _duration_to_days_float(duration_val, duration_unit)
-    days = max(1, math.ceil(days_float))
+    days_float = _duration_to_days_float(duration_val, duration_unit)  # ✅ FLOAT
     now = get_utc_now()
 
     existing_lic = _find_license_by_device(clean_device, db)
@@ -1610,7 +1624,7 @@ def _force_trial_to_device(
         existing_lic.is_trial = True
         existing_lic.duration_val = duration_val
         existing_lic.duration_unit = duration_unit
-        existing_lic.duration_days = days
+        existing_lic.duration_days = days_float
         existing_lic.activated_at = now
         existing_lic.expires_at = _compute_expiry(existing_lic, from_now=True)
         existing_lic.device_uuid = json.dumps([clean_device])
@@ -1627,7 +1641,7 @@ def _force_trial_to_device(
             is_trial=True,
             device_uuid=json.dumps([clean_device]),
             max_devices=1,
-            duration_days=days,
+            duration_days=days_float,  # ✅ FLOAT
             duration_val=duration_val,
             duration_unit=duration_unit,
             created_at=now,
@@ -1651,7 +1665,7 @@ def _force_trial_to_device(
         "expires_at": lic.expires_at.isoformat() if lic.expires_at else None,
         "duration_val": duration_val,
         "duration_unit": duration_unit,
-        "duration_days": days,
+        "duration_days": float(days_float),
     }
 
 
@@ -1662,8 +1676,7 @@ def _grant_full_access_to_device(
     db: Session,
 ) -> dict:
     clean_device = dev.device_id.strip().upper()
-    days_float = _duration_to_days_float(duration_val, duration_unit)
-    days = max(1, math.ceil(days_float))
+    days_float = _duration_to_days_float(duration_val, duration_unit)  # ✅ FLOAT
     now = get_utc_now()
 
     existing_lic = _find_license_by_device(clean_device, db)
@@ -1673,7 +1686,7 @@ def _grant_full_access_to_device(
         existing_lic.is_trial = False
         existing_lic.duration_val = duration_val
         existing_lic.duration_unit = duration_unit
-        existing_lic.duration_days = days
+        existing_lic.duration_days = days_float
         existing_lic.activated_at = now
         existing_lic.expires_at = _compute_expiry(existing_lic, from_now=True)
         existing_lic.device_uuid = json.dumps([clean_device])
@@ -1690,7 +1703,7 @@ def _grant_full_access_to_device(
             is_trial=False,
             device_uuid=json.dumps([clean_device]),
             max_devices=1,
-            duration_days=days,
+            duration_days=days_float,  # ✅ FLOAT
             duration_val=duration_val,
             duration_unit=duration_unit,
             created_at=now,
@@ -1714,7 +1727,7 @@ def _grant_full_access_to_device(
         "expires_at": lic.expires_at.isoformat() if lic.expires_at else None,
         "duration_val": duration_val,
         "duration_unit": duration_unit,
-        "duration_days": days,
+        "duration_days": float(days_float),
     }
 
 
