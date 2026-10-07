@@ -1,6 +1,16 @@
+# main.py
+# ═══════════════════════════════════════════════════════════
+#  SmartCollect — Backend API & Admin Server
+#  ✅ FastAPI + SQLAlchemy + PostgreSQL
+#  ✅ Licence WhatsApp + Essai 1/appareil
+#  ✅ NOUVEAU : Plans tarifaires (Basic / Pro / Business)
+#  ✅ NOUVEAU : /api/plans public
+#  ✅ NOUVEAU : set-plan admin
+#  ✅ NOUVEAU : upgrade via Play Store (receipt validation basique)
+# ═══════════════════════════════════════════════════════════
+
 import os
 import json
-import math
 import secrets
 import time
 import traceback
@@ -123,7 +133,6 @@ def check_rate_limit(identifier: str):
 
 # ═══════════════════════════════════════════════════════════
 # MODÈLES SQLALCHEMY
-# ✅ duration_days devient Float (garde les vraies valeurs)
 # ═══════════════════════════════════════════════════════════
 class LicenseKey(Base):
     __tablename__ = "licenses"
@@ -138,12 +147,16 @@ class LicenseKey(Base):
     is_trial = Column(Boolean, default=True)
     device_uuid = Column(Text, default="[]")
     max_devices = Column(Integer, default=1)
-    duration_days = Column(Float, default=DEFAULT_TRIAL_DAYS)  # ✅ FLOAT
+    duration_days = Column(Float, default=DEFAULT_TRIAL_DAYS)
     duration_val = Column(Integer, default=DEFAULT_TRIAL_DAYS)
     duration_unit = Column(String(20), default=DEFAULT_TRIAL_UNIT)
     created_at = Column(DateTime, default=get_utc_now)
     activated_at = Column(DateTime, nullable=True)
     expires_at = Column(DateTime, nullable=True)
+    # ✅ NOUVEAU : plan & facturation
+    plan_code = Column(String(20), default="trial")  # trial / basic / pro / business
+    is_yearly = Column(Boolean, default=False)
+    purchase_token = Column(Text, nullable=True)  # Google Play receipt
 
 
 class DeviceAttempt(Base):
@@ -185,9 +198,33 @@ class AppConfig(Base):
     updated_at = Column(DateTime, default=get_utc_now, onupdate=get_utc_now)
 
 
+# ✅ NOUVEAU : Plans tarifaires configurables
+class LicensePlan(Base):
+    __tablename__ = "license_plans"
+
+    id = Column(Integer, primary_key=True)
+    code = Column(String(20), unique=True, index=True, nullable=False)
+    name = Column(String(100), nullable=False)
+    description = Column(String(255), default="")
+    price_monthly_usd = Column(Float, default=5.0)
+    price_yearly_usd = Column(Float, default=40.0)
+    max_tables = Column(Integer, default=3)
+    max_rows_per_table = Column(Integer, default=500)
+    allow_export = Column(Boolean, default=True)
+    allow_cloud_backup = Column(Boolean, default=False)
+    allow_bulk_export = Column(Boolean, default=False)
+    allow_merge_tables = Column(Boolean, default=False)
+    allow_custom_branding = Column(Boolean, default=False)
+    allow_reminders = Column(Boolean, default=False)
+    max_devices = Column(Integer, default=1)
+    is_active = Column(Boolean, default=True)
+    display_order = Column(Integer, default=0)
+    created_at = Column(DateTime, default=get_utc_now)
+    updated_at = Column(DateTime, default=get_utc_now, onupdate=get_utc_now)
+
+
 # ═══════════════════════════════════════════════════════════
 # MIGRATIONS
-# ✅ ALTER duration_days INTEGER → DOUBLE PRECISION
 # ═══════════════════════════════════════════════════════════
 print("[startup] Début des migrations...")
 
@@ -201,7 +238,6 @@ migrations = [
     ("ADD duration_val", "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS duration_val INTEGER DEFAULT 7"),
     ("ADD duration_unit", "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS duration_unit VARCHAR(20) DEFAULT 'Jours'"),
     ("ADD is_trial", "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS is_trial BOOLEAN DEFAULT TRUE"),
-    # ✅ Migration clé : duration_days → DOUBLE PRECISION
     ("ALTER duration_days to DOUBLE PRECISION",
      "ALTER TABLE licenses ALTER COLUMN duration_days TYPE DOUBLE PRECISION USING duration_days::double precision"),
     ("SET duration_days default", f"ALTER TABLE licenses ALTER COLUMN duration_days SET DEFAULT {DEFAULT_TRIAL_DAYS}"),
@@ -211,6 +247,13 @@ migrations = [
     ("ADD index device_attempts.phone",
      "CREATE INDEX IF NOT EXISTS ix_device_attempts_phone "
      "ON device_attempts (phone_number)"),
+    # ✅ NOUVELLES colonnes pour les plans
+    ("ADD licenses.plan_code",
+     "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS plan_code VARCHAR(20) DEFAULT 'trial'"),
+    ("ADD licenses.is_yearly",
+     "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS is_yearly BOOLEAN DEFAULT FALSE"),
+    ("ADD licenses.purchase_token",
+     "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS purchase_token TEXT"),
     ("NORMALIZE all devices quota to 1",
      "UPDATE device_attempts SET max_attempts_allowed = 1 "
      "WHERE admin_unblocked = FALSE "
@@ -254,6 +297,98 @@ try:
     print("[startup] Tables créées/vérifiées.")
 except Exception as e:
     print(f"[startup] Erreur create_all : {e}")
+
+
+# ═══════════════════════════════════════════════════════════
+# SEED DES PLANS PAR DÉFAUT
+# ═══════════════════════════════════════════════════════════
+def _seed_default_plans():
+    db = SessionLocal()
+    try:
+        defaults = [
+            {
+                "code": "trial",
+                "name": "Essai",
+                "description": "Essai gratuit 7 jours - 1 tableau, 50 lignes",
+                "price_monthly_usd": 0.0,
+                "price_yearly_usd": 0.0,
+                "max_tables": 1,
+                "max_rows_per_table": 50,
+                "allow_export": False,
+                "allow_cloud_backup": False,
+                "allow_bulk_export": False,
+                "allow_merge_tables": False,
+                "allow_custom_branding": False,
+                "allow_reminders": False,
+                "max_devices": 1,
+                "display_order": 0,
+            },
+            {
+                "code": "basic",
+                "name": "Basic",
+                "description": "Pour les indépendants - 3 tableaux, 500 lignes, exports",
+                "price_monthly_usd": 5.0,
+                "price_yearly_usd": 40.0,
+                "max_tables": 3,
+                "max_rows_per_table": 500,
+                "allow_export": True,
+                "allow_cloud_backup": False,
+                "allow_bulk_export": False,
+                "allow_merge_tables": False,
+                "allow_custom_branding": False,
+                "allow_reminders": False,
+                "max_devices": 1,
+                "display_order": 1,
+            },
+            {
+                "code": "pro",
+                "name": "Pro",
+                "description": "Pour les PME - Illimité + publipostage + cloud",
+                "price_monthly_usd": 10.0,
+                "price_yearly_usd": 80.0,
+                "max_tables": 999999,
+                "max_rows_per_table": 999999,
+                "allow_export": True,
+                "allow_cloud_backup": True,
+                "allow_bulk_export": True,
+                "allow_merge_tables": True,
+                "allow_custom_branding": True,
+                "allow_reminders": True,
+                "max_devices": 2,
+                "display_order": 2,
+            },
+            {
+                "code": "business",
+                "name": "Business",
+                "description": "Pour les organisations - Multi-appareils + support",
+                "price_monthly_usd": 25.0,
+                "price_yearly_usd": 200.0,
+                "max_tables": 999999,
+                "max_rows_per_table": 999999,
+                "allow_export": True,
+                "allow_cloud_backup": True,
+                "allow_bulk_export": True,
+                "allow_merge_tables": True,
+                "allow_custom_branding": True,
+                "allow_reminders": True,
+                "max_devices": 5,
+                "display_order": 3,
+            },
+        ]
+        for p in defaults:
+            existing = db.query(LicensePlan).filter(LicensePlan.code == p["code"]).first()
+            if not existing:
+                db.add(LicensePlan(**p))
+        db.commit()
+        print("[seed] Plans par défaut OK")
+    except Exception as e:
+        print(f"[seed] Erreur : {e}")
+        db.rollback()
+    finally:
+        db.close()
+
+
+_seed_default_plans()
 
 print("[startup] Migrations terminées.")
 
@@ -305,6 +440,7 @@ class AdminCreateLicenseRequest(BaseModel):
     duration_unit: str = Field(..., max_length=20)
     max_devices: int = Field(1, ge=1, le=50)
     is_active: Optional[bool] = False
+    plan_code: Optional[str] = Field("trial", pattern="^(trial|basic|pro|business)$")
 
 
 class AdminUpdateLicenseRequest(BaseModel):
@@ -316,6 +452,40 @@ class AdminUpdateLicenseRequest(BaseModel):
     extend_duration_val: Optional[int] = Field(None, ge=0, le=9999)
     extend_duration_unit: Optional[str] = None
     duration_mode: Optional[str] = Field("add", pattern="^(add|replace)$")
+
+
+class SetPlanRequest(BaseModel):
+    plan_code: str = Field(..., pattern="^(trial|basic|pro|business)$")
+    is_yearly: bool = False
+    duration_val: int = Field(..., ge=1, le=9999)
+    duration_unit: str = Field(..., max_length=20)
+    reset_expiry: bool = True
+
+
+class UpdatePlanRequest(BaseModel):
+    name: Optional[str] = Field(None, max_length=100)
+    description: Optional[str] = Field(None, max_length=255)
+    price_monthly_usd: Optional[float] = Field(None, ge=0)
+    price_yearly_usd: Optional[float] = Field(None, ge=0)
+    max_tables: Optional[int] = Field(None, ge=1)
+    max_rows_per_table: Optional[int] = Field(None, ge=1)
+    allow_export: Optional[bool] = None
+    allow_cloud_backup: Optional[bool] = None
+    allow_bulk_export: Optional[bool] = None
+    allow_merge_tables: Optional[bool] = None
+    allow_custom_branding: Optional[bool] = None
+    allow_reminders: Optional[bool] = None
+    max_devices: Optional[int] = Field(None, ge=1, le=50)
+    is_active: Optional[bool] = None
+    display_order: Optional[int] = Field(None, ge=0)
+
+
+class UpgradeLicenseRequest(BaseModel):
+    key: str = Field(..., min_length=8, max_length=32)
+    device_id: str = Field(..., min_length=8, max_length=255)
+    plan_code: str = Field(..., pattern="^(basic|pro|business)$")
+    is_yearly: bool = False
+    purchase_token: Optional[str] = None
 
 
 class NewsCreateRequest(BaseModel):
@@ -356,7 +526,7 @@ class DefaultTrialConfigRequest(BaseModel):
 
 
 # ═══════════════════════════════════════════════════════════
-# ✅ HELPERS DURÉE — CONVERSIONS EXACTES
+# HELPERS DURÉE
 # ═══════════════════════════════════════════════════════════
 def _duration_to_days_float(val: int, unit: str) -> float:
     u = (unit or "").lower().strip()
@@ -400,7 +570,7 @@ def _compute_expiry(lic: "LicenseKey", from_now: bool = True) -> datetime:
 
 
 # ═══════════════════════════════════════════════════════════
-# ✅ HELPERS CONFIG DYNAMIQUE (table app_config)
+# HELPERS CONFIG DYNAMIQUE
 # ═══════════════════════════════════════════════════════════
 def _get_default_trial_config(db: Session) -> tuple:
     defaults = {
@@ -508,9 +678,10 @@ def _update_license_user_info(lic: LicenseKey, req, changed_log: list):
 
 
 # ═══════════════════════════════════════════════════════════
-# ✅ _build_access_payload — duration_days = FLOAT exact
+# ✅ NOUVEAU : _build_access_payload enrichi avec plan
 # ═══════════════════════════════════════════════════════════
 def _build_access_payload(lic: Optional[LicenseKey], db: Optional[Session] = None) -> dict:
+    # ─── CAS ESSAI / PAS DE LICENCE ───
     if lic is None:
         if db is not None:
             val, unit, days_float = _get_default_trial_config(db)
@@ -523,17 +694,28 @@ def _build_access_payload(lic: Optional[LicenseKey], db: Optional[Session] = Non
         return {
             "mode": "trial",
             "is_trial": True,
+            "plan_code": "trial",
+            "plan_name": "Essai",
             "duration_val": val,
             "duration_unit": unit,
-            "duration_days": days_float,  # ✅ FLOAT exact
+            "duration_days": days_float,
             "duration_seconds": int(delta.total_seconds()),
             "max_tables": TRIAL_MAX_TABLES,
             "max_rows_per_table": TRIAL_MAX_ROWS_PER_TABLE,
             "allow_export": TRIAL_ALLOW_EXPORT,
+            "allow_cloud_backup": False,
+            "allow_bulk_export": False,
+            "allow_merge_tables": False,
+            "allow_custom_branding": False,
+            "allow_reminders": False,
+            "max_devices": 1,
         }
 
+    # ─── CAS LICENCE EXISTANTE ───
     is_trial = bool(lic.is_trial)
-    mode = "trial" if is_trial else "full"
+    plan_code = getattr(lic, "plan_code", "trial") or ("trial" if is_trial else "pro")
+    if is_trial:
+        plan_code = "trial"
 
     dur_val = lic.duration_val if lic.duration_val is not None else DEFAULT_TRIAL_DAYS
     dur_unit = lic.duration_unit or DEFAULT_TRIAL_UNIT
@@ -542,16 +724,51 @@ def _build_access_payload(lic: Optional[LicenseKey], db: Optional[Session] = Non
     delta = _duration_to_timedelta(dur_val, dur_unit)
     duration_seconds = int(delta.total_seconds())
 
+    # Récupérer les limites du plan en DB
+    plan = None
+    if db is not None:
+        plan = db.query(LicensePlan).filter(LicensePlan.code == plan_code).first()
+
+    if plan:
+        return {
+            "mode": "trial" if is_trial else "full",
+            "is_trial": is_trial,
+            "plan_code": plan.code,
+            "plan_name": plan.name,
+            "duration_val": dur_val,
+            "duration_unit": dur_unit,
+            "duration_days": float(dur_days),
+            "duration_seconds": duration_seconds,
+            "max_tables": plan.max_tables,
+            "max_rows_per_table": plan.max_rows_per_table,
+            "allow_export": plan.allow_export,
+            "allow_cloud_backup": plan.allow_cloud_backup,
+            "allow_bulk_export": plan.allow_bulk_export,
+            "allow_merge_tables": plan.allow_merge_tables,
+            "allow_custom_branding": plan.allow_custom_branding,
+            "allow_reminders": plan.allow_reminders,
+            "max_devices": plan.max_devices,
+        }
+
+    # Fallback si plan introuvable
     return {
-        "mode": mode,
+        "mode": "trial" if is_trial else "full",
         "is_trial": is_trial,
+        "plan_code": plan_code,
+        "plan_name": plan_code.capitalize(),
         "duration_val": dur_val,
         "duration_unit": dur_unit,
-        "duration_days": float(dur_days),  # ✅ FLOAT exact
+        "duration_days": float(dur_days),
         "duration_seconds": duration_seconds,
         "max_tables": TRIAL_MAX_TABLES if is_trial else 999999,
         "max_rows_per_table": TRIAL_MAX_ROWS_PER_TABLE if is_trial else 999999,
         "allow_export": (not is_trial) or TRIAL_ALLOW_EXPORT,
+        "allow_cloud_backup": not is_trial,
+        "allow_bulk_export": not is_trial,
+        "allow_merge_tables": not is_trial,
+        "allow_custom_branding": not is_trial,
+        "allow_reminders": not is_trial,
+        "max_devices": 1,
     }
 
 
@@ -575,6 +792,47 @@ def home():
 @app.get("/health")
 def health():
     return {"status": "healthy"}
+
+
+# ═══════════════════════════════════════════════════════════
+# ✅ NOUVEAU : /api/plans (public)
+# ═══════════════════════════════════════════════════════════
+@app.get("/api/plans")
+@app.get("/api/plans/")
+def get_public_plans(db: Session = Depends(get_db)):
+    """Retourne les plans disponibles avec tarifs et limites."""
+    plans = (
+        db.query(LicensePlan)
+        .filter(LicensePlan.is_active == True)
+        .order_by(LicensePlan.display_order.asc())
+        .all()
+    )
+
+    result = []
+    for p in plans:
+        full_year = float(p.price_monthly_usd or 0) * 12
+        discount = 0.0
+        if full_year > 0 and p.price_yearly_usd:
+            discount = round((1 - (p.price_yearly_usd / full_year)) * 100, 1)
+
+        result.append({
+            "code": p.code,
+            "name": p.name,
+            "description": p.description or "",
+            "price_monthly_usd": float(p.price_monthly_usd or 0),
+            "price_yearly_usd": float(p.price_yearly_usd or 0),
+            "discount_yearly_pct": max(0.0, discount),
+            "max_tables": p.max_tables,
+            "max_rows_per_table": p.max_rows_per_table,
+            "allow_export": bool(p.allow_export),
+            "allow_cloud_backup": bool(p.allow_cloud_backup),
+            "allow_bulk_export": bool(p.allow_bulk_export),
+            "allow_merge_tables": bool(p.allow_merge_tables),
+            "allow_custom_branding": bool(p.allow_custom_branding),
+            "allow_reminders": bool(p.allow_reminders),
+            "max_devices": p.max_devices,
+        })
+    return result
 
 
 # ═══════════════════════════════════════════════════════════
@@ -796,9 +1054,11 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                 organization=(req.organization or "").strip(),
                 is_active=True,
                 is_trial=True,
+                plan_code="trial",
+                is_yearly=False,
                 device_uuid=json.dumps([clean_device]),
                 max_devices=1,
-                duration_days=def_days_float,  # ✅ FLOAT
+                duration_days=def_days_float,
                 duration_val=def_val,
                 duration_unit=def_unit,
                 created_at=now,
@@ -841,6 +1101,7 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                 "access": access,
             }
 
+        # ─── NOUVELLE DEMANDE ───
         admin_lic = db.query(LicenseKey).filter(
             LicenseKey.phone_number == clean_phone,
             LicenseKey.is_active == True,
@@ -943,9 +1204,11 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                 organization=(req.organization or "").strip(),
                 is_active=True,
                 is_trial=True,
+                plan_code="trial",
+                is_yearly=False,
                 device_uuid=json.dumps([clean_device]),
                 max_devices=1,
-                duration_days=def_days_float,  # ✅ FLOAT
+                duration_days=def_days_float,
                 duration_val=def_val,
                 duration_unit=def_unit,
                 created_at=get_utc_now(),
@@ -1044,6 +1307,7 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                     "d'appareils est atteinte. Contactez l'administrateur."
                 )
 
+        # ─── CRÉATION NOUVELLE LICENCE ESSAI ───
         new_attempt = DeviceAttempt(
             device_id=clean_device,
             phone_number=clean_phone,
@@ -1071,9 +1335,11 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
             organization=(req.organization or "").strip(),
             is_active=True,
             is_trial=True,
+            plan_code="trial",
+            is_yearly=False,
             device_uuid=json.dumps([clean_device]),
             max_devices=1,
-            duration_days=def_days_float,  # ✅ FLOAT
+            duration_days=def_days_float,
             duration_val=def_val,
             duration_unit=def_unit,
             created_at=get_utc_now(),
@@ -1200,11 +1466,19 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
             "phone_number": license_entry.phone_number or "",
             "expires_at": license_entry.expires_at.strftime("%Y-%m-%d %H:%M:%S") if license_entry.expires_at else None,
             "is_trial": bool(license_entry.is_trial),
+            "plan_code": access.get("plan_code", "trial"),
+            "plan_name": access.get("plan_name", "Essai"),
             "access": access,
             "limits": {
                 "max_tables": access["max_tables"],
                 "max_rows_per_table": access["max_rows_per_table"],
                 "allow_export": access["allow_export"],
+                "allow_cloud_backup": access.get("allow_cloud_backup", False),
+                "allow_bulk_export": access.get("allow_bulk_export", False),
+                "allow_merge_tables": access.get("allow_merge_tables", False),
+                "allow_custom_branding": access.get("allow_custom_branding", False),
+                "allow_reminders": access.get("allow_reminders", False),
+                "max_devices": access.get("max_devices", 1),
             },
         }
 
@@ -1217,7 +1491,120 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
 
 
 # ═══════════════════════════════════════════════════════════
-# ✅ ROUTE : CONFIG DURÉE PAR DÉFAUT (PUBLIQUE)
+# ✅ NOUVEAU : UPGRADE via Google Play (achat utilisateur)
+# ═══════════════════════════════════════════════════════════
+@app.post("/api/license/upgrade")
+@app.post("/api/license/upgrade/")
+def upgrade_license(req: UpgradeLicenseRequest, db: Session = Depends(get_db)):
+    """
+    Appelé par l'app Flutter après un achat Play Store réussi.
+    Met à jour la licence avec le nouveau plan + prolonge l'expiration.
+    """
+    try:
+        clean_key = req.key.strip().upper()
+        clean_device = req.device_id.strip().upper()
+
+        license_entry = db.query(LicenseKey).filter(LicenseKey.key == clean_key).first()
+        if not license_entry:
+            # Créer une nouvelle licence directement avec le plan acheté
+            part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
+            new_key = f"{part1}-{part2}-{part3}-{part4}"
+            license_entry = LicenseKey(
+                key=new_key,
+                phone_number="",
+                is_active=True,
+                is_trial=False,
+                plan_code=req.plan_code,
+                is_yearly=req.is_yearly,
+                purchase_token=req.purchase_token,
+                device_uuid=json.dumps([clean_device]),
+                max_devices=1,
+                duration_val=30 if not req.is_yearly else 365,
+                duration_unit="Jours",
+                duration_days=30.0 if not req.is_yearly else 365.0,
+                created_at=get_utc_now(),
+                activated_at=get_utc_now(),
+            )
+            license_entry.expires_at = _compute_expiry(license_entry, from_now=True)
+            db.add(license_entry)
+            db.commit()
+            db.refresh(license_entry)
+        else:
+            # Mettre à jour la licence existante
+            plan = db.query(LicensePlan).filter(LicensePlan.code == req.plan_code).first()
+            if not plan:
+                raise HTTPException(404, f"Plan '{req.plan_code}' introuvable.")
+
+            license_entry.plan_code = req.plan_code
+            license_entry.is_yearly = req.is_yearly
+            license_entry.is_trial = False
+            license_entry.is_active = True
+            license_entry.purchase_token = req.purchase_token
+
+            # Durée : 30j mensuel, 365j annuel
+            license_entry.duration_val = 30 if not req.is_yearly else 365
+            license_entry.duration_unit = "Jours"
+            license_entry.duration_days = float(license_entry.duration_val)
+            license_entry.max_devices = plan.max_devices
+
+            # Ajouter les devices déjà liés
+            try:
+                devices = json.loads(license_entry.device_uuid or "[]")
+            except Exception:
+                devices = []
+            if clean_device not in devices:
+                devices.append(clean_device)
+            license_entry.device_uuid = json.dumps(devices)
+
+            now = get_utc_now()
+            license_entry.activated_at = now
+            license_entry.expires_at = _compute_expiry(license_entry, from_now=True)
+
+            # Débloquer le device associé
+            dev = db.query(DeviceAttempt).filter(
+                DeviceAttempt.device_id == clean_device
+            ).first()
+            if dev:
+                dev.is_blocked = False
+                dev.block_reason = ""
+                dev.admin_unblocked = True
+                dev.admin_unblocked_at = now
+
+            db.commit()
+            db.refresh(license_entry)
+
+        access = _build_access_payload(license_entry, db=db)
+        return {
+            "status": "success",
+            "message": f"Plan {req.plan_code} activé.",
+            "license_key": license_entry.key,
+            "plan_code": license_entry.plan_code,
+            "is_yearly": license_entry.is_yearly,
+            "expires_at": license_entry.expires_at.isoformat() if license_entry.expires_at else None,
+            "access": access,
+            "limits": {
+                "max_tables": access["max_tables"],
+                "max_rows_per_table": access["max_rows_per_table"],
+                "allow_export": access["allow_export"],
+                "allow_cloud_backup": access.get("allow_cloud_backup", False),
+                "allow_bulk_export": access.get("allow_bulk_export", False),
+                "allow_merge_tables": access.get("allow_merge_tables", False),
+                "allow_custom_branding": access.get("allow_custom_branding", False),
+                "allow_reminders": access.get("allow_reminders", False),
+                "max_devices": access.get("max_devices", 1),
+            },
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        print(f"[UPGRADE ERROR] {traceback.format_exc()}")
+        raise HTTPException(500, f"Erreur DB: {str(e)}")
+
+
+# ═══════════════════════════════════════════════════════════
+# ROUTE : CONFIG DURÉE PAR DÉFAUT (PUBLIQUE)
 # ═══════════════════════════════════════════════════════════
 @app.get("/api/config/default-trial")
 @app.get("/api/config/default-trial/")
@@ -1226,7 +1613,7 @@ def get_public_default_trial(db: Session = Depends(get_db)):
     return {
         "duration_val": val,
         "duration_unit": unit,
-        "duration_days": days,  # ✅ FLOAT
+        "duration_days": days,
     }
 
 
@@ -1263,8 +1650,10 @@ def get_admin_licenses(db: Session = Depends(get_db)):
                 "duration_unit": item.duration_unit or DEFAULT_TRIAL_UNIT,
                 "is_active": bool(item.is_active and str(item.device_uuid) != "REVOKED"),
                 "is_trial": bool(item.is_trial),
+                "plan_code": item.plan_code or ("trial" if item.is_trial else "pro"),
+                "is_yearly": bool(item.is_yearly),
                 "created_at": item.created_at.isoformat() if item.created_at else "",
-                "expires_at": item.expires_at.isoformat() if item.expires_at else None
+                "expires_at": item.expires_at.isoformat() if item.expires_at else None,
             })
         return results
     except Exception as err:
@@ -1279,21 +1668,27 @@ def create_admin_license(req: AdminCreateLicenseRequest, db: Session = Depends(g
         part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
         license_key = f"{part1}-{part2}-{part3}-{part4}"
 
-        # ✅ duration_days = FLOAT exact (pas d'arrondi)
         days_float = _duration_to_days_float(req.duration_val, req.duration_unit)
+
+        plan = db.query(LicensePlan).filter(LicensePlan.code == req.plan_code).first()
+        is_trial = req.plan_code == "trial"
 
         new_lic = LicenseKey(
             key=license_key,
             phone_number=req.phone_number.strip().replace(" ", ""),
             is_active=bool(req.is_active) if req.is_active is not None else False,
-            is_trial=True,
+            is_trial=is_trial,
+            plan_code=req.plan_code,
+            is_yearly=False,
             device_uuid="[]",
             max_devices=req.max_devices,
-            duration_days=days_float,  # ✅ FLOAT
+            duration_days=days_float,
             duration_val=req.duration_val,
             duration_unit=req.duration_unit,
             created_at=get_utc_now()
         )
+        if plan:
+            new_lic.max_devices = plan.max_devices
         db.add(new_lic)
         db.commit()
         db.refresh(new_lic)
@@ -1305,7 +1700,8 @@ def create_admin_license(req: AdminCreateLicenseRequest, db: Session = Depends(g
             "duration_unit": new_lic.duration_unit,
             "duration_days": float(new_lic.duration_days),
             "is_active": new_lic.is_active,
-            "is_trial": new_lic.is_trial
+            "is_trial": new_lic.is_trial,
+            "plan_code": new_lic.plan_code,
         }
     except Exception as e:
         db.rollback()
@@ -1340,25 +1736,18 @@ def update_admin_license_full(key: str, req: AdminUpdateLicenseRequest, db: Sess
         if mode == "replace":
             lic.duration_val = val
             lic.duration_unit = req.extend_duration_unit
-            lic.duration_days = _duration_to_days_float(val, req.extend_duration_unit)  # ✅ FLOAT
+            lic.duration_days = _duration_to_days_float(val, req.extend_duration_unit)
         else:
-            # ✅ Addition intelligente : si même unité, on additionne les vals
             if (lic.duration_unit or "").lower() == req.extend_duration_unit.lower():
                 lic.duration_val = (lic.duration_val or 0) + val
-                # duration_unit reste identique
             else:
-                # Unités différentes : on additionne en jours (float)
                 current_days = float(lic.duration_days or 0)
                 new_days_float = _duration_to_days_float(val, req.extend_duration_unit)
-                total_days = current_days + new_days_float
-                lic.duration_days = total_days
-                # On garde duration_val/unit d'origine (moins précis mais OK)
-            # Recalcule duration_days à partir de duration_val+unit
+                lic.duration_days = current_days + new_days_float
             lic.duration_days = _duration_to_days_float(
                 lic.duration_val or 0, lic.duration_unit or "Jours"
             )
 
-        # ✅ TOUT changement réinitialise le compteur
         now = get_utc_now()
         lic.activated_at = now
         lic.expires_at = _compute_expiry(lic, from_now=True)
@@ -1374,7 +1763,8 @@ def update_admin_license_full(key: str, req: AdminUpdateLicenseRequest, db: Sess
         "duration_val": lic.duration_val,
         "duration_unit": lic.duration_unit,
         "duration_days": float(lic.duration_days) if lic.duration_days is not None else 0,
-        "expires_at": lic.expires_at.isoformat() if lic.expires_at else None
+        "expires_at": lic.expires_at.isoformat() if lic.expires_at else None,
+        "plan_code": lic.plan_code,
     }
 
 
@@ -1417,9 +1807,10 @@ def grant_full_access(key: str, req: GrantFullAccessRequest, db: Session = Depen
 
     lic.is_active = True
     lic.is_trial = False
+    if not lic.plan_code or lic.plan_code == "trial":
+        lic.plan_code = "pro"
 
     if mode == "add":
-        # ✅ Addition intelligente
         if (lic.duration_unit or "").lower() == req.duration_unit.lower():
             lic.duration_val = (lic.duration_val or 0) + req.duration_val
         else:
@@ -1449,6 +1840,7 @@ def grant_full_access(key: str, req: GrantFullAccessRequest, db: Session = Depen
         "key": lic.key,
         "is_active": lic.is_active,
         "is_trial": lic.is_trial,
+        "plan_code": lic.plan_code,
         "duration_val": lic.duration_val,
         "duration_unit": lic.duration_unit,
         "duration_days": float(lic.duration_days),
@@ -1467,6 +1859,7 @@ def reset_license_to_trial(key: str, req: ResetToTrialRequest, db: Session = Dep
 
     lic.is_active = True
     lic.is_trial = True
+    lic.plan_code = "trial"
 
     if mode == "add":
         if (lic.duration_unit or "").lower() == req.duration_unit.lower():
@@ -1502,6 +1895,51 @@ def reset_license_to_trial(key: str, req: ResetToTrialRequest, db: Session = Dep
         "duration_unit": lic.duration_unit,
         "duration_days": float(lic.duration_days),
         "expires_at": lic.expires_at.isoformat() if lic.expires_at else None
+    }
+
+
+# ✅ NOUVEAU : Définir un plan explicitement
+@app.post("/api/admin/licenses/{key}/set-plan", dependencies=[Depends(require_admin_key)])
+@app.post("/api/admin/licenses/{key}/set-plan/", dependencies=[Depends(require_admin_key)])
+def admin_set_license_plan(key: str, req: SetPlanRequest, db: Session = Depends(get_db)):
+    lic = db.query(LicenseKey).filter(LicenseKey.key == key.strip().upper()).first()
+    if not lic:
+        raise HTTPException(404, "Licence introuvable.")
+
+    plan = db.query(LicensePlan).filter(LicensePlan.code == req.plan_code).first()
+    if not plan:
+        raise HTTPException(404, f"Plan '{req.plan_code}' introuvable.")
+
+    lic.plan_code = req.plan_code
+    lic.is_yearly = req.is_yearly
+    lic.is_trial = (req.plan_code == "trial")
+    lic.is_active = True
+    lic.duration_val = req.duration_val
+    lic.duration_unit = req.duration_unit
+    lic.duration_days = _duration_to_days_float(req.duration_val, req.duration_unit)
+    lic.max_devices = plan.max_devices
+
+    if req.reset_expiry:
+        now = get_utc_now()
+        lic.activated_at = now
+        lic.expires_at = _compute_expiry(lic, from_now=True)
+
+    _unblock_associated_devices(lic, db)
+
+    db.commit()
+    db.refresh(lic)
+
+    return {
+        "status": "success",
+        "message": f"Plan '{req.plan_code}' appliqué à la licence.",
+        "key": lic.key,
+        "plan_code": lic.plan_code,
+        "is_yearly": lic.is_yearly,
+        "is_trial": lic.is_trial,
+        "max_devices": lic.max_devices,
+        "duration_val": lic.duration_val,
+        "duration_unit": lic.duration_unit,
+        "expires_at": lic.expires_at.isoformat() if lic.expires_at else None,
     }
 
 
@@ -1550,7 +1988,65 @@ def delete_admin_license(key: str, db: Session = Depends(get_db)):
 
 
 # ═══════════════════════════════════════════════════════════
-# ✅ ROUTES ADMIN — CONFIG DURÉE PAR DÉFAUT (DYNAMIQUE)
+# ✅ NOUVEAU : ROUTES ADMIN — PLANS
+# ═══════════════════════════════════════════════════════════
+@app.get("/api/admin/plans", dependencies=[Depends(require_admin_key)])
+@app.get("/api/admin/plans/", dependencies=[Depends(require_admin_key)])
+def admin_get_plans(db: Session = Depends(get_db)):
+    plans = db.query(LicensePlan).order_by(LicensePlan.display_order.asc()).all()
+    return [
+        {
+            "id": p.id,
+            "code": p.code,
+            "name": p.name,
+            "description": p.description or "",
+            "price_monthly_usd": float(p.price_monthly_usd or 0),
+            "price_yearly_usd": float(p.price_yearly_usd or 0),
+            "max_tables": p.max_tables,
+            "max_rows_per_table": p.max_rows_per_table,
+            "allow_export": bool(p.allow_export),
+            "allow_cloud_backup": bool(p.allow_cloud_backup),
+            "allow_bulk_export": bool(p.allow_bulk_export),
+            "allow_merge_tables": bool(p.allow_merge_tables),
+            "allow_custom_branding": bool(p.allow_custom_branding),
+            "allow_reminders": bool(p.allow_reminders),
+            "max_devices": p.max_devices,
+            "is_active": bool(p.is_active),
+            "display_order": p.display_order,
+        }
+        for p in plans
+    ]
+
+
+@app.put("/api/admin/plans/{code}", dependencies=[Depends(require_admin_key)])
+@app.put("/api/admin/plans/{code}/", dependencies=[Depends(require_admin_key)])
+def admin_update_plan(code: str, req: UpdatePlanRequest, db: Session = Depends(get_db)):
+    plan = db.query(LicensePlan).filter(LicensePlan.code == code).first()
+    if not plan:
+        raise HTTPException(404, "Plan introuvable.")
+
+    for field, value in req.dict(exclude_unset=True).items():
+        if value is not None:
+            setattr(plan, field, value)
+
+    db.commit()
+    db.refresh(plan)
+    return {
+        "status": "success",
+        "plan": {
+            "code": plan.code,
+            "name": plan.name,
+            "price_monthly_usd": float(plan.price_monthly_usd or 0),
+            "price_yearly_usd": float(plan.price_yearly_usd or 0),
+            "max_tables": plan.max_tables,
+            "max_rows_per_table": plan.max_rows_per_table,
+            "max_devices": plan.max_devices,
+        }
+    }
+
+
+# ═══════════════════════════════════════════════════════════
+# ROUTES ADMIN — CONFIG DURÉE PAR DÉFAUT
 # ═══════════════════════════════════════════════════════════
 @app.get("/api/admin/config/default-trial", dependencies=[Depends(require_admin_key)])
 @app.get("/api/admin/config/default-trial/", dependencies=[Depends(require_admin_key)])
@@ -1559,7 +2055,7 @@ def get_default_trial_config(db: Session = Depends(get_db)):
     return {
         "duration_val": val,
         "duration_unit": unit,
-        "duration_days": days,  # ✅ FLOAT
+        "duration_days": days,
     }
 
 
@@ -1607,14 +2103,9 @@ def get_admin_devices(db: Session = Depends(get_db)):
         raise HTTPException(500, f"Erreur SQL: {str(err)}")
 
 
-def _force_trial_to_device(
-    dev: DeviceAttempt,
-    duration_val: int,
-    duration_unit: str,
-    db: Session,
-) -> dict:
+def _force_trial_to_device(dev: DeviceAttempt, duration_val: int, duration_unit: str, db: Session) -> dict:
     clean_device = dev.device_id.strip().upper()
-    days_float = _duration_to_days_float(duration_val, duration_unit)  # ✅ FLOAT
+    days_float = _duration_to_days_float(duration_val, duration_unit)
     now = get_utc_now()
 
     existing_lic = _find_license_by_device(clean_device, db)
@@ -1622,6 +2113,7 @@ def _force_trial_to_device(
     if existing_lic:
         existing_lic.is_active = True
         existing_lic.is_trial = True
+        existing_lic.plan_code = "trial"
         existing_lic.duration_val = duration_val
         existing_lic.duration_unit = duration_unit
         existing_lic.duration_days = days_float
@@ -1639,9 +2131,10 @@ def _force_trial_to_device(
             phone_number=dev.phone_number or "",
             is_active=True,
             is_trial=True,
+            plan_code="trial",
             device_uuid=json.dumps([clean_device]),
             max_devices=1,
-            duration_days=days_float,  # ✅ FLOAT
+            duration_days=days_float,
             duration_val=duration_val,
             duration_unit=duration_unit,
             created_at=now,
@@ -1669,14 +2162,9 @@ def _force_trial_to_device(
     }
 
 
-def _grant_full_access_to_device(
-    dev: DeviceAttempt,
-    duration_val: int,
-    duration_unit: str,
-    db: Session,
-) -> dict:
+def _grant_full_access_to_device(dev: DeviceAttempt, duration_val: int, duration_unit: str, db: Session) -> dict:
     clean_device = dev.device_id.strip().upper()
-    days_float = _duration_to_days_float(duration_val, duration_unit)  # ✅ FLOAT
+    days_float = _duration_to_days_float(duration_val, duration_unit)
     now = get_utc_now()
 
     existing_lic = _find_license_by_device(clean_device, db)
@@ -1684,6 +2172,7 @@ def _grant_full_access_to_device(
     if existing_lic:
         existing_lic.is_active = True
         existing_lic.is_trial = False
+        existing_lic.plan_code = "pro"
         existing_lic.duration_val = duration_val
         existing_lic.duration_unit = duration_unit
         existing_lic.duration_days = days_float
@@ -1701,9 +2190,10 @@ def _grant_full_access_to_device(
             phone_number=dev.phone_number or "",
             is_active=True,
             is_trial=False,
+            plan_code="pro",
             device_uuid=json.dumps([clean_device]),
-            max_devices=1,
-            duration_days=days_float,  # ✅ FLOAT
+            max_devices=2,
+            duration_days=days_float,
             duration_val=duration_val,
             duration_unit=duration_unit,
             created_at=now,
@@ -1747,22 +2237,14 @@ def update_admin_device(device_id: str, req: DeviceUpdateRequest, db: Session = 
     if req.grant_full_access is True:
         duration_val = req.duration_val or 7
         duration_unit = req.duration_unit or "Jours"
-        full_access_info = _grant_full_access_to_device(
-            dev, duration_val, duration_unit, db
-        )
-        log_lines.append(
-            f"ACCÈS COMPLET {duration_val} {duration_unit} → clé {full_access_info['key']}"
-        )
+        full_access_info = _grant_full_access_to_device(dev, duration_val, duration_unit, db)
+        log_lines.append(f"ACCÈS COMPLET {duration_val} {duration_unit} → clé {full_access_info['key']}")
     elif req.force_trial is True:
         duration_val = req.duration_val or DEFAULT_TRIAL_DAYS
         duration_unit = req.duration_unit or DEFAULT_TRIAL_UNIT
-        trial_info = _force_trial_to_device(
-            dev, duration_val, duration_unit, db
-        )
+        trial_info = _force_trial_to_device(dev, duration_val, duration_unit, db)
         full_access_info = trial_info
-        log_lines.append(
-            f"FORCE ESSAI {duration_val} {duration_unit} → clé {trial_info['key']}"
-        )
+        log_lines.append(f"FORCE ESSAI {duration_val} {duration_unit} → clé {trial_info['key']}")
 
     if req.set_max_attempts is not None:
         dev.max_attempts_allowed = max(0, req.set_max_attempts)
