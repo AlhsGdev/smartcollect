@@ -2,11 +2,11 @@
 # ═══════════════════════════════════════════════════════════
 #  SmartCollect — Backend API & Admin Server
 #  ✅ FastAPI + SQLAlchemy + PostgreSQL
-#  ✅ Licence WhatsApp + Essai 1/appareil
+#  ✅ Licence WhatsApp + Essai 1/appareil (système existant)
 #  ✅ NOUVEAU : Plans tarifaires (Basic / Pro / Business)
-#  ✅ NOUVEAU : /api/plans public
-#  ✅ NOUVEAU : set-plan admin
-#  ✅ NOUVEAU : upgrade via Play Store (receipt validation basique)
+#  ✅ NOUVEAU : Comptes utilisateurs (email + password)
+#  ✅ NOUVEAU : Multi-appareils par compte (auto-déconnexion)
+#  ✅ NOUVEAU : Upgrade via Play Store
 # ═══════════════════════════════════════════════════════════
 
 import os
@@ -14,6 +14,8 @@ import json
 import secrets
 import time
 import traceback
+import re
+import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 
@@ -21,9 +23,18 @@ from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import (
-    create_engine, Column, Integer, String, Boolean, DateTime, Text, Float, text
+    create_engine, Column, Integer, String, Boolean, DateTime, Text, Float, text,
+    ForeignKey, Index
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
+
+try:
+    import bcrypt
+    BCRYPT_AVAILABLE = True
+except ImportError:
+    BCRYPT_AVAILABLE = False
+    print("⚠️  [WARN] bcrypt non installé. Ajoute 'bcrypt' dans requirements.txt")
+    print("⚠️  [WARN] Fallback SHA256 utilisé (moins sécurisé).")
 
 # ═══════════════════════════════════════════════════════════
 # CONFIGURATION GLOBALE
@@ -36,6 +47,7 @@ TRIAL_MAX_ROWS_PER_TABLE = 50
 TRIAL_ALLOW_EXPORT = False
 
 DEFAULT_INITIAL_QUOTA = 1
+SESSION_DURATION_DAYS = 30
 
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
 
@@ -132,7 +144,7 @@ def check_rate_limit(identifier: str):
 
 
 # ═══════════════════════════════════════════════════════════
-# MODÈLES SQLALCHEMY
+# MODÈLES SQLALCHEMY (existant)
 # ═══════════════════════════════════════════════════════════
 class LicenseKey(Base):
     __tablename__ = "licenses"
@@ -153,10 +165,9 @@ class LicenseKey(Base):
     created_at = Column(DateTime, default=get_utc_now)
     activated_at = Column(DateTime, nullable=True)
     expires_at = Column(DateTime, nullable=True)
-    # ✅ NOUVEAU : plan & facturation
-    plan_code = Column(String(20), default="trial")  # trial / basic / pro / business
+    plan_code = Column(String(20), default="trial")
     is_yearly = Column(Boolean, default=False)
-    purchase_token = Column(Text, nullable=True)  # Google Play receipt
+    purchase_token = Column(Text, nullable=True)
 
 
 class DeviceAttempt(Base):
@@ -198,7 +209,6 @@ class AppConfig(Base):
     updated_at = Column(DateTime, default=get_utc_now, onupdate=get_utc_now)
 
 
-# ✅ NOUVEAU : Plans tarifaires configurables
 class LicensePlan(Base):
     __tablename__ = "license_plans"
 
@@ -224,6 +234,61 @@ class LicensePlan(Base):
 
 
 # ═══════════════════════════════════════════════════════════
+# ✅ NOUVEAU : COMPTES UTILISATEURS (email + password)
+# ═══════════════════════════════════════════════════════════
+class Account(Base):
+    __tablename__ = "accounts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String(255), unique=True, index=True, nullable=False)
+    password_hash = Column(String(255), nullable=False)
+    google_sub = Column(String(255), nullable=True, index=True)
+
+    first_name = Column(String(100), default="", nullable=True)
+    last_name = Column(String(100), default="", nullable=True)
+    phone_number = Column(String(50), default="", nullable=True)
+
+    plan_code = Column(String(20), default="trial")
+    is_yearly = Column(Boolean, default=False)
+    is_trial = Column(Boolean, default=True)
+    is_active = Column(Boolean, default=True)
+    expires_at = Column(DateTime, nullable=True)
+
+    purchase_token = Column(Text, nullable=True)
+    purchase_platform = Column(String(20), default="play_store")
+
+    created_at = Column(DateTime, default=get_utc_now)
+    last_login_at = Column(DateTime, nullable=True)
+    last_login_device = Column(String(255), nullable=True)
+
+
+# ═══════════════════════════════════════════════════════════
+# ✅ NOUVEAU : APPAREILS LIÉS À UN COMPTE
+# ═══════════════════════════════════════════════════════════
+class AccountDevice(Base):
+    __tablename__ = "account_devices"
+
+    id = Column(Integer, primary_key=True, index=True)
+    account_id = Column(Integer, ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    device_id = Column(String(255), nullable=False, index=True)
+    device_name = Column(String(150), default="")
+    platform = Column(String(20), default="unknown")
+    app_version = Column(String(30), default="")
+
+    session_token = Column(String(128), unique=True, index=True, nullable=False)
+    session_expires_at = Column(DateTime, nullable=False)
+    is_active = Column(Boolean, default=True, index=True)
+
+    created_at = Column(DateTime, default=get_utc_now)
+    last_seen_at = Column(DateTime, default=get_utc_now, onupdate=get_utc_now)
+    revoked_at = Column(DateTime, nullable=True)
+    revoked_reason = Column(String(100), default="")
+
+
+Index("ix_account_devices_account_active", AccountDevice.account_id, AccountDevice.is_active)
+Index("ix_account_devices_device_active", AccountDevice.device_id, AccountDevice.is_active)
+# ═══════════════════════════════════════════════════════════
 # MIGRATIONS
 # ═══════════════════════════════════════════════════════════
 print("[startup] Début des migrations...")
@@ -247,7 +312,6 @@ migrations = [
     ("ADD index device_attempts.phone",
      "CREATE INDEX IF NOT EXISTS ix_device_attempts_phone "
      "ON device_attempts (phone_number)"),
-    # ✅ NOUVELLES colonnes pour les plans
     ("ADD licenses.plan_code",
      "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS plan_code VARCHAR(20) DEFAULT 'trial'"),
     ("ADD licenses.is_yearly",
@@ -281,6 +345,56 @@ migrations = [
      "    END IF; "
      "  END LOOP; "
      "END $$;"),
+
+    # ✅ NOUVELLES MIGRATIONS : comptes utilisateurs
+    ("CREATE TABLE accounts IF NOT EXISTS",
+     "CREATE TABLE IF NOT EXISTS accounts ("
+     "  id SERIAL PRIMARY KEY,"
+     "  email VARCHAR(255) UNIQUE NOT NULL,"
+     "  password_hash VARCHAR(255) NOT NULL,"
+     "  google_sub VARCHAR(255),"
+     "  first_name VARCHAR(100) DEFAULT '',"
+     "  last_name VARCHAR(100) DEFAULT '',"
+     "  phone_number VARCHAR(50) DEFAULT '',"
+     "  plan_code VARCHAR(20) DEFAULT 'trial',"
+     "  is_yearly BOOLEAN DEFAULT FALSE,"
+     "  is_trial BOOLEAN DEFAULT TRUE,"
+     "  is_active BOOLEAN DEFAULT TRUE,"
+     "  expires_at TIMESTAMP,"
+     "  purchase_token TEXT,"
+     "  purchase_platform VARCHAR(20) DEFAULT 'play_store',"
+     "  created_at TIMESTAMP DEFAULT NOW(),"
+     "  last_login_at TIMESTAMP,"
+     "  last_login_device VARCHAR(255)"
+     ")"),
+    ("CREATE INDEX accounts.email",
+     "CREATE INDEX IF NOT EXISTS ix_accounts_email ON accounts(email)"),
+    ("CREATE TABLE account_devices IF NOT EXISTS",
+     "CREATE TABLE IF NOT EXISTS account_devices ("
+     "  id SERIAL PRIMARY KEY,"
+     "  account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,"
+     "  device_id VARCHAR(255) NOT NULL,"
+     "  device_name VARCHAR(150) DEFAULT '',"
+     "  platform VARCHAR(20) DEFAULT 'unknown',"
+     "  app_version VARCHAR(30) DEFAULT '',"
+     "  session_token VARCHAR(128) UNIQUE NOT NULL,"
+     "  session_expires_at TIMESTAMP NOT NULL,"
+     "  is_active BOOLEAN DEFAULT TRUE,"
+     "  created_at TIMESTAMP DEFAULT NOW(),"
+     "  last_seen_at TIMESTAMP DEFAULT NOW(),"
+     "  revoked_at TIMESTAMP,"
+     "  revoked_reason VARCHAR(100) DEFAULT ''"
+     ")"),
+    ("CREATE INDEX account_devices.account_id",
+     "CREATE INDEX IF NOT EXISTS ix_account_devices_account ON account_devices(account_id)"),
+    ("CREATE INDEX account_devices.device_id",
+     "CREATE INDEX IF NOT EXISTS ix_account_devices_device ON account_devices(device_id)"),
+    ("CREATE INDEX account_devices.session_token",
+     "CREATE INDEX IF NOT EXISTS ix_account_devices_session ON account_devices(session_token)"),
+    ("UPDATE plans: Pro max_devices = 3",
+     "UPDATE license_plans SET max_devices = 3 WHERE code = 'pro'"),
+    ("UPDATE plans: Basic max_tables = 10",
+     "UPDATE license_plans SET max_tables = 10 WHERE code = 'basic'"),
 ]
 
 for name, sql in migrations:
@@ -326,10 +440,10 @@ def _seed_default_plans():
             {
                 "code": "basic",
                 "name": "Basic",
-                "description": "Pour les indépendants - 3 tableaux, 500 lignes, exports",
+                "description": "Pour les indépendants - 10 tableaux, 500 lignes, exports",
                 "price_monthly_usd": 5.0,
                 "price_yearly_usd": 40.0,
-                "max_tables": 3,
+                "max_tables": 10,
                 "max_rows_per_table": 500,
                 "allow_export": True,
                 "allow_cloud_backup": False,
@@ -354,7 +468,7 @@ def _seed_default_plans():
                 "allow_merge_tables": True,
                 "allow_custom_branding": True,
                 "allow_reminders": True,
-                "max_devices": 2,
+                "max_devices": 3,
                 "display_order": 2,
             },
             {
@@ -402,6 +516,396 @@ def get_db():
 
 
 # ═══════════════════════════════════════════════════════════
+# HELPERS DURÉE
+# ═══════════════════════════════════════════════════════════
+def _duration_to_days_float(val: int, unit: str) -> float:
+    u = (unit or "").lower().strip()
+    if "minute" in u or u == "min" or u == "mn":
+        return val / (24 * 60)
+    if "heure" in u or u == "h" or u == "hr" or u == "hrs":
+        return val / 24
+    if "jour" in u or u == "day" or u == "days" or u == "j":
+        return float(val)
+    if "mois" in u or u == "month" or u == "months":
+        return float(val * 30)
+    if "an" in u or u == "year" or u == "years":
+        return float(val * 365)
+    return float(val)
+
+
+def _duration_to_timedelta(val: int, unit: str) -> timedelta:
+    u = (unit or "").lower().strip()
+    if "minute" in u or u == "min" or u == "mn":
+        return timedelta(minutes=val)
+    if "heure" in u or u == "h" or u == "hr" or u == "hrs":
+        return timedelta(hours=val)
+    if "jour" in u or u == "day" or u == "days" or u == "j":
+        return timedelta(days=val)
+    if "mois" in u or u == "month" or u == "months":
+        return timedelta(days=val * 30)
+    if "an" in u or u == "year" or u == "years":
+        return timedelta(days=val * 365)
+    return timedelta(days=val)
+
+
+def _compute_expiry(lic: "LicenseKey", from_now: bool = True) -> datetime:
+    val = lic.duration_val or DEFAULT_TRIAL_DAYS
+    unit = lic.duration_unit or DEFAULT_TRIAL_UNIT
+    delta = _duration_to_timedelta(val, unit)
+    if from_now or not lic.activated_at:
+        base = get_utc_now()
+    else:
+        base = lic.activated_at
+    return base + delta
+
+
+# ═══════════════════════════════════════════════════════════
+# ✅ NOUVEAU : HELPERS AUTH
+# ═══════════════════════════════════════════════════════════
+def _hash_password(password: str) -> str:
+    if BCRYPT_AVAILABLE:
+        return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode("utf-8")
+    salt = "smartcollect_fallback_salt_v1"
+    return hashlib.sha256(f"{salt}:{password}".encode()).hexdigest()
+
+
+def _verify_password(password: str, password_hash: str) -> bool:
+    if BCRYPT_AVAILABLE:
+        try:
+            return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
+        except Exception:
+            return False
+    salt = "smartcollect_fallback_salt_v1"
+    return hashlib.sha256(f"{salt}:{password}".encode()).hexdigest() == password_hash
+
+
+def _generate_session_token() -> str:
+    return secrets.token_urlsafe(64)
+
+
+def _normalize_email(email: str) -> str:
+    return (email or "").strip().lower()
+
+
+def _validate_email(email: str) -> bool:
+    pattern = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
+    return bool(re.match(pattern, email))
+
+
+def _get_plan_max_devices(plan_code: str, db: Session) -> int:
+    plan = db.query(LicensePlan).filter(LicensePlan.code == plan_code).first()
+    if plan:
+        return max(1, plan.max_devices or 1)
+    fallbacks = {"trial": 1, "basic": 1, "pro": 3, "business": 5}
+    return fallbacks.get(plan_code, 1)
+
+
+def _get_plan_limits(plan_code: str, db: Session) -> dict:
+    plan = db.query(LicensePlan).filter(LicensePlan.code == plan_code).first()
+    if plan:
+        return {
+            "max_tables": plan.max_tables,
+            "max_rows_per_table": plan.max_rows_per_table,
+            "allow_export": bool(plan.allow_export),
+            "allow_cloud_backup": bool(plan.allow_cloud_backup),
+            "allow_bulk_export": bool(plan.allow_bulk_export),
+            "allow_merge_tables": bool(plan.allow_merge_tables),
+            "allow_custom_branding": bool(plan.allow_custom_branding),
+            "allow_reminders": bool(plan.allow_reminders),
+            "max_devices": plan.max_devices,
+        }
+    return {
+        "max_tables": 1 if plan_code == "trial" else 999999,
+        "max_rows_per_table": 50 if plan_code == "trial" else 999999,
+        "allow_export": plan_code != "trial",
+        "allow_cloud_backup": plan_code in ("pro", "business"),
+        "allow_bulk_export": plan_code in ("pro", "business"),
+        "allow_merge_tables": plan_code in ("pro", "business"),
+        "allow_custom_branding": plan_code in ("pro", "business"),
+        "allow_reminders": plan_code in ("pro", "business"),
+        "max_devices": {"trial": 1, "basic": 1, "pro": 3, "business": 5}.get(plan_code, 1),
+    }
+
+
+def _enforce_device_limit(account: Account, device_id: str, device_name: str,
+                           platform: str, app_version: str,
+                           db: Session) -> AccountDevice:
+    """
+    Vérifie/ajoute un device à un compte.
+    Si la limite est atteinte → désactive le plus ancien.
+    """
+    clean_device = (device_id or "").strip().upper()
+    max_devices = _get_plan_max_devices(account.plan_code, db)
+
+    existing = db.query(AccountDevice).filter(
+        AccountDevice.account_id == account.id,
+        AccountDevice.device_id == clean_device,
+    ).first()
+
+    if existing:
+        if not existing.is_active:
+            existing.is_active = True
+            existing.revoked_at = None
+            existing.revoked_reason = ""
+        existing.session_token = _generate_session_token()
+        existing.session_expires_at = get_utc_now() + timedelta(days=SESSION_DURATION_DAYS)
+        existing.last_seen_at = get_utc_now()
+        existing.device_name = device_name or existing.device_name
+        existing.platform = platform or existing.platform
+        existing.app_version = app_version or existing.app_version
+        return existing
+
+    active_devices = db.query(AccountDevice).filter(
+        AccountDevice.account_id == account.id,
+        AccountDevice.is_active == True,
+    ).order_by(AccountDevice.last_seen_at.desc()).all()
+
+    while len(active_devices) >= max_devices:
+        oldest = active_devices.pop()
+        oldest.is_active = False
+        oldest.revoked_at = get_utc_now()
+        oldest.revoked_reason = f"Auto-déconnecté (limite {max_devices} appareils atteinte)"
+        print(f"[DEVICE LIMIT] Compte {account.email} : révoqué {oldest.device_id[:16]}...")
+
+    new_device = AccountDevice(
+        account_id=account.id,
+        device_id=clean_device,
+        device_name=device_name or "Appareil sans nom",
+        platform=platform or "unknown",
+        app_version=app_version or "",
+        session_token=_generate_session_token(),
+        session_expires_at=get_utc_now() + timedelta(days=SESSION_DURATION_DAYS),
+        is_active=True,
+    )
+    db.add(new_device)
+    return new_device
+
+
+def _account_to_access_payload(account: Account, db: Session) -> dict:
+    """Construit le payload d'accès pour un compte."""
+    plan_code = account.plan_code or "trial"
+    limits = _get_plan_limits(plan_code, db)
+
+    plan = db.query(LicensePlan).filter(LicensePlan.code == plan_code).first()
+    plan_name = plan.name if plan else plan_code.capitalize()
+
+    return {
+        "mode": "trial" if account.is_trial else "full",
+        "is_trial": bool(account.is_trial),
+        "plan_code": plan_code,
+        "plan_name": plan_name,
+        "expires_at": account.expires_at.isoformat() if account.expires_at else None,
+        "max_tables": limits["max_tables"],
+        "max_rows_per_table": limits["max_rows_per_table"],
+        "allow_export": limits["allow_export"],
+        "allow_cloud_backup": limits["allow_cloud_backup"],
+        "allow_bulk_export": limits["allow_bulk_export"],
+        "allow_merge_tables": limits["allow_merge_tables"],
+        "allow_custom_branding": limits["allow_custom_branding"],
+        "allow_reminders": limits["allow_reminders"],
+        "max_devices": limits["max_devices"],
+    }
+
+
+# ═══════════════════════════════════════════════════════════
+# HELPERS CONFIG DYNAMIQUE
+# ═══════════════════════════════════════════════════════════
+def _get_default_trial_config(db: Session) -> tuple:
+    defaults = {
+        "default_trial_val": "7",
+        "default_trial_unit": "Jours",
+    }
+    results = {}
+    for k in defaults:
+        row = db.query(AppConfig).filter(AppConfig.key == k).first()
+        results[k] = row.value if row else defaults[k]
+
+    try:
+        val = int(results["default_trial_val"])
+    except ValueError:
+        val = 7
+    unit = results["default_trial_unit"] or "Jours"
+    days = _duration_to_days_float(val, unit)
+
+    return val, unit, days
+
+
+def _set_default_trial_config(db: Session, val: int, unit: str):
+    for k, v in [
+        ("default_trial_val", str(val)),
+        ("default_trial_unit", unit),
+    ]:
+        row = db.query(AppConfig).filter(AppConfig.key == k).first()
+        if row:
+            row.value = v
+        else:
+            db.add(AppConfig(key=k, value=v))
+    db.commit()
+
+
+# ═══════════════════════════════════════════════════════════
+# HELPER : trouver une licence par device_id (système existant)
+# ═══════════════════════════════════════════════════════════
+def _find_license_by_device(device_id: str, db: Session):
+    try:
+        clean_device = (device_id or "").strip().upper()
+        if not clean_device:
+            return None
+
+        all_lics = db.query(LicenseKey).order_by(LicenseKey.id.desc()).all()
+
+        now = get_utc_now()
+        for lic in all_lics:
+            try:
+                raw = str(lic.device_uuid or "[]")
+                if raw in ("", "REVOKED"):
+                    continue
+                devices = json.loads(raw)
+                if not isinstance(devices, list):
+                    continue
+                normalized = [str(d).strip().upper() for d in devices]
+                if clean_device in normalized:
+                    is_expired = bool(lic.expires_at and now > lic.expires_at)
+                    if lic.is_active and not is_expired:
+                        return lic
+            except Exception:
+                continue
+
+        for lic in all_lics:
+            try:
+                raw = str(lic.device_uuid or "[]")
+                if raw in ("", "REVOKED"):
+                    continue
+                devices = json.loads(raw)
+                if not isinstance(devices, list):
+                    continue
+                normalized = [str(d).strip().upper() for d in devices]
+                if clean_device in normalized:
+                    return lic
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"[_find_license_by_device ERROR] {e}")
+    return None
+
+
+def _update_license_user_info(lic: LicenseKey, req, changed_log: list):
+    new_phone = (getattr(req, "phone_number", "") or "").strip()
+    old_phone = (lic.phone_number or "").strip()
+    if new_phone and new_phone != old_phone:
+        lic.phone_number = new_phone
+        changed_log.append(f"tel: {old_phone or '∅'} → {new_phone}")
+
+    new_first = (getattr(req, "first_name", "") or "").strip()
+    old_first = (lic.first_name or "").strip()
+    if new_first and new_first != old_first:
+        lic.first_name = new_first
+        changed_log.append(f"prénom: {old_first or '∅'} → {new_first}")
+
+    new_last = (getattr(req, "last_name", "") or "").strip()
+    old_last = (lic.last_name or "").strip()
+    if new_last and new_last != old_last:
+        lic.last_name = new_last
+        changed_log.append(f"nom: {old_last or '∅'} → {new_last}")
+
+    new_org = (getattr(req, "organization", "") or "").strip()
+    old_org = (lic.organization or "").strip()
+    if new_org and new_org != old_org:
+        lic.organization = new_org
+        changed_log.append(f"org: {old_org or '∅'} → {new_org}")
+
+
+# ═══════════════════════════════════════════════════════════
+# ✅ _build_access_payload enrichi avec plan
+# ═══════════════════════════════════════════════════════════
+def _build_access_payload(lic: Optional[LicenseKey], db: Optional[Session] = None) -> dict:
+    if lic is None:
+        if db is not None:
+            val, unit, days_float = _get_default_trial_config(db)
+        else:
+            val = DEFAULT_TRIAL_DAYS
+            unit = DEFAULT_TRIAL_UNIT
+            days_float = float(DEFAULT_TRIAL_DAYS)
+
+        delta = _duration_to_timedelta(val, unit)
+        return {
+            "mode": "trial",
+            "is_trial": True,
+            "plan_code": "trial",
+            "plan_name": "Essai",
+            "duration_val": val,
+            "duration_unit": unit,
+            "duration_days": days_float,
+            "duration_seconds": int(delta.total_seconds()),
+            "max_tables": TRIAL_MAX_TABLES,
+            "max_rows_per_table": TRIAL_MAX_ROWS_PER_TABLE,
+            "allow_export": TRIAL_ALLOW_EXPORT,
+            "allow_cloud_backup": False,
+            "allow_bulk_export": False,
+            "allow_merge_tables": False,
+            "allow_custom_branding": False,
+            "allow_reminders": False,
+            "max_devices": 1,
+        }
+
+    is_trial = bool(lic.is_trial)
+    plan_code = getattr(lic, "plan_code", "trial") or ("trial" if is_trial else "pro")
+    if is_trial:
+        plan_code = "trial"
+
+    dur_val = lic.duration_val if lic.duration_val is not None else DEFAULT_TRIAL_DAYS
+    dur_unit = lic.duration_unit or DEFAULT_TRIAL_UNIT
+    dur_days = lic.duration_days if lic.duration_days is not None else float(DEFAULT_TRIAL_DAYS)
+
+    delta = _duration_to_timedelta(dur_val, dur_unit)
+    duration_seconds = int(delta.total_seconds())
+
+    plan = None
+    if db is not None:
+        plan = db.query(LicensePlan).filter(LicensePlan.code == plan_code).first()
+
+    if plan:
+        return {
+            "mode": "trial" if is_trial else "full",
+            "is_trial": is_trial,
+            "plan_code": plan.code,
+            "plan_name": plan.name,
+            "duration_val": dur_val,
+            "duration_unit": dur_unit,
+            "duration_days": float(dur_days),
+            "duration_seconds": duration_seconds,
+            "max_tables": plan.max_tables,
+            "max_rows_per_table": plan.max_rows_per_table,
+            "allow_export": plan.allow_export,
+            "allow_cloud_backup": plan.allow_cloud_backup,
+            "allow_bulk_export": plan.allow_bulk_export,
+            "allow_merge_tables": plan.allow_merge_tables,
+            "allow_custom_branding": plan.allow_custom_branding,
+            "allow_reminders": plan.allow_reminders,
+            "max_devices": plan.max_devices,
+        }
+
+    return {
+        "mode": "trial" if is_trial else "full",
+        "is_trial": is_trial,
+        "plan_code": plan_code,
+        "plan_name": plan_code.capitalize(),
+        "duration_val": dur_val,
+        "duration_unit": dur_unit,
+        "duration_days": float(dur_days),
+        "duration_seconds": duration_seconds,
+        "max_tables": TRIAL_MAX_TABLES if is_trial else 999999,
+        "max_rows_per_table": TRIAL_MAX_ROWS_PER_TABLE if is_trial else 999999,
+        "allow_export": (not is_trial) or TRIAL_ALLOW_EXPORT,
+        "allow_cloud_backup": not is_trial,
+        "allow_bulk_export": not is_trial,
+        "allow_merge_tables": not is_trial,
+        "allow_custom_branding": not is_trial,
+        "allow_reminders": not is_trial,
+        "max_devices": 1,
+    }
+
+# ═══════════════════════════════════════════════════════════
 # APPLICATION FASTAPI
 # ═══════════════════════════════════════════════════════════
 app = FastAPI(title="SmartCollect API & Admin Server", redirect_slashes=True)
@@ -416,7 +920,7 @@ app.add_middleware(
 
 
 # ═══════════════════════════════════════════════════════════
-# SCHÉMAS PYDANTIC
+# SCHÉMAS PYDANTIC (existants)
 # ═══════════════════════════════════════════════════════════
 class SelfRegisterPhoneRequest(BaseModel):
     first_name: str = Field(..., max_length=100)
@@ -526,254 +1030,432 @@ class DefaultTrialConfigRequest(BaseModel):
 
 
 # ═══════════════════════════════════════════════════════════
-# HELPERS DURÉE
+# ✅ NOUVEAUX : SCHÉMAS AUTH
 # ═══════════════════════════════════════════════════════════
-def _duration_to_days_float(val: int, unit: str) -> float:
-    u = (unit or "").lower().strip()
-    if "minute" in u or u == "min" or u == "mn":
-        return val / (24 * 60)
-    if "heure" in u or u == "h" or u == "hr" or u == "hrs":
-        return val / 24
-    if "jour" in u or u == "day" or u == "days" or u == "j":
-        return float(val)
-    if "mois" in u or u == "month" or u == "months":
-        return float(val * 30)
-    if "an" in u or u == "year" or u == "years":
-        return float(val * 365)
-    return float(val)
+class RegisterRequest(BaseModel):
+    email: str = Field(..., min_length=5, max_length=255)
+    password: str = Field(..., min_length=8, max_length=100)
+    first_name: str = Field("", max_length=100)
+    last_name: str = Field("", max_length=100)
+    phone_number: str = Field("", max_length=50)
+    device_id: str = Field(..., min_length=8, max_length=255)
+    device_name: str = Field("", max_length=150)
+    platform: str = Field("unknown", max_length=20)
+    app_version: str = Field("", max_length=30)
 
 
-def _duration_to_timedelta(val: int, unit: str) -> timedelta:
-    u = (unit or "").lower().strip()
-    if "minute" in u or u == "min" or u == "mn":
-        return timedelta(minutes=val)
-    if "heure" in u or u == "h" or u == "hr" or u == "hrs":
-        return timedelta(hours=val)
-    if "jour" in u or u == "day" or u == "days" or u == "j":
-        return timedelta(days=val)
-    if "mois" in u or u == "month" or u == "months":
-        return timedelta(days=val * 30)
-    if "an" in u or u == "year" or u == "years":
-        return timedelta(days=val * 365)
-    return timedelta(days=val)
+class LoginRequest(BaseModel):
+    email: str = Field(..., min_length=5, max_length=255)
+    password: str = Field(..., min_length=1, max_length=100)
+    device_id: str = Field(..., min_length=8, max_length=255)
+    device_name: str = Field("", max_length=150)
+    platform: str = Field("unknown", max_length=20)
+    app_version: str = Field("", max_length=30)
 
 
-def _compute_expiry(lic: "LicenseKey", from_now: bool = True) -> datetime:
-    val = lic.duration_val or DEFAULT_TRIAL_DAYS
-    unit = lic.duration_unit or DEFAULT_TRIAL_UNIT
-    delta = _duration_to_timedelta(val, unit)
-    if from_now or not lic.activated_at:
-        base = get_utc_now()
-    else:
-        base = lic.activated_at
-    return base + delta
+class VerifySessionRequest(BaseModel):
+    session_token: str = Field(..., min_length=16, max_length=128)
+    device_id: str = Field(..., min_length=8, max_length=255)
+
+
+class LogoutRequest(BaseModel):
+    session_token: str = Field(..., min_length=16, max_length=128)
+
+
+class AccountUpgradeRequest(BaseModel):
+    session_token: str = Field(..., min_length=16, max_length=128)
+    plan_code: str = Field(..., pattern="^(basic|pro|business)$")
+    is_yearly: bool = False
+    purchase_token: Optional[str] = None
+    purchase_platform: str = Field("play_store", max_length=20)
+
+
+class RevokeDeviceRequest(BaseModel):
+    session_token: str = Field(..., min_length=16, max_length=128)
+    device_id_to_revoke: str = Field(..., min_length=8, max_length=255)
 
 
 # ═══════════════════════════════════════════════════════════
-# HELPERS CONFIG DYNAMIQUE
+# ✅ NOUVEAU : ROUTES AUTH (email + password)
 # ═══════════════════════════════════════════════════════════
-def _get_default_trial_config(db: Session) -> tuple:
-    defaults = {
-        "default_trial_val": "7",
-        "default_trial_unit": "Jours",
-    }
-    results = {}
-    for k in defaults:
-        row = db.query(AppConfig).filter(AppConfig.key == k).first()
-        results[k] = row.value if row else defaults[k]
-
+@app.post("/api/auth/register")
+@app.post("/api/auth/register/")
+def auth_register(req: RegisterRequest, db: Session = Depends(get_db)):
+    """Créer un nouveau compte utilisateur."""
     try:
-        val = int(results["default_trial_val"])
-    except ValueError:
-        val = 7
-    unit = results["default_trial_unit"] or "Jours"
-    days = _duration_to_days_float(val, unit)
+        email = _normalize_email(req.email)
+        if not _validate_email(email):
+            raise HTTPException(400, "Email invalide.")
+        if len(req.password) < 8:
+            raise HTTPException(400, "Le mot de passe doit faire au moins 8 caractères.")
 
-    return val, unit, days
+        existing = db.query(Account).filter(Account.email == email).first()
+        if existing:
+            raise HTTPException(409, "Cet email est déjà utilisé.")
 
-
-def _set_default_trial_config(db: Session, val: int, unit: str):
-    for k, v in [
-        ("default_trial_val", str(val)),
-        ("default_trial_unit", unit),
-    ]:
-        row = db.query(AppConfig).filter(AppConfig.key == k).first()
-        if row:
-            row.value = v
-        else:
-            db.add(AppConfig(key=k, value=v))
-    db.commit()
-
-
-# ═══════════════════════════════════════════════════════════
-# HELPER : trouver une licence par device_id
-# ═══════════════════════════════════════════════════════════
-def _find_license_by_device(device_id: str, db: Session):
-    try:
-        clean_device = (device_id or "").strip().upper()
-        if not clean_device:
-            return None
-
-        all_lics = db.query(LicenseKey).order_by(LicenseKey.id.desc()).all()
+        def_val, def_unit, def_days_float = _get_default_trial_config(db)
 
         now = get_utc_now()
-        for lic in all_lics:
-            try:
-                raw = str(lic.device_uuid or "[]")
-                if raw in ("", "REVOKED"):
-                    continue
-                devices = json.loads(raw)
-                if not isinstance(devices, list):
-                    continue
-                normalized = [str(d).strip().upper() for d in devices]
-                if clean_device in normalized:
-                    is_expired = bool(lic.expires_at and now > lic.expires_at)
-                    if lic.is_active and not is_expired:
-                        return lic
-            except Exception:
-                continue
+        new_account = Account(
+            email=email,
+            password_hash=_hash_password(req.password),
+            first_name=(req.first_name or "").strip(),
+            last_name=(req.last_name or "").strip(),
+            phone_number=(req.phone_number or "").strip(),
+            plan_code="trial",
+            is_trial=True,
+            is_active=True,
+            expires_at=now + _duration_to_timedelta(def_val, def_unit),
+            created_at=now,
+            last_login_at=now,
+            last_login_device=req.device_id.strip().upper(),
+        )
+        db.add(new_account)
+        db.flush()
 
-        for lic in all_lics:
-            try:
-                raw = str(lic.device_uuid or "[]")
-                if raw in ("", "REVOKED"):
-                    continue
-                devices = json.loads(raw)
-                if not isinstance(devices, list):
-                    continue
-                normalized = [str(d).strip().upper() for d in devices]
-                if clean_device in normalized:
-                    return lic
-            except Exception:
-                continue
+        device = _enforce_device_limit(
+            account=new_account,
+            device_id=req.device_id,
+            device_name=req.device_name,
+            platform=req.platform,
+            app_version=req.app_version,
+            db=db,
+        )
+
+        db.commit()
+        db.refresh(new_account)
+        db.refresh(device)
+
+        access = _account_to_access_payload(new_account, db)
+        return {
+            "status": "success",
+            "message": "Compte créé avec succès.",
+            "account": {
+                "id": new_account.id,
+                "email": new_account.email,
+                "first_name": new_account.first_name,
+                "last_name": new_account.last_name,
+                "plan_code": new_account.plan_code,
+                "is_trial": new_account.is_trial,
+                "expires_at": new_account.expires_at.isoformat() if new_account.expires_at else None,
+            },
+            "session_token": device.session_token,
+            "session_expires_at": device.session_expires_at.isoformat(),
+            "access": access,
+        }
+
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"[_find_license_by_device ERROR] {e}")
-    return None
+        db.rollback()
+        print(f"[AUTH-REGISTER ERROR] {traceback.format_exc()}")
+        raise HTTPException(500, f"Erreur serveur: {str(e)}")
 
 
-def _update_license_user_info(lic: LicenseKey, req, changed_log: list):
-    new_phone = (getattr(req, "phone_number", "") or "").strip()
-    old_phone = (lic.phone_number or "").strip()
-    if new_phone and new_phone != old_phone:
-        lic.phone_number = new_phone
-        changed_log.append(f"tel: {old_phone or '∅'} → {new_phone}")
+@app.post("/api/auth/login")
+@app.post("/api/auth/login/")
+def auth_login(req: LoginRequest, db: Session = Depends(get_db)):
+    """Connexion + gestion multi-appareils."""
+    try:
+        email = _normalize_email(req.email)
+        clean_device = req.device_id.strip().upper()
 
-    new_first = (getattr(req, "first_name", "") or "").strip()
-    old_first = (lic.first_name or "").strip()
-    if new_first and new_first != old_first:
-        lic.first_name = new_first
-        changed_log.append(f"prénom: {old_first or '∅'} → {new_first}")
+        check_rate_limit(f"login:{email}")
 
-    new_last = (getattr(req, "last_name", "") or "").strip()
-    old_last = (lic.last_name or "").strip()
-    if new_last and new_last != old_last:
-        lic.last_name = new_last
-        changed_log.append(f"nom: {old_last or '∅'} → {new_last}")
+        account = db.query(Account).filter(Account.email == email).first()
+        if not account:
+            raise HTTPException(401, "Email ou mot de passe incorrect.")
 
-    new_org = (getattr(req, "organization", "") or "").strip()
-    old_org = (lic.organization or "").strip()
-    if new_org and new_org != old_org:
-        lic.organization = new_org
-        changed_log.append(f"org: {old_org or '∅'} → {new_org}")
+        if not account.is_active:
+            raise HTTPException(403, "Ce compte est désactivé. Contactez l'administrateur.")
 
+        if not _verify_password(req.password, account.password_hash):
+            raise HTTPException(401, "Email ou mot de passe incorrect.")
 
-# ═══════════════════════════════════════════════════════════
-# ✅ NOUVEAU : _build_access_payload enrichi avec plan
-# ═══════════════════════════════════════════════════════════
-def _build_access_payload(lic: Optional[LicenseKey], db: Optional[Session] = None) -> dict:
-    # ─── CAS ESSAI / PAS DE LICENCE ───
-    if lic is None:
-        if db is not None:
-            val, unit, days_float = _get_default_trial_config(db)
-        else:
-            val = DEFAULT_TRIAL_DAYS
-            unit = DEFAULT_TRIAL_UNIT
-            days_float = float(DEFAULT_TRIAL_DAYS)
+        now = get_utc_now()
+        if account.expires_at and now > account.expires_at:
+            raise HTTPException(
+                403,
+                "Votre abonnement a expiré. Renouvelez-le pour continuer."
+            )
 
-        delta = _duration_to_timedelta(val, unit)
+        device = _enforce_device_limit(
+            account=account,
+            device_id=clean_device,
+            device_name=req.device_name,
+            platform=req.platform,
+            app_version=req.app_version,
+            db=db,
+        )
+
+        account.last_login_at = now
+        account.last_login_device = clean_device
+
+        db.commit()
+        db.refresh(account)
+        db.refresh(device)
+
+        access = _account_to_access_payload(account, db)
         return {
-            "mode": "trial",
-            "is_trial": True,
-            "plan_code": "trial",
-            "plan_name": "Essai",
-            "duration_val": val,
-            "duration_unit": unit,
-            "duration_days": days_float,
-            "duration_seconds": int(delta.total_seconds()),
-            "max_tables": TRIAL_MAX_TABLES,
-            "max_rows_per_table": TRIAL_MAX_ROWS_PER_TABLE,
-            "allow_export": TRIAL_ALLOW_EXPORT,
-            "allow_cloud_backup": False,
-            "allow_bulk_export": False,
-            "allow_merge_tables": False,
-            "allow_custom_branding": False,
-            "allow_reminders": False,
-            "max_devices": 1,
+            "status": "success",
+            "message": "Connexion réussie.",
+            "account": {
+                "id": account.id,
+                "email": account.email,
+                "first_name": account.first_name,
+                "last_name": account.last_name,
+                "plan_code": account.plan_code,
+                "is_trial": account.is_trial,
+                "expires_at": account.expires_at.isoformat() if account.expires_at else None,
+            },
+            "session_token": device.session_token,
+            "session_expires_at": device.session_expires_at.isoformat(),
+            "access": access,
         }
 
-    # ─── CAS LICENCE EXISTANTE ───
-    is_trial = bool(lic.is_trial)
-    plan_code = getattr(lic, "plan_code", "trial") or ("trial" if is_trial else "pro")
-    if is_trial:
-        plan_code = "trial"
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        print(f"[AUTH-LOGIN ERROR] {traceback.format_exc()}")
+        raise HTTPException(500, f"Erreur serveur: {str(e)}")
 
-    dur_val = lic.duration_val if lic.duration_val is not None else DEFAULT_TRIAL_DAYS
-    dur_unit = lic.duration_unit or DEFAULT_TRIAL_UNIT
-    dur_days = lic.duration_days if lic.duration_days is not None else float(DEFAULT_TRIAL_DAYS)
 
-    delta = _duration_to_timedelta(dur_val, dur_unit)
-    duration_seconds = int(delta.total_seconds())
+@app.post("/api/auth/verify-session")
+@app.post("/api/auth/verify-session/")
+def auth_verify_session(req: VerifySessionRequest, db: Session = Depends(get_db)):
+    """Vérifier une session au démarrage de l'app."""
+    try:
+        clean_device = req.device_id.strip().upper()
+        now = get_utc_now()
 
-    # Récupérer les limites du plan en DB
-    plan = None
-    if db is not None:
-        plan = db.query(LicensePlan).filter(LicensePlan.code == plan_code).first()
+        device = db.query(AccountDevice).filter(
+            AccountDevice.session_token == req.session_token,
+            AccountDevice.device_id == clean_device,
+        ).first()
 
-    if plan:
+        if not device:
+            raise HTTPException(401, "Session introuvable.")
+
+        if not device.is_active:
+            raise HTTPException(403, "Cette session a été révoquée (déconnectée à distance).")
+
+        if device.session_expires_at and now > device.session_expires_at:
+            raise HTTPException(401, "Session expirée. Reconnectez-vous.")
+
+        account = db.query(Account).filter(Account.id == device.account_id).first()
+        if not account or not account.is_active:
+            raise HTTPException(403, "Compte désactivé.")
+
+        if account.expires_at and now > account.expires_at:
+            raise HTTPException(403, "Abonnement expiré.")
+
+        device.last_seen_at = now
+        db.commit()
+        db.refresh(account)
+
+        access = _account_to_access_payload(account, db)
         return {
-            "mode": "trial" if is_trial else "full",
-            "is_trial": is_trial,
-            "plan_code": plan.code,
-            "plan_name": plan.name,
-            "duration_val": dur_val,
-            "duration_unit": dur_unit,
-            "duration_days": float(dur_days),
-            "duration_seconds": duration_seconds,
-            "max_tables": plan.max_tables,
-            "max_rows_per_table": plan.max_rows_per_table,
-            "allow_export": plan.allow_export,
-            "allow_cloud_backup": plan.allow_cloud_backup,
-            "allow_bulk_export": plan.allow_bulk_export,
-            "allow_merge_tables": plan.allow_merge_tables,
-            "allow_custom_branding": plan.allow_custom_branding,
-            "allow_reminders": plan.allow_reminders,
-            "max_devices": plan.max_devices,
+            "status": "valid",
+            "account": {
+                "id": account.id,
+                "email": account.email,
+                "first_name": account.first_name,
+                "last_name": account.last_name,
+                "plan_code": account.plan_code,
+                "is_trial": account.is_trial,
+                "expires_at": account.expires_at.isoformat() if account.expires_at else None,
+            },
+            "access": access,
         }
 
-    # Fallback si plan introuvable
-    return {
-        "mode": "trial" if is_trial else "full",
-        "is_trial": is_trial,
-        "plan_code": plan_code,
-        "plan_name": plan_code.capitalize(),
-        "duration_val": dur_val,
-        "duration_unit": dur_unit,
-        "duration_days": float(dur_days),
-        "duration_seconds": duration_seconds,
-        "max_tables": TRIAL_MAX_TABLES if is_trial else 999999,
-        "max_rows_per_table": TRIAL_MAX_ROWS_PER_TABLE if is_trial else 999999,
-        "allow_export": (not is_trial) or TRIAL_ALLOW_EXPORT,
-        "allow_cloud_backup": not is_trial,
-        "allow_bulk_export": not is_trial,
-        "allow_merge_tables": not is_trial,
-        "allow_custom_branding": not is_trial,
-        "allow_reminders": not is_trial,
-        "max_devices": 1,
-    }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[VERIFY-SESSION ERROR] {traceback.format_exc()}")
+        raise HTTPException(500, f"Erreur serveur: {str(e)}")
+
+
+@app.post("/api/auth/logout")
+@app.post("/api/auth/logout/")
+def auth_logout(req: LogoutRequest, db: Session = Depends(get_db)):
+    """Déconnecte l'appareil courant."""
+    try:
+        device = db.query(AccountDevice).filter(
+            AccountDevice.session_token == req.session_token
+        ).first()
+
+        if device:
+            device.is_active = False
+            device.revoked_at = get_utc_now()
+            device.revoked_reason = "Déconnexion manuelle"
+            db.commit()
+
+        return {"status": "success", "message": "Déconnexion réussie."}
+    except Exception as e:
+        db.rollback()
+        print(f"[LOGOUT ERROR] {traceback.format_exc()}")
+        raise HTTPException(500, f"Erreur serveur: {str(e)}")
+
+
+@app.get("/api/account/devices")
+@app.get("/api/account/devices/")
+def get_account_devices(session_token: str, db: Session = Depends(get_db)):
+    """Liste tous les appareils actifs du compte."""
+    try:
+        device = db.query(AccountDevice).filter(
+            AccountDevice.session_token == session_token
+        ).first()
+
+        if not device or not device.is_active:
+            raise HTTPException(401, "Session invalide.")
+
+        account = db.query(Account).filter(Account.id == device.account_id).first()
+        if not account:
+            raise HTTPException(404, "Compte introuvable.")
+
+        all_devices = db.query(AccountDevice).filter(
+            AccountDevice.account_id == account.id,
+            AccountDevice.is_active == True,
+        ).order_by(AccountDevice.last_seen_at.desc()).all()
+
+        max_devices = _get_plan_max_devices(account.plan_code, db)
+
+        return {
+            "status": "success",
+            "plan_code": account.plan_code,
+            "max_devices": max_devices,
+            "used_devices": len(all_devices),
+            "current_device_id": device.device_id,
+            "devices": [
+                {
+                    "device_id": d.device_id,
+                    "device_name": d.device_name or "Appareil sans nom",
+                    "platform": d.platform,
+                    "app_version": d.app_version,
+                    "is_current": d.device_id == device.device_id,
+                    "created_at": d.created_at.isoformat() if d.created_at else None,
+                    "last_seen_at": d.last_seen_at.isoformat() if d.last_seen_at else None,
+                }
+                for d in all_devices
+            ],
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ACCOUNT-DEVICES ERROR] {traceback.format_exc()}")
+        raise HTTPException(500, f"Erreur serveur: {str(e)}")
+
+
+@app.post("/api/account/devices/revoke")
+@app.post("/api/account/devices/revoke/")
+def revoke_account_device(req: RevokeDeviceRequest, db: Session = Depends(get_db)):
+    """Révoque un autre appareil à distance."""
+    try:
+        clean_target = req.device_id_to_revoke.strip().upper()
+
+        current_device = db.query(AccountDevice).filter(
+            AccountDevice.session_token == req.session_token
+        ).first()
+
+        if not current_device or not current_device.is_active:
+            raise HTTPException(401, "Session invalide.")
+
+        account = db.query(Account).filter(Account.id == current_device.account_id).first()
+        if not account:
+            raise HTTPException(404, "Compte introuvable.")
+
+        if current_device.device_id.strip().upper() == clean_target:
+            raise HTTPException(400, "Vous ne pouvez pas révoquer l'appareil courant.")
+
+        target = db.query(AccountDevice).filter(
+            AccountDevice.account_id == account.id,
+            AccountDevice.device_id == clean_target,
+            AccountDevice.is_active == True,
+        ).first()
+
+        if not target:
+            raise HTTPException(404, "Appareil introuvable ou déjà révoqué.")
+
+        target.is_active = False
+        target.revoked_at = get_utc_now()
+        target.revoked_reason = "Révoqué depuis un autre appareil"
+        db.commit()
+
+        return {
+            "status": "success",
+            "message": f"Appareil '{target.device_name or target.device_id[:12]}' révoqué.",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        print(f"[REVOKE-DEVICE ERROR] {traceback.format_exc()}")
+        raise HTTPException(500, f"Erreur serveur: {str(e)}")
+
+
+@app.post("/api/account/upgrade")
+@app.post("/api/account/upgrade/")
+def account_upgrade(req: AccountUpgradeRequest, db: Session = Depends(get_db)):
+    """Met à jour le plan du compte après un achat Play Store."""
+    try:
+        device = db.query(AccountDevice).filter(
+            AccountDevice.session_token == req.session_token
+        ).first()
+
+        if not device or not device.is_active:
+            raise HTTPException(401, "Session invalide.")
+
+        account = db.query(Account).filter(Account.id == device.account_id).first()
+        if not account:
+            raise HTTPException(404, "Compte introuvable.")
+
+        plan = db.query(LicensePlan).filter(LicensePlan.code == req.plan_code).first()
+        if not plan:
+            raise HTTPException(404, f"Plan '{req.plan_code}' introuvable.")
+
+        now = get_utc_now()
+        duration_days = 365 if req.is_yearly else 30
+
+        account.plan_code = req.plan_code
+        account.is_yearly = req.is_yearly
+        account.is_trial = False
+        account.purchase_token = req.purchase_token
+        account.purchase_platform = req.purchase_platform
+        account.expires_at = now + timedelta(days=duration_days)
+        db.commit()
+        db.refresh(account)
+
+        new_max = _get_plan_max_devices(account.plan_code, db)
+        active_count = db.query(AccountDevice).filter(
+            AccountDevice.account_id == account.id,
+            AccountDevice.is_active == True,
+        ).count()
+
+        access = _account_to_access_payload(account, db)
+        return {
+            "status": "success",
+            "message": f"Plan {plan.name} activé.",
+            "plan_code": account.plan_code,
+            "is_yearly": account.is_yearly,
+            "expires_at": account.expires_at.isoformat() if account.expires_at else None,
+            "max_devices": new_max,
+            "active_devices": active_count,
+            "access": access,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        print(f"[ACCOUNT-UPGRADE ERROR] {traceback.format_exc()}")
+        raise HTTPException(500, f"Erreur serveur: {str(e)}")
 
 
 # ═══════════════════════════════════════════════════════════
-# ROUTES PUBLIQUES
+# ROUTES PUBLIQUES (existantes)
 # ═══════════════════════════════════════════════════════════
 @app.get("/")
 def home():
@@ -794,9 +1476,6 @@ def health():
     return {"status": "healthy"}
 
 
-# ═══════════════════════════════════════════════════════════
-# ✅ NOUVEAU : /api/plans (public)
-# ═══════════════════════════════════════════════════════════
 @app.get("/api/plans")
 @app.get("/api/plans/")
 def get_public_plans(db: Session = Depends(get_db)):
@@ -835,9 +1514,6 @@ def get_public_plans(db: Session = Depends(get_db)):
     return result
 
 
-# ═══════════════════════════════════════════════════════════
-# APERÇU DE CE QUI SERA ACCORDÉ
-# ═══════════════════════════════════════════════════════════
 @app.get("/api/license/preview/{device_id}")
 @app.get("/api/license/preview/{device_id}/")
 def preview_access_for_device(device_id: str, db: Session = Depends(get_db)):
@@ -929,9 +1605,6 @@ def preview_access_for_device(device_id: str, db: Session = Depends(get_db)):
         raise HTTPException(500, f"Erreur DB: {str(e)}")
 
 
-# ═══════════════════════════════════════════════════════════
-# ROUTE : DEMANDE / RENOUVELLEMENT DE CLÉ
-# ═══════════════════════════════════════════════════════════
 @app.post("/api/license/request-key")
 @app.post("/api/license/request-key/")
 def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get_db)):
@@ -1101,7 +1774,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                 "access": access,
             }
 
-        # ─── NOUVELLE DEMANDE ───
         admin_lic = db.query(LicenseKey).filter(
             LicenseKey.phone_number == clean_phone,
             LicenseKey.is_active == True,
@@ -1307,7 +1979,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
                     "d'appareils est atteinte. Contactez l'administrateur."
                 )
 
-        # ─── CRÉATION NOUVELLE LICENCE ESSAI ───
         new_attempt = DeviceAttempt(
             device_id=clean_device,
             phone_number=clean_phone,
@@ -1368,9 +2039,6 @@ def request_license_key(req: SelfRegisterPhoneRequest, db: Session = Depends(get
         raise HTTPException(500, f"Erreur DB: {str(e)}")
 
 
-# ═══════════════════════════════════════════════════════════
-# ROUTE : VÉRIFICATION / ACTIVATION
-# ═══════════════════════════════════════════════════════════
 @app.post("/api/license/verify")
 @app.post("/api/license/verify/")
 def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(get_db)):
@@ -1490,23 +2158,16 @@ def verify_or_activate_flutter(req: FlutterVerifyRequest, db: Session = Depends(
         raise HTTPException(500, f"Erreur DB: {str(e)}")
 
 
-# ═══════════════════════════════════════════════════════════
-# ✅ NOUVEAU : UPGRADE via Google Play (achat utilisateur)
-# ═══════════════════════════════════════════════════════════
 @app.post("/api/license/upgrade")
 @app.post("/api/license/upgrade/")
 def upgrade_license(req: UpgradeLicenseRequest, db: Session = Depends(get_db)):
-    """
-    Appelé par l'app Flutter après un achat Play Store réussi.
-    Met à jour la licence avec le nouveau plan + prolonge l'expiration.
-    """
+    """Upgrade licence par clé (système existant WhatsApp)."""
     try:
         clean_key = req.key.strip().upper()
         clean_device = req.device_id.strip().upper()
 
         license_entry = db.query(LicenseKey).filter(LicenseKey.key == clean_key).first()
         if not license_entry:
-            # Créer une nouvelle licence directement avec le plan acheté
             part1, part2, part3, part4 = [secrets.token_hex(2).upper() for _ in range(4)]
             new_key = f"{part1}-{part2}-{part3}-{part4}"
             license_entry = LicenseKey(
@@ -1530,7 +2191,6 @@ def upgrade_license(req: UpgradeLicenseRequest, db: Session = Depends(get_db)):
             db.commit()
             db.refresh(license_entry)
         else:
-            # Mettre à jour la licence existante
             plan = db.query(LicensePlan).filter(LicensePlan.code == req.plan_code).first()
             if not plan:
                 raise HTTPException(404, f"Plan '{req.plan_code}' introuvable.")
@@ -1541,13 +2201,11 @@ def upgrade_license(req: UpgradeLicenseRequest, db: Session = Depends(get_db)):
             license_entry.is_active = True
             license_entry.purchase_token = req.purchase_token
 
-            # Durée : 30j mensuel, 365j annuel
             license_entry.duration_val = 30 if not req.is_yearly else 365
             license_entry.duration_unit = "Jours"
             license_entry.duration_days = float(license_entry.duration_val)
             license_entry.max_devices = plan.max_devices
 
-            # Ajouter les devices déjà liés
             try:
                 devices = json.loads(license_entry.device_uuid or "[]")
             except Exception:
@@ -1560,7 +2218,6 @@ def upgrade_license(req: UpgradeLicenseRequest, db: Session = Depends(get_db)):
             license_entry.activated_at = now
             license_entry.expires_at = _compute_expiry(license_entry, from_now=True)
 
-            # Débloquer le device associé
             dev = db.query(DeviceAttempt).filter(
                 DeviceAttempt.device_id == clean_device
             ).first()
@@ -1603,9 +2260,6 @@ def upgrade_license(req: UpgradeLicenseRequest, db: Session = Depends(get_db)):
         raise HTTPException(500, f"Erreur DB: {str(e)}")
 
 
-# ═══════════════════════════════════════════════════════════
-# ROUTE : CONFIG DURÉE PAR DÉFAUT (PUBLIQUE)
-# ═══════════════════════════════════════════════════════════
 @app.get("/api/config/default-trial")
 @app.get("/api/config/default-trial/")
 def get_public_default_trial(db: Session = Depends(get_db)):
@@ -1615,7 +2269,6 @@ def get_public_default_trial(db: Session = Depends(get_db)):
         "duration_unit": unit,
         "duration_days": days,
     }
-
 
 # ═══════════════════════════════════════════════════════════
 # ROUTES ADMIN — LICENCES
@@ -1898,7 +2551,6 @@ def reset_license_to_trial(key: str, req: ResetToTrialRequest, db: Session = Dep
     }
 
 
-# ✅ NOUVEAU : Définir un plan explicitement
 @app.post("/api/admin/licenses/{key}/set-plan", dependencies=[Depends(require_admin_key)])
 @app.post("/api/admin/licenses/{key}/set-plan/", dependencies=[Depends(require_admin_key)])
 def admin_set_license_plan(key: str, req: SetPlanRequest, db: Session = Depends(get_db)):
@@ -1988,7 +2640,7 @@ def delete_admin_license(key: str, db: Session = Depends(get_db)):
 
 
 # ═══════════════════════════════════════════════════════════
-# ✅ NOUVEAU : ROUTES ADMIN — PLANS
+# ROUTES ADMIN — PLANS
 # ═══════════════════════════════════════════════════════════
 @app.get("/api/admin/plans", dependencies=[Depends(require_admin_key)])
 @app.get("/api/admin/plans/", dependencies=[Depends(require_admin_key)])
@@ -2046,6 +2698,115 @@ def admin_update_plan(code: str, req: UpdatePlanRequest, db: Session = Depends(g
 
 
 # ═══════════════════════════════════════════════════════════
+# ROUTES ADMIN — COMPTES UTILISATEURS (NOUVEAU)
+# ═══════════════════════════════════════════════════════════
+@app.get("/api/admin/accounts", dependencies=[Depends(require_admin_key)])
+@app.get("/api/admin/accounts/", dependencies=[Depends(require_admin_key)])
+def admin_get_accounts(db: Session = Depends(get_db)):
+    """Liste tous les comptes utilisateurs."""
+    try:
+        accounts = db.query(Account).order_by(Account.id.desc()).all()
+        results = []
+        for acc in accounts:
+            device_count = db.query(AccountDevice).filter(
+                AccountDevice.account_id == acc.id,
+                AccountDevice.is_active == True,
+            ).count()
+
+            results.append({
+                "id": acc.id,
+                "email": acc.email,
+                "first_name": acc.first_name or "",
+                "last_name": acc.last_name or "",
+                "phone_number": acc.phone_number or "",
+                "plan_code": acc.plan_code,
+                "is_yearly": bool(acc.is_yearly),
+                "is_trial": bool(acc.is_trial),
+                "is_active": bool(acc.is_active),
+                "expires_at": acc.expires_at.isoformat() if acc.expires_at else None,
+                "purchase_token": acc.purchase_token,
+                "active_devices": device_count,
+                "created_at": acc.created_at.isoformat() if acc.created_at else "",
+                "last_login_at": acc.last_login_at.isoformat() if acc.last_login_at else None,
+            })
+        return results
+    except Exception as err:
+        print(f"[ADMIN-ACCOUNTS ERROR] {traceback.format_exc()}")
+        raise HTTPException(500, f"Erreur SQL: {str(err)}")
+
+
+@app.get("/api/admin/accounts/{account_id}/devices", dependencies=[Depends(require_admin_key)])
+def admin_get_account_devices(account_id: int, db: Session = Depends(get_db)):
+    """Liste les appareils d'un compte."""
+    account = db.query(Account).filter(Account.id == account_id).first()
+    if not account:
+        raise HTTPException(404, "Compte introuvable.")
+
+    devices = db.query(AccountDevice).filter(
+        AccountDevice.account_id == account_id
+    ).order_by(AccountDevice.last_seen_at.desc()).all()
+
+    return {
+        "status": "success",
+        "account_email": account.email,
+        "plan_code": account.plan_code,
+        "devices": [
+            {
+                "id": d.id,
+                "device_id": d.device_id,
+                "device_name": d.device_name or "",
+                "platform": d.platform,
+                "app_version": d.app_version,
+                "is_active": bool(d.is_active),
+                "created_at": d.created_at.isoformat() if d.created_at else None,
+                "last_seen_at": d.last_seen_at.isoformat() if d.last_seen_at else None,
+                "revoked_at": d.revoked_at.isoformat() if d.revoked_at else None,
+                "revoked_reason": d.revoked_reason or "",
+            }
+            for d in devices
+        ],
+    }
+
+
+@app.post("/api/admin/accounts/{account_id}/revoke-device", dependencies=[Depends(require_admin_key)])
+def admin_revoke_account_device(account_id: int, device_id: str, db: Session = Depends(get_db)):
+    """Révoque un appareil d'un compte (support)."""
+    device = db.query(AccountDevice).filter(
+        AccountDevice.account_id == account_id,
+        AccountDevice.device_id == device_id.strip().upper(),
+    ).first()
+
+    if not device:
+        raise HTTPException(404, "Appareil introuvable.")
+
+    device.is_active = False
+    device.revoked_at = get_utc_now()
+    device.revoked_reason = "Révoqué par l'administrateur"
+    db.commit()
+
+    return {
+        "status": "success",
+        "message": f"Appareil '{device.device_name or device.device_id[:12]}' révoqué.",
+    }
+
+
+@app.post("/api/admin/accounts/{account_id}/toggle-status", dependencies=[Depends(require_admin_key)])
+def admin_toggle_account_status(account_id: int, db: Session = Depends(get_db)):
+    """Active/désactive un compte."""
+    account = db.query(Account).filter(Account.id == account_id).first()
+    if not account:
+        raise HTTPException(404, "Compte introuvable.")
+
+    account.is_active = not account.is_active
+    db.commit()
+
+    return {
+        "status": "success",
+        "is_active": account.is_active,
+    }
+
+
+# ═══════════════════════════════════════════════════════════
 # ROUTES ADMIN — CONFIG DURÉE PAR DÉFAUT
 # ═══════════════════════════════════════════════════════════
 @app.get("/api/admin/config/default-trial", dependencies=[Depends(require_admin_key)])
@@ -2074,7 +2835,7 @@ def update_default_trial_config(req: DefaultTrialConfigRequest, db: Session = De
 
 
 # ═══════════════════════════════════════════════════════════
-# ROUTES ADMIN — APPAREILS
+# ROUTES ADMIN — APPAREILS (existant)
 # ═══════════════════════════════════════════════════════════
 @app.get("/api/admin/devices", dependencies=[Depends(require_admin_key)])
 @app.get("/api/admin/devices/", dependencies=[Depends(require_admin_key)])
@@ -2192,7 +2953,7 @@ def _grant_full_access_to_device(dev: DeviceAttempt, duration_val: int, duration
             is_trial=False,
             plan_code="pro",
             device_uuid=json.dumps([clean_device]),
-            max_devices=2,
+            max_devices=3,
             duration_days=days_float,
             duration_val=duration_val,
             duration_unit=duration_unit,
@@ -2395,6 +3156,9 @@ def delete_admin_news(news_id: int, db: Session = Depends(get_db)):
     return {"status": "success", "message": "Actualité supprimée."}
 
 
+# ═══════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
