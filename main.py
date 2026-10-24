@@ -515,10 +515,6 @@ def _get_plan_limits(plan_code: str, db: Session) -> dict:
 def _enforce_device_limit(account: Account, device_id: str, device_name: str,
                            platform: str, app_version: str,
                            db: Session) -> AccountDevice:
-    """
-    Vérifie/ajoute un device à un compte.
-    Si la limite est atteinte → désactive le plus ancien.
-    """
     clean_device = (device_id or "").strip().upper()
     max_devices = _get_plan_max_devices(account.plan_code, db)
 
@@ -567,7 +563,6 @@ def _enforce_device_limit(account: Account, device_id: str, device_name: str,
 
 
 def _account_to_access_payload(account: Account, db: Session) -> dict:
-    """Construit le payload d'accès pour un compte."""
     plan_code = account.plan_code or "trial"
     limits = _get_plan_limits(plan_code, db)
 
@@ -720,7 +715,6 @@ class RevokeDeviceRequest(BaseModel):
     device_id_to_revoke: str = Field(..., min_length=8, max_length=255)
 
 
-# ✅ NOUVEAUX SCHÉMAS ADMIN — COMPTES
 class AdminUpdateAccountRequest(BaseModel):
     first_name: Optional[str] = None
     last_name: Optional[str] = None
@@ -747,12 +741,11 @@ class AdminResetToTrialRequest(BaseModel):
 
 
 # ═══════════════════════════════════════════════════════════
-# ROUTES AUTH (email + password)
+# ROUTES AUTH
 # ═══════════════════════════════════════════════════════════
 @app.post("/api/auth/register")
 @app.post("/api/auth/register/")
 def auth_register(req: RegisterRequest, db: Session = Depends(get_db)):
-    """Créer un nouveau compte utilisateur."""
     try:
         email = _normalize_email(req.email)
         if not _validate_email(email):
@@ -826,7 +819,6 @@ def auth_register(req: RegisterRequest, db: Session = Depends(get_db)):
 @app.post("/api/auth/login")
 @app.post("/api/auth/login/")
 def auth_login(req: LoginRequest, db: Session = Depends(get_db)):
-    """Connexion + gestion multi-appareils."""
     try:
         email = _normalize_email(req.email)
         clean_device = req.device_id.strip().upper()
@@ -895,7 +887,6 @@ def auth_login(req: LoginRequest, db: Session = Depends(get_db)):
 @app.post("/api/auth/verify-session")
 @app.post("/api/auth/verify-session/")
 def auth_verify_session(req: VerifySessionRequest, db: Session = Depends(get_db)):
-    """Vérifier une session au démarrage de l'app."""
     try:
         clean_device = req.device_id.strip().upper()
         now = get_utc_now()
@@ -950,7 +941,6 @@ def auth_verify_session(req: VerifySessionRequest, db: Session = Depends(get_db)
 @app.post("/api/auth/logout")
 @app.post("/api/auth/logout/")
 def auth_logout(req: LogoutRequest, db: Session = Depends(get_db)):
-    """Déconnecte l'appareil courant."""
     try:
         device = db.query(AccountDevice).filter(
             AccountDevice.session_token == req.session_token
@@ -972,7 +962,6 @@ def auth_logout(req: LogoutRequest, db: Session = Depends(get_db)):
 @app.get("/api/account/devices")
 @app.get("/api/account/devices/")
 def get_account_devices(session_token: str, db: Session = Depends(get_db)):
-    """Liste tous les appareils actifs du compte."""
     try:
         device = db.query(AccountDevice).filter(
             AccountDevice.session_token == session_token
@@ -1022,7 +1011,6 @@ def get_account_devices(session_token: str, db: Session = Depends(get_db)):
 @app.post("/api/account/devices/revoke")
 @app.post("/api/account/devices/revoke/")
 def revoke_account_device(req: RevokeDeviceRequest, db: Session = Depends(get_db)):
-    """Révoque un autre appareil à distance."""
     try:
         clean_target = req.device_id_to_revoke.strip().upper()
 
@@ -1070,7 +1058,6 @@ def revoke_account_device(req: RevokeDeviceRequest, db: Session = Depends(get_db
 @app.post("/api/account/upgrade")
 @app.post("/api/account/upgrade/")
 def account_upgrade(req: AccountUpgradeRequest, db: Session = Depends(get_db)):
-    """Met à jour le plan du compte après un achat Play Store."""
     try:
         device = db.query(AccountDevice).filter(
             AccountDevice.session_token == req.session_token
@@ -1146,7 +1133,6 @@ def health():
 @app.get("/api/plans")
 @app.get("/api/plans/")
 def get_public_plans(db: Session = Depends(get_db)):
-    """Retourne les plans disponibles avec tarifs et limites."""
     plans = (
         db.query(LicensePlan)
         .filter(LicensePlan.is_active == True)
@@ -1179,6 +1165,34 @@ def get_public_plans(db: Session = Depends(get_db)):
             "max_devices": p.max_devices,
         })
     return result
+
+
+# ✅ NOUVEAU : endpoint public pour récupérer les limites d'un plan spécifique
+@app.get("/api/plans/{code}")
+@app.get("/api/plans/{code}/")
+def get_plan_by_code(code: str, db: Session = Depends(get_db)):
+    """Retourne les limites d'un plan spécifique (utilisé par l'app mobile
+    pour rafraîchir les limites après une modification admin)."""
+    plan = db.query(LicensePlan).filter(LicensePlan.code == code.lower()).first()
+    if not plan:
+        raise HTTPException(404, "Plan introuvable.")
+    return {
+        "code": plan.code,
+        "name": plan.name,
+        "description": plan.description or "",
+        "price_monthly_usd": float(plan.price_monthly_usd or 0),
+        "price_yearly_usd": float(plan.price_yearly_usd or 0),
+        "max_tables": plan.max_tables,
+        "max_rows_per_table": plan.max_rows_per_table,
+        "max_devices": plan.max_devices,
+        "allow_export": bool(plan.allow_export),
+        "allow_cloud_backup": bool(plan.allow_cloud_backup),
+        "allow_bulk_export": bool(plan.allow_bulk_export),
+        "allow_merge_tables": bool(plan.allow_merge_tables),
+        "allow_custom_branding": bool(plan.allow_custom_branding),
+        "allow_reminders": bool(plan.allow_reminders),
+        "is_active": bool(plan.is_active),
+    }
 
 
 @app.get("/api/config/default-trial")
@@ -1251,12 +1265,11 @@ def admin_update_plan(code: str, req: UpdatePlanRequest, db: Session = Depends(g
 
 
 # ═══════════════════════════════════════════════════════════
-# ROUTES ADMIN — COMPTES UTILISATEURS
+# ROUTES ADMIN — COMPTES
 # ═══════════════════════════════════════════════════════════
 @app.get("/api/admin/accounts", dependencies=[Depends(require_admin_key)])
 @app.get("/api/admin/accounts/", dependencies=[Depends(require_admin_key)])
 def admin_get_accounts(db: Session = Depends(get_db)):
-    """Liste tous les comptes utilisateurs."""
     try:
         accounts = db.query(Account).order_by(Account.id.desc()).all()
         results = []
@@ -1290,7 +1303,6 @@ def admin_get_accounts(db: Session = Depends(get_db)):
 
 @app.get("/api/admin/accounts/{account_id}/devices", dependencies=[Depends(require_admin_key)])
 def admin_get_account_devices(account_id: int, db: Session = Depends(get_db)):
-    """Liste les appareils d'un compte."""
     account = db.query(Account).filter(Account.id == account_id).first()
     if not account:
         raise HTTPException(404, "Compte introuvable.")
@@ -1323,7 +1335,6 @@ def admin_get_account_devices(account_id: int, db: Session = Depends(get_db)):
 
 @app.post("/api/admin/accounts/{account_id}/revoke-device", dependencies=[Depends(require_admin_key)])
 def admin_revoke_account_device(account_id: int, device_id: str, db: Session = Depends(get_db)):
-    """Révoque un appareil d'un compte (support)."""
     device = db.query(AccountDevice).filter(
         AccountDevice.account_id == account_id,
         AccountDevice.device_id == device_id.strip().upper(),
@@ -1345,7 +1356,6 @@ def admin_revoke_account_device(account_id: int, device_id: str, db: Session = D
 
 @app.post("/api/admin/accounts/{account_id}/toggle-status", dependencies=[Depends(require_admin_key)])
 def admin_toggle_account_status(account_id: int, db: Session = Depends(get_db)):
-    """Active/désactive un compte."""
     account = db.query(Account).filter(Account.id == account_id).first()
     if not account:
         raise HTTPException(404, "Compte introuvable.")
@@ -1366,7 +1376,6 @@ def admin_update_account(
     req: AdminUpdateAccountRequest,
     db: Session = Depends(get_db)
 ):
-    """Met à jour les infos d'un compte (nom, téléphone, statut)."""
     account = db.query(Account).filter(Account.id == account_id).first()
     if not account:
         raise HTTPException(404, "Compte introuvable.")
@@ -1406,7 +1415,6 @@ def admin_grant_full_access_account(
     req: AdminGrantFullAccessRequest,
     db: Session = Depends(get_db)
 ):
-    """Accorde un accès complet (payant) à un compte."""
     account = db.query(Account).filter(Account.id == account_id).first()
     if not account:
         raise HTTPException(404, "Compte introuvable.")
@@ -1456,7 +1464,6 @@ def admin_reset_account_to_trial(
     req: AdminResetToTrialRequest,
     db: Session = Depends(get_db)
 ):
-    """Remet un compte en mode essai."""
     account = db.query(Account).filter(Account.id == account_id).first()
     if not account:
         raise HTTPException(404, "Compte introuvable.")
@@ -1499,7 +1506,6 @@ def admin_reset_account_devices(
     account_id: int,
     db: Session = Depends(get_db)
 ):
-    """Révoque tous les appareils actifs d'un compte."""
     account = db.query(Account).filter(Account.id == account_id).first()
     if not account:
         raise HTTPException(404, "Compte introuvable.")
@@ -1533,7 +1539,6 @@ def admin_delete_account(
     account_id: int,
     db: Session = Depends(get_db)
 ):
-    """Supprime un compte et tous ses appareils."""
     account = db.query(Account).filter(Account.id == account_id).first()
     if not account:
         raise HTTPException(404, "Compte introuvable.")
