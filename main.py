@@ -1,6 +1,7 @@
 # main.py
 # ═══════════════════════════════════════════════════════════
 #  SmartCollect — Backend API & Admin Server
+#  ✅ Email via Brevo API HTTP (port 443, jamais bloqué)
 # ═══════════════════════════════════════════════════════════
 
 import os
@@ -12,9 +13,7 @@ import re
 import hashlib
 import random
 import string
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import requests
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 
@@ -43,9 +42,8 @@ SESSION_DURATION_DAYS = 30
 
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
 
-# ─── Brevo SMTP Config ───
-BREVO_SMTP_LOGIN = os.getenv("BREVO_SMTP_LOGIN", "").strip()
-BREVO_SMTP_KEY = os.getenv("BREVO_SMTP_KEY", "").strip()
+# ─── Brevo API Config ───
+BREVO_API_KEY = os.getenv("BREVO_API_KEY", "").strip()
 BREVO_SENDER_EMAIL = os.getenv("BREVO_SENDER_EMAIL", "noreply@smartcollect.com").strip()
 BREVO_SENDER_NAME = os.getenv("BREVO_SENDER_NAME", "SmartCollect").strip()
 
@@ -58,7 +56,6 @@ if not ADMIN_API_KEY:
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 if not DATABASE_URL:
-    print("❌ [FATAL] DATABASE_URL non définie !")
     raise RuntimeError("DATABASE_URL requis.")
 
 if DATABASE_URL.startswith("postgres://"):
@@ -107,43 +104,50 @@ def get_utc_now():
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 # ═══════════════════════════════════════════════════════════
-# ✅ FONCTION D'ENVOI D'EMAIL (Brevo SMTP)
+# ✅ FONCTION D'ENVOI D'EMAIL (Brevo API HTTP - Port 443)
 # ═══════════════════════════════════════════════════════════
 def _send_reset_email(to_email: str, otp_code: str) -> bool:
-    if not BREVO_SMTP_LOGIN or not BREVO_SMTP_KEY:
-        print("⚠️ [EMAIL] BREVO_SMTP_LOGIN ou BREVO_SMTP_KEY non configurés.")
+    if not BREVO_API_KEY:
+        print("⚠️ [EMAIL] BREVO_API_KEY non configurée sur Render.")
         return False
 
     try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = "Code de réinitialisation - SmartCollect"
-        msg["From"] = f"{BREVO_SENDER_NAME} <{BREVO_SENDER_EMAIL}>"
-        msg["To"] = to_email
-
-        html = f"""
-        <div style="font-family: Arial, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px; border: 1px solid #e2e8f0; border-radius: 10px;">
-            <h2 style="color: #4F46E5; text-align: center;">SmartCollect</h2>
-            <p>Bonjour,</p>
-            <p>Vous avez demandé la réinitialisation de votre mot de passe.</p>
-            <p>Voici votre code de sécurité :</p>
-            <div style="text-align: center; margin: 20px 0;">
-                <span style="font-size: 32px; font-weight: bold; letter-spacing: 8px; color: #0F172A; background: #F1F5F9; padding: 10px 20px; border-radius: 8px; display: inline-block;">{otp_code}</span>
-            </div>
-            <p>Ce code est valable pendant <strong>15 minutes</strong>.</p>
-            <p style="color: #64748B; font-size: 12px;">Si vous n'êtes pas à l'origine de cette demande, ignorez cet email.</p>
-        </div>
-        """
-        msg.attach(MIMEText(html, "html"))
-
-        with smtplib.SMTP("smtp-relay.brevo.com", 587) as server:
-            server.starttls()
-            server.login(BREVO_SMTP_LOGIN, BREVO_SMTP_KEY)
-            server.sendmail(BREVO_SENDER_EMAIL, [to_email], msg.as_string())
-
-        print(f"✅ [EMAIL] Envoyé à {to_email}")
-        return True
+        res = requests.post(
+            "https://api.brevo.com/v3/smtp/email",
+            headers={
+                "accept": "application/json",
+                "api-key": BREVO_API_KEY,
+                "content-type": "application/json"
+            },
+            json={
+                "sender": {"name": BREVO_SENDER_NAME, "email": BREVO_SENDER_EMAIL},
+                "to": [{"email": to_email}],
+                "subject": "Code de réinitialisation - SmartCollect",
+                "htmlContent": f"""
+                <div style="font-family: Arial, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px; border: 1px solid #e2e8f0; border-radius: 10px;">
+                    <h2 style="color: #4F46E5; text-align: center;">SmartCollect</h2>
+                    <p>Bonjour,</p>
+                    <p>Vous avez demandé la réinitialisation de votre mot de passe.</p>
+                    <p>Voici votre code de sécurité :</p>
+                    <div style="text-align: center; margin: 20px 0;">
+                        <span style="font-size: 32px; font-weight: bold; letter-spacing: 8px; color: #0F172A; background: #F1F5F9; padding: 10px 20px; border-radius: 8px; display: inline-block;">{otp_code}</span>
+                    </div>
+                    <p>Ce code est valable pendant <strong>15 minutes</strong>.</p>
+                    <p style="color: #64748B; font-size: 12px;">Si vous n'êtes pas à l'origine de cette demande, ignorez cet email.</p>
+                </div>
+                """
+            },
+            timeout=15
+        )
+        
+        if res.status_code in (200, 201, 202):
+            print(f"✅ [EMAIL] Envoyé à {to_email} (via API HTTP)")
+            return True
+        else:
+            print(f"❌ [EMAIL ERROR] Brevo API a refusé : {res.status_code} - {res.text}")
+            return False
     except Exception as e:
-        print(f"❌ [EMAIL ERROR] Échec de l'envoi : {e}")
+        print(f"❌ [EMAIL ERROR] Exception : {e}")
         return False
 
 # ═══════════════════════════════════════════════════════════
@@ -342,7 +346,6 @@ def _seed_default_plans():
             if not existing:
                 db.add(LicensePlan(**p))
         db.commit()
-        print("[seed] Plans par défaut OK")
     except Exception as e:
         print(f"[seed] Erreur : {e}")
         db.rollback()
