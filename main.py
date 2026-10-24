@@ -1,6 +1,3 @@
-# main.py
-# ... (tout le début reste identique jusqu'à la ligne "SCHÉMAS PYDANTIC")
-
 import os
 import json
 import secrets
@@ -8,18 +5,20 @@ import time
 import traceback
 import re
 import hashlib
-import random    # ✅ AJOUTÉ
-import string    # ✅ AJOUTÉ
+import random    # ✅ Doit être là
+import string    # ✅ Doit être là
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 
-# ... (tout le code jusqu'aux schémas Pydantic reste identique)
-
-# ═══════════════════════════════════════════════════════════
-# SCHÉMAS PYDANTIC
-# ═══════════════════════════════════════════════════════════
-
-# ... (les autres schémas existants) ...
+from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field   # ✅ CETTE LIGNE DOIT ÊTRE PRÉSENTE
+from sqlalchemy import (
+    create_engine, Column, Integer, String, Boolean, DateTime, Text, Float, text,
+    ForeignKey, Index
+)
+from sqlalchemy.orm import declarative_base, sessionmaker, Session
+import resend    # ✅ Si tu as ajouté Resend
 
 # ✅ NOUVEAUX SCHÉMAS
 class ForgotPasswordRequest(BaseModel):
