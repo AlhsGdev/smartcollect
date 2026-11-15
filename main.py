@@ -139,7 +139,7 @@ def _send_reset_email(to_email: str, otp_code: str) -> bool:
             },
             timeout=15
         )
-        
+
         if res.status_code in (200, 201, 202):
             print(f"✅ [EMAIL] Envoyé à {to_email} (via API HTTP)")
             return True
@@ -807,6 +807,9 @@ def admin_toggle_account_status(account_id: int, db: Session = Depends(get_db)):
     db.commit()
     return {"status": "success", "is_active": account.is_active}
 
+# ═══════════════════════════════════════════════════════════
+# BUG FIX: plan_code / is_yearly / is_trial désormais appliqués
+# ═══════════════════════════════════════════════════════════
 @app.put("/api/admin/accounts/{account_id}", dependencies=[Depends(require_admin_key)])
 def admin_update_account(account_id: int, req: AdminUpdateAccountRequest, db: Session = Depends(get_db)):
     account = db.query(Account).filter(Account.id == account_id).first()
@@ -815,6 +818,9 @@ def admin_update_account(account_id: int, req: AdminUpdateAccountRequest, db: Se
     if req.last_name is not None: account.last_name = req.last_name.strip()
     if req.phone_number is not None: account.phone_number = req.phone_number.strip()
     if req.is_active is not None: account.is_active = req.is_active
+    if req.plan_code is not None: account.plan_code = req.plan_code
+    if req.is_yearly is not None: account.is_yearly = req.is_yearly
+    if req.is_trial is not None: account.is_trial = req.is_trial
     db.commit()
     return {"status": "success", "message": "Compte mis à jour."}
 
