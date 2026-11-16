@@ -11,6 +11,8 @@ import time
 import traceback
 import re
 import hashlib
+import hmac
+import base64
 import random
 import string
 import requests
@@ -41,6 +43,12 @@ DEFAULT_TRIAL_UNIT = "Jours"
 SESSION_DURATION_DAYS = 30
 
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
+
+# Secret used to derive each account's backup encryption key. Set once in
+# the hosting environment and NEVER change it: backups made with a key
+# derived from the old secret could no longer be restored.
+BACKUP_MASTER_SECRET = os.getenv("BACKUP_MASTER_SECRET", "").strip()
+BACKUP_KEY_VERSION = 1
 
 # ─── Brevo API Config ───
 BREVO_API_KEY = os.getenv("BREVO_API_KEY", "").strip()
@@ -760,6 +768,37 @@ def account_upgrade(req: AccountUpgradeRequest, db: Session = Depends(get_db)):
 # ═══════════════════════════════════════════════════════════
 # ROUTES ADMIN
 # ═══════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════
+# CLÉ DE SAUVEGARDE (app v2)
+# ═══════════════════════════════════════════════════════════
+class BackupKeyRequest(BaseModel):
+    session_token: str
+    device_id: str
+
+def _derive_backup_key(account_id: int) -> str:
+    """Per-account key: HMAC-SHA256(secret, account id), base64url."""
+    msg = f"smartcollect-backup-v{BACKUP_KEY_VERSION}:{account_id}".encode()
+    digest = hmac.new(BACKUP_MASTER_SECRET.encode(), msg, hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(digest).decode().rstrip("=")
+
+@app.post("/api/account/backup-key")
+def account_backup_key(req: BackupKeyRequest, db: Session = Depends(get_db)):
+    """Key that encrypts the account's backups. Only the account owner,
+    with a valid session, gets it: the same account can restore its
+    backups on a new device; another account cannot read them.
+    An expired subscription does not block it: users can always restore
+    their own data."""
+    if not BACKUP_MASTER_SECRET:
+        raise HTTPException(503, "Sauvegarde chiffrée indisponible.")
+    clean_device = req.device_id.strip().upper()
+    device = db.query(AccountDevice).filter(AccountDevice.session_token == req.session_token, AccountDevice.device_id == clean_device).first()
+    if not device: raise HTTPException(401, "Session introuvable.")
+    if not device.is_active: raise HTTPException(403, "Session révoquée.")
+    if device.session_expires_at and get_utc_now() > device.session_expires_at: raise HTTPException(401, "Session expirée.")
+    account = db.query(Account).filter(Account.id == device.account_id).first()
+    if not account or not account.is_active: raise HTTPException(403, "Compte désactivé.")
+    return {"status": "success", "account_id": account.id, "key_version": BACKUP_KEY_VERSION, "key": _derive_backup_key(account.id)}
+
 @app.get("/api/admin/plans", dependencies=[Depends(require_admin_key)])
 def admin_get_plans(db: Session = Depends(get_db)):
     plans = db.query(LicensePlan).order_by(LicensePlan.display_order.asc()).all()
