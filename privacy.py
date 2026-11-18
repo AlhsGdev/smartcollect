@@ -1,4 +1,4 @@
-"""Privacy policy of the SmartCollect app (public page required by Google
+"""Privacy policy of the Tablyo app (public page required by Google
 Play and by the Google sign-in consent screen). French by default,
 English with ?lang=en. The contact address comes from PRIVACY_CONTACT_EMAIL.
 """
@@ -16,10 +16,10 @@ def _contact() -> str:
 
 
 _FR = """
-<h1>Politique de confidentialité de SmartCollect</h1>
+<h1>Politique de confidentialité de Tablyo</h1>
 <p class="meta">Éditeur : {publisher} · Dernière mise à jour : {updated}</p>
 
-<p>SmartCollect est une application de collecte et d'organisation de données
+<p>Tablyo est une application de collecte et d'organisation de données
 (tables, fiches, rendez-vous, documents). Cette page explique quelles données
 sont traitées, pourquoi, et quels sont vos droits.</p>
 
@@ -91,7 +91,7 @@ Google Drive (Paramètres › Gérer les applications).</p>
 stockés chiffrés et les sauvegardes sont chiffrées pour votre compte.</p>
 
 <h2>8. Enfants</h2>
-<p>SmartCollect est destinée à un usage professionnel ou associatif et ne
+<p>Tablyo est destinée à un usage professionnel ou associatif et ne
 s'adresse pas aux enfants de moins de 13 ans.</p>
 
 <h2>9. Contact</h2>
@@ -104,10 +104,10 @@ page.</p>
 """
 
 _EN = """
-<h1>SmartCollect privacy policy</h1>
+<h1>Tablyo privacy policy</h1>
 <p class="meta">Publisher: {publisher} · Last updated: {updated}</p>
 
-<p>SmartCollect is an app to collect and organise data (tables, sheets,
+<p>Tablyo is an app to collect and organise data (tables, sheets,
 appointments, documents). This page explains which data is processed, why, and
 your rights.</p>
 
@@ -139,7 +139,7 @@ access to its own private space in your Google Drive ("drive.appdata"). It
 cannot see your other files. Backups are sent there encrypted; we cannot read
 them. You can withdraw this access at any time from the app or from your Google
 account (myaccount.google.com/permissions).</p>
-<p>SmartCollect's use of information received from Google APIs adheres to the
+<p>Tablyo's use of information received from Google APIs adheres to the
 <a href="https://developers.google.com/terms/api-services-user-data-policy">Google
 API Services User Data Policy</a>, including the Limited Use requirements.</p>
 
@@ -173,7 +173,7 @@ apps).</p>
 and backups are encrypted for your account.</p>
 
 <h2>8. Children</h2>
-<p>SmartCollect is meant for professional or community use and is not directed
+<p>Tablyo is meant for professional or community use and is not directed
 at children under 13.</p>
 
 <h2>9. Contact</h2>
@@ -220,8 +220,8 @@ def privacy_page(lang: str = "fr") -> str:
     )
     return _PAGE.format(
         lang="en" if en else "fr",
-        title="SmartCollect – Privacy policy" if en
-        else "SmartCollect – Politique de confidentialité",
+        title="Tablyo – Privacy policy" if en
+        else "Tablyo – Politique de confidentialité",
         other="fr" if en else "en",
         switch="Version française" if en else "English version",
         body=body,
@@ -230,8 +230,8 @@ def privacy_page(lang: str = "fr") -> str:
 
 _DELETE = {
     "fr": {
-        "title": "SmartCollect – Supprimer mon compte",
-        "h1": "Supprimer mon compte SmartCollect",
+        "title": "Tablyo – Supprimer mon compte",
+        "h1": "Supprimer mon compte Tablyo",
         "intro": (
             "Vous pouvez supprimer votre compte depuis l'application "
             "(Compte › Supprimer mon compte) ou ici. La suppression est "
@@ -256,8 +256,8 @@ _DELETE = {
         "switch": "English version",
     },
     "en": {
-        "title": "SmartCollect – Delete my account",
-        "h1": "Delete my SmartCollect account",
+        "title": "Tablyo – Delete my account",
+        "h1": "Delete my Tablyo account",
         "intro": (
             "You can delete your account from the app (Account › Delete my "
             "account) or here. Deletion is <strong>permanent</strong>: your "
