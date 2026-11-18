@@ -21,6 +21,9 @@ from typing import Optional, List
 
 from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+
+from privacy import privacy_page
 from pydantic import BaseModel, Field
 from sqlalchemy import (
     create_engine, Column, Integer, String, Boolean, DateTime, Text, Float, text,
@@ -703,6 +706,11 @@ def home(): return {"status": "online", "database": "PostgreSQL", "service": "Sm
 
 @app.get("/health")
 def health(): return {"status": "healthy"}
+
+@app.get("/privacy", response_class=HTMLResponse)
+def privacy(lang: str = "fr"):
+    """Public privacy policy of the app (Google Play, Google sign-in)."""
+    return privacy_page(lang)
 
 @app.get("/api/plans")
 def get_public_plans(db: Session = Depends(get_db)):
