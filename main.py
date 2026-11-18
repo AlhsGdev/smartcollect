@@ -23,7 +23,7 @@ from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
-from privacy import privacy_page
+from privacy import delete_account_page_html, privacy_page
 from pydantic import BaseModel, Field
 from sqlalchemy import (
     create_engine, Column, Integer, String, Boolean, DateTime, Text, Float, text,
@@ -806,6 +806,53 @@ def account_backup_key(req: BackupKeyRequest, db: Session = Depends(get_db)):
     account = db.query(Account).filter(Account.id == device.account_id).first()
     if not account or not account.is_active: raise HTTPException(403, "Compte désactivé.")
     return {"status": "success", "account_id": account.id, "key_version": BACKUP_KEY_VERSION, "key": _derive_backup_key(account.id)}
+
+# ═══════════════════════════════════════════════════════════
+# SUPPRESSION DU COMPTE (exigence Google Play)
+# ═══════════════════════════════════════════════════════════
+class DeleteAccountRequest(BaseModel):
+    session_token: str
+    device_id: str
+    password: str
+
+class DeleteAccountByPasswordRequest(BaseModel):
+    email: str
+    password: str
+
+def _delete_account(account: Account, db: Session) -> None:
+    """Deletes the account and everything the server keeps about it
+    (its devices). Work data never reaches the server."""
+    db.query(AccountDevice).filter(AccountDevice.account_id == account.id).delete(synchronize_session=False)
+    db.delete(account)
+    db.commit()
+
+@app.post("/api/account/delete")
+def account_delete(req: DeleteAccountRequest, db: Session = Depends(get_db)):
+    """From the app: a valid session and the password again."""
+    clean_device = req.device_id.strip().upper()
+    device = db.query(AccountDevice).filter(AccountDevice.session_token == req.session_token, AccountDevice.device_id == clean_device).first()
+    if not device or not device.is_active: raise HTTPException(401, "Session invalide.")
+    account = db.query(Account).filter(Account.id == device.account_id).first()
+    if not account: raise HTTPException(404, "Compte introuvable.")
+    if not _verify_password(req.password, account.password_hash): raise HTTPException(401, "Mot de passe incorrect.")
+    _delete_account(account, db)
+    return {"status": "success", "message": "Compte supprimé."}
+
+@app.post("/api/account/delete-by-password")
+def account_delete_by_password(req: DeleteAccountByPasswordRequest, db: Session = Depends(get_db)):
+    """From the web page (/delete-account), without the app."""
+    email = _normalize_email(req.email)
+    account = db.query(Account).filter(Account.email == email).first()
+    # Same answer for an unknown e-mail and a wrong password.
+    if not account or not _verify_password(req.password, account.password_hash):
+        raise HTTPException(401, "E-mail ou mot de passe incorrect.")
+    _delete_account(account, db)
+    return {"status": "success", "message": "Compte supprimé."}
+
+@app.get("/delete-account", response_class=HTMLResponse)
+def delete_account_page(lang: str = "fr"):
+    """Public page to delete an account without the app (Google Play)."""
+    return delete_account_page_html(lang)
 
 @app.get("/api/admin/plans", dependencies=[Depends(require_admin_key)])
 def admin_get_plans(db: Session = Depends(get_db)):

@@ -78,8 +78,10 @@ exigences d'utilisation limitée.</p>
 
 <h2>6. Conservation et suppression</h2>
 <p>Les données de compte sont conservées tant que votre compte existe. Vous
-pouvez demander la suppression de votre compte et des données associées en
-écrivant à l'adresse ci-dessous ; elle est effectuée sous 30 jours. Les données
+pouvez supprimer votre compte et les données associées à tout moment, depuis
+l'application (Compte › Supprimer mon compte) ou depuis la page
+<a href="/delete-account">Supprimer mon compte</a> ; la suppression est
+immédiate. Vous pouvez aussi la demander à l'adresse ci-dessous. Les données
 de travail sur votre appareil disparaissent quand vous désinstallez
 l'application ; vos sauvegardes Google Drive peuvent être supprimées depuis
 Google Drive (Paramètres › Gérer les applications).</p>
@@ -159,9 +161,10 @@ API Services User Data Policy</a>, including the Limited Use requirements.</p>
 </ul>
 
 <h2>6. Retention and deletion</h2>
-<p>Account data is kept as long as your account exists. You can ask for your
-account and its data to be deleted by writing to the address below; it is done
-within 30 days. Work data on your device is removed when you uninstall the app;
+<p>Account data is kept as long as your account exists. You can delete your
+account and its data at any time, from the app (Account › Delete my account) or
+from the <a href="/delete-account?lang=en">Delete my account</a> page; deletion
+is immediate. You can also ask for it at the address below. Work data on your device is removed when you uninstall the app;
 your Google Drive backups can be deleted from Google Drive (Settings › Manage
 apps).</p>
 
@@ -222,4 +225,140 @@ def privacy_page(lang: str = "fr") -> str:
         other="fr" if en else "en",
         switch="Version française" if en else "English version",
         body=body,
+    )
+
+
+_DELETE = {
+    "fr": {
+        "title": "SmartCollect – Supprimer mon compte",
+        "h1": "Supprimer mon compte SmartCollect",
+        "intro": (
+            "Vous pouvez supprimer votre compte depuis l'application "
+            "(Compte › Supprimer mon compte) ou ici. La suppression est "
+            "<strong>définitive</strong> : votre compte, votre formule et la "
+            "liste de vos appareils sont effacés de nos serveurs, aussitôt."
+        ),
+        "kept": (
+            "Vos données de travail ne sont pas sur nos serveurs : elles restent "
+            "sur vos appareils jusqu'à la désinstallation de l'app. Vos "
+            "sauvegardes Google Drive se suppriment depuis Google Drive "
+            "(Paramètres › Gérer les applications). Un abonnement Google Play "
+            "s'arrête depuis Google Play (Paiements et abonnements)."
+        ),
+        "email": "Adresse e-mail du compte",
+        "password": "Mot de passe",
+        "confirm": "Je comprends que la suppression est définitive.",
+        "button": "Supprimer définitivement mon compte",
+        "done": "Votre compte a été supprimé.",
+        "wrong": "E-mail ou mot de passe incorrect.",
+        "error": "La suppression n'a pas abouti. Réessayez plus tard.",
+        "other": "en",
+        "switch": "English version",
+    },
+    "en": {
+        "title": "SmartCollect – Delete my account",
+        "h1": "Delete my SmartCollect account",
+        "intro": (
+            "You can delete your account from the app (Account › Delete my "
+            "account) or here. Deletion is <strong>permanent</strong>: your "
+            "account, your plan and the list of your devices are erased from "
+            "our servers at once."
+        ),
+        "kept": (
+            "Your work data is not on our servers: it stays on your devices "
+            "until you uninstall the app. Your Google Drive backups are deleted "
+            "from Google Drive (Settings › Manage apps). A Google Play "
+            "subscription is cancelled in Google Play (Payments & "
+            "subscriptions)."
+        ),
+        "email": "Account e-mail",
+        "password": "Password",
+        "confirm": "I understand that deletion is permanent.",
+        "button": "Permanently delete my account",
+        "done": "Your account has been deleted.",
+        "wrong": "Wrong e-mail or password.",
+        "error": "Deletion failed. Please try again later.",
+        "other": "fr",
+        "switch": "Version française",
+    },
+}
+
+_DELETE_PAGE = """<!doctype html>
+<html lang="{lang}"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+body{{margin:0;background:#F3F5F4;color:#0B1F2A;font:16px/1.6 Inter,system-ui,
+-apple-system,"Segoe UI",Roboto,sans-serif}}
+main{{max-width:560px;margin:0 auto;padding:32px 20px 64px}}
+h1{{font-size:26px;line-height:1.25;margin:0 0 12px}}
+p{{margin:0 0 14px}} .muted{{color:#4A5B66;font-size:15px}}
+a{{color:#0E7C86}} nav{{margin-bottom:18px}}
+label{{display:block;font-weight:600;margin:14px 0 6px}}
+input[type=email],input[type=password]{{width:100%;box-sizing:border-box;
+min-height:44px;padding:10px 12px;border:1px solid #C9D3D7;border-radius:14px;
+font:inherit;background:#fff;color:#0B1F2A}}
+.check{{display:flex;gap:10px;align-items:flex-start;font-weight:400}}
+.check input{{width:20px;height:20px;margin-top:3px}}
+button{{margin-top:18px;min-height:48px;width:100%;border:0;border-radius:14px;
+background:#C0392B;color:#fff;font:600 16px Inter,system-ui,sans-serif;cursor:pointer}}
+button:disabled{{opacity:.5;cursor:default}}
+#msg{{margin-top:16px;font-weight:600}}
+@media (prefers-color-scheme:dark){{body{{background:#0B1F2A;color:#E8EEF0}}
+.muted{{color:#A9B8C0}}a{{color:#5CC3CC}}}}
+</style></head>
+<body><main>
+<nav><a href="?lang={other}">{switch}</a> · <a href="/privacy?lang={lang}">Privacy</a></nav>
+<h1>{h1}</h1>
+<p>{intro}</p>
+<p class="muted">{kept}</p>
+<form id="f">
+<label for="e">{email}</label>
+<input id="e" type="email" autocomplete="username" required>
+<label for="p">{password}</label>
+<input id="p" type="password" autocomplete="current-password" required>
+<label class="check"><input id="c" type="checkbox" required> {confirm}</label>
+<button id="b" type="submit">{button}</button>
+<div id="msg" role="status"></div>
+</form>
+<script>
+document.getElementById('f').addEventListener('submit', async function (ev) {{
+  ev.preventDefault();
+  var b = document.getElementById('b'), m = document.getElementById('msg');
+  b.disabled = true; m.textContent = '';
+  try {{
+    var r = await fetch('/api/account/delete-by-password', {{
+      method: 'POST', headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{email: document.getElementById('e').value,
+                            password: document.getElementById('p').value}})
+    }});
+    if (r.ok) {{ m.textContent = {done}; document.getElementById('f').reset(); return; }}
+    m.textContent = r.status === 401 ? {wrong} : {error};
+  }} catch (_) {{ m.textContent = {error}; }}
+  b.disabled = false;
+}});
+</script>
+</main></body></html>"""
+
+
+def delete_account_page_html(lang: str = "fr") -> str:
+    import json
+
+    key = "en" if lang.lower().startswith("en") else "fr"
+    t = _DELETE[key]
+    return _DELETE_PAGE.format(
+        lang=key,
+        title=t["title"],
+        h1=t["h1"],
+        intro=t["intro"],
+        kept=t["kept"],
+        email=t["email"],
+        password=t["password"],
+        confirm=t["confirm"],
+        button=t["button"],
+        done=json.dumps(t["done"]),
+        wrong=json.dumps(t["wrong"]),
+        error=json.dumps(t["error"]),
+        other=t["other"],
+        switch=t["switch"],
     )
