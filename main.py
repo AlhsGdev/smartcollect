@@ -15,19 +15,22 @@ import hmac
 import base64
 import random
 import string
+import csv
+import io
 import requests
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 
-from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 
 from privacy import delete_account_page_html, privacy_page
 from pydantic import BaseModel, Field
 from sqlalchemy import (
     create_engine, Column, Integer, String, Boolean, DateTime, Text, Float, text,
-    ForeignKey, Index
+    ForeignKey, Index, func, or_, and_
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
@@ -164,12 +167,61 @@ def _send_reset_email(to_email: str, otp_code: str) -> bool:
 # ═══════════════════════════════════════════════════════════
 # 🛡️  DÉPENDANCE AUTH ADMIN
 # ═══════════════════════════════════════════════════════════
-async def require_admin_key(x_admin_key: str = Header(None, alias="X-Admin-Key")):
+# ═══════════════════════════════════════════════════════════
+# ADMIN : session, protection, journal, aides
+# ═══════════════════════════════════════════════════════════
+ADMIN_SESSION_HOURS = 8
+_ADMIN_SIGN_KEY = hashlib.sha256(("smartcollect-admin-session:" + ADMIN_API_KEY).encode()).digest()
+_ADMIN_FAIL_WINDOW_SEC = 15 * 60
+_ADMIN_FAIL_MAX = 8
+_admin_fail_store: dict = {}
+
+def _client_ip(request: Request) -> str:
+    # Behind the host's proxy the LAST forwarded address is the one the
+    # proxy itself saw; earlier ones can be forged by the caller.
+    fwd = request.headers.get("x-forwarded-for", "")
+    if fwd: return fwd.split(",")[-1].strip()[:64]
+    return (request.client.host if request.client else "?")[:64]
+
+def _admin_check_blocked(ip: str):
+    now = time.time()
+    hist = [t for t in _admin_fail_store.get(ip, []) if now - t < _ADMIN_FAIL_WINDOW_SEC]
+    _admin_fail_store[ip] = hist
+    if len(hist) >= _ADMIN_FAIL_MAX:
+        raise HTTPException(429, "Trop d'essais. Réessayez dans quelques minutes.")
+
+def _admin_register_failure(ip: str):
+    _admin_fail_store.setdefault(ip, []).append(time.time())
+
+def _admin_make_token():
+    exp = int(time.time()) + ADMIN_SESSION_HOURS * 3600
+    payload = f"{exp}.{secrets.token_urlsafe(8)}"
+    sig = hmac.new(_ADMIN_SIGN_KEY, payload.encode(), hashlib.sha256).hexdigest()
+    return f"{payload}.{sig}", exp
+
+def _admin_token_valid(token: str) -> bool:
+    try:
+        exp_s, nonce, sig = token.split(".")
+        good = hmac.new(_ADMIN_SIGN_KEY, f"{exp_s}.{nonce}".encode(), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(sig, good) and int(exp_s) > time.time()
+    except Exception:
+        return False
+
+async def require_admin_key(request: Request, x_admin_key: str = Header(None, alias="X-Admin-Key"), authorization: str = Header(None)):
+    """Admin access: either the key itself (X-Admin-Key, used by scripts and
+    the desktop tool) or a session token from /api/admin/session (Bearer,
+    used by the web console)."""
     if not ADMIN_API_KEY:
         raise HTTPException(503, "Service admin désactivé.")
-    if not x_admin_key or x_admin_key.strip() != ADMIN_API_KEY:
-        raise HTTPException(401, "Clé admin invalide ou manquante.")
-    return True
+    ip = _client_ip(request)
+    _admin_check_blocked(ip)
+    if x_admin_key and hmac.compare_digest(x_admin_key.strip().encode(), ADMIN_API_KEY.encode()):
+        return True
+    if authorization and authorization.lower().startswith("bearer ") and _admin_token_valid(authorization[7:].strip()):
+        return True
+    _admin_register_failure(ip)
+    raise HTTPException(401, "Clé admin invalide ou manquante.")
+
 
 # ═══════════════════════════════════════════════════════════
 # 🛡️  RATE LIMITING
@@ -249,6 +301,13 @@ class Account(Base):
     created_at = Column(DateTime, default=get_utc_now)
     last_login_at = Column(DateTime, nullable=True)
     last_login_device = Column(String(255), nullable=True)
+    # Admin console / subscriptions (all optional)
+    admin_note = Column(Text, nullable=True)
+    grant_source = Column(String(20), nullable=True)  # admin | trial | play_store
+    subscription_state = Column(String(30), nullable=True)  # filled by Play Billing later
+    auto_renewing = Column(Boolean, nullable=True)
+    purchase_order_id = Column(String(100), nullable=True)
+    purchased_at = Column(DateTime, nullable=True)
 
 class AccountDevice(Base):
     __tablename__ = "account_devices"
@@ -265,6 +324,17 @@ class AccountDevice(Base):
     last_seen_at = Column(DateTime, default=get_utc_now, onupdate=get_utc_now)
     revoked_at = Column(DateTime, nullable=True)
     revoked_reason = Column(String(100), default="")
+
+class AdminAudit(Base):
+    __tablename__ = "admin_audit"
+    id = Column(Integer, primary_key=True, index=True)
+    created_at = Column(DateTime, default=get_utc_now, index=True)
+    action = Column(String(60), nullable=False, index=True)
+    target_type = Column(String(20), default="account")
+    target_id = Column(Integer, nullable=True, index=True)
+    target_label = Column(String(255), default="")
+    details = Column(Text, default="")
+    ip = Column(String(64), default="")
 
 Index("ix_account_devices_account_active", AccountDevice.account_id, AccountDevice.is_active)
 Index("ix_account_devices_device_active", AccountDevice.device_id, AccountDevice.is_active)
@@ -323,6 +393,12 @@ migrations = [
      "UPDATE license_plans SET max_devices = 3 WHERE code = 'pro'"),
     ("UPDATE plans: Basic max_tables = 10",
      "UPDATE license_plans SET max_tables = 10 WHERE code = 'basic'"),
+    ("ALTER accounts.admin_note", "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS admin_note TEXT"),
+    ("ALTER accounts.grant_source", "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS grant_source VARCHAR(20)"),
+    ("ALTER accounts.subscription_state", "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS subscription_state VARCHAR(30)"),
+    ("ALTER accounts.auto_renewing", "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS auto_renewing BOOLEAN"),
+    ("ALTER accounts.purchase_order_id", "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS purchase_order_id VARCHAR(100)"),
+    ("ALTER accounts.purchased_at", "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS purchased_at TIMESTAMP"),
 ]
 
 for name, sql in migrations:
@@ -476,6 +552,93 @@ def _set_default_trial_config(db: Session, val: int, unit: str):
     db.commit()
 
 # ═══════════════════════════════════════════════════════════
+# ADMIN : aides données (statut, recherche, journal)
+# ═══════════════════════════════════════════════════════════
+def _iso(dt):
+    """Dates are stored as naive UTC: the console needs the explicit Z."""
+    return dt.isoformat() + "Z" if dt else None
+
+def _mask_email(email: str) -> str:
+    """Kept in the audit log instead of the full address, so deleting an
+    account does not leave its e-mail behind."""
+    try:
+        local, domain = email.split("@", 1)
+        return f"{local[:2]}***@{domain}"
+    except Exception:
+        return "***"
+
+def _csv_safe(value):
+    """Spreadsheet formula injection: a cell starting with = + - @ would be
+    executed by Excel."""
+    s = str(value)
+    return "'" + s if s[:1] in ("=", "+", "-", "@", "\t", "\r") else s
+
+def _account_status(acc: Account, now) -> str:
+    if not acc.is_active: return "disabled"
+    if acc.expires_at and acc.expires_at < now: return "expired"
+    return "trial" if acc.is_trial else "paid"
+
+def _account_source(acc: Account) -> str:
+    """Where the current access comes from: 'play_store' (a purchase),
+    'admin' (granted by hand) or 'trial'."""
+    if acc.grant_source: return acc.grant_source
+    if acc.purchase_token: return "play_store"
+    return "trial" if acc.is_trial else "admin"
+
+def _account_dict(acc: Account, now, devices: int = 0) -> dict:
+    days_left = None
+    if acc.expires_at: days_left = round((acc.expires_at - now).total_seconds() / 86400.0, 2)
+    return {"id": acc.id, "email": acc.email, "first_name": acc.first_name or "", "last_name": acc.last_name or "", "phone_number": acc.phone_number or "", "plan_code": acc.plan_code or "trial", "is_yearly": bool(acc.is_yearly), "is_trial": bool(acc.is_trial), "is_active": bool(acc.is_active), "status": _account_status(acc, now), "source": _account_source(acc), "expires_at": _iso(acc.expires_at), "days_left": days_left, "created_at": _iso(acc.created_at), "last_login_at": _iso(acc.last_login_at), "last_login_device": acc.last_login_device or "", "active_devices": devices, "has_purchase": bool(acc.purchase_token), "purchase_token": acc.purchase_token, "purchase_platform": acc.purchase_platform or "", "admin_note": acc.admin_note or "", "subscription_state": acc.subscription_state or "", "auto_renewing": acc.auto_renewing, "purchase_order_id": acc.purchase_order_id or "", "purchased_at": _iso(acc.purchased_at)}
+
+def _device_counts(db: Session, ids: list) -> dict:
+    if not ids: return {}
+    rows = db.query(AccountDevice.account_id, func.count(AccountDevice.id)).filter(AccountDevice.account_id.in_(ids), AccountDevice.is_active == True).group_by(AccountDevice.account_id).all()
+    return {r[0]: r[1] for r in rows}
+
+def _filtered_accounts(db: Session, q: str, status: str, plan: str, now):
+    query = db.query(Account)
+    q = (q or "").strip()
+    if q:
+        esc = q.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        like = f"%{esc}%"
+        conds = [func.lower(Account.email).like(like, escape="\\"), func.lower(Account.first_name).like(like, escape="\\"), func.lower(Account.last_name).like(like, escape="\\"), Account.phone_number.like(like, escape="\\")]
+        if q.isdigit(): conds.append(Account.id == int(q))
+        query = query.filter(or_(*conds))
+    if plan: query = query.filter(Account.plan_code == plan)
+    live = and_(Account.is_active == True, or_(Account.expires_at == None, Account.expires_at >= now))
+    if status == "trial": query = query.filter(live, Account.is_trial == True)
+    elif status == "paid": query = query.filter(live, Account.is_trial == False)
+    elif status == "expired": query = query.filter(Account.is_active == True, Account.expires_at != None, Account.expires_at < now)
+    elif status == "disabled": query = query.filter(Account.is_active == False)
+    elif status == "expiring": query = query.filter(live, Account.expires_at != None, Account.expires_at <= now + timedelta(days=7))
+    elif status == "admin": query = query.filter(live, Account.is_trial == False, Account.purchase_token == None)
+    return query
+
+def _purge_reset_codes(db: Session, email: str):
+    """Password-reset codes are stored per e-mail in app_config: remove them
+    with the account so no trace of the address stays behind."""
+    e = _normalize_email(email)
+    db.query(AppConfig).filter(AppConfig.key.in_([f"reset_code_{e}", f"reset_expires_{e}"])).delete(synchronize_session=False)
+
+def _label(db: Session, account_id: int) -> str:
+    a = db.query(Account).filter(Account.id == account_id).first()
+    return _mask_email(a.email) if a else f"#{account_id}"
+
+def _audit(db: Session, request, action: str, target_id=None, label: str = "", details=None, target_type: str = "account"):
+    """Journal of admin actions. Never breaks the action it records."""
+    try:
+        db.add(AdminAudit(action=action, target_type=target_type, target_id=target_id, target_label=(label or "")[:255], details=json.dumps(details, ensure_ascii=False, default=str) if details else "", ip=_client_ip(request) if request is not None else ""))
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[audit] échec : {e}")
+
+def _audit_dict(a: AdminAudit) -> dict:
+    try: details = json.loads(a.details) if a.details else None
+    except Exception: details = None
+    return {"id": a.id, "at": _iso(a.created_at), "action": a.action, "target_type": a.target_type, "target_id": a.target_id, "target_label": a.target_label or "", "details": details, "ip": a.ip or ""}
+
+# ═══════════════════════════════════════════════════════════
 # APPLICATION FASTAPI & SCHÉMAS
 # ═══════════════════════════════════════════════════════════
 app = FastAPI(title="SmartCollect API", redirect_slashes=True)
@@ -576,6 +739,20 @@ class AdminResetToTrialRequest(BaseModel):
     duration_val: int
     duration_unit: str
     duration_mode: str = "replace"
+
+class AdminSessionRequest(BaseModel):
+    key: str = Field(..., max_length=500)
+
+class AdminNoteRequest(BaseModel):
+    note: str = ""
+
+class AdminExtendRequest(BaseModel):
+    days: float
+
+class AdminBulkRequest(BaseModel):
+    ids: List[int]
+    action: str
+    days: Optional[float] = None
 
 # ═══════════════════════════════════════════════════════════
 # ROUTES AUTH
@@ -822,6 +999,7 @@ class DeleteAccountByPasswordRequest(BaseModel):
 def _delete_account(account: Account, db: Session) -> None:
     """Deletes the account and everything the server keeps about it
     (its devices). Work data never reaches the server."""
+    _purge_reset_codes(db, account.email)
     db.query(AccountDevice).filter(AccountDevice.account_id == account.id).delete(synchronize_session=False)
     db.delete(account)
     db.commit()
@@ -854,77 +1032,202 @@ def delete_account_page(lang: str = "fr"):
     """Public page to delete an account without the app (Google Play)."""
     return delete_account_page_html(lang)
 
+@app.post("/api/admin/session")
+def admin_open_session(req: AdminSessionRequest, request: Request):
+    """Exchanges the admin key for a short-lived token (8 h) so the web
+    console never has to keep the key itself in the browser."""
+    if not ADMIN_API_KEY:
+        raise HTTPException(503, "Service admin désactivé.")
+    ip = _client_ip(request)
+    _admin_check_blocked(ip)
+    if not hmac.compare_digest((req.key or "").strip().encode(), ADMIN_API_KEY.encode()):
+        _admin_register_failure(ip)
+        raise HTTPException(401, "Clé admin invalide.")
+    token, exp = _admin_make_token()
+    return {"status": "success", "token": token, "expires_at": datetime.fromtimestamp(exp, timezone.utc).isoformat().replace("+00:00", "Z"), "hours": ADMIN_SESSION_HOURS}
+
 @app.get("/api/admin/plans", dependencies=[Depends(require_admin_key)])
 def admin_get_plans(db: Session = Depends(get_db)):
     plans = db.query(LicensePlan).order_by(LicensePlan.display_order.asc()).all()
     return [{"id": p.id, "code": p.code, "name": p.name, "description": p.description or "", "price_monthly_usd": float(p.price_monthly_usd or 0), "price_yearly_usd": float(p.price_yearly_usd or 0), "max_tables": p.max_tables, "max_rows_per_table": p.max_rows_per_table, "allow_export": bool(p.allow_export), "allow_cloud_backup": bool(p.allow_cloud_backup), "allow_bulk_export": bool(p.allow_bulk_export), "allow_merge_tables": bool(p.allow_merge_tables), "allow_custom_branding": bool(p.allow_custom_branding), "allow_reminders": bool(p.allow_reminders), "max_devices": p.max_devices, "is_active": bool(p.is_active), "display_order": p.display_order} for p in plans]
 
 @app.put("/api/admin/plans/{code}", dependencies=[Depends(require_admin_key)])
-def admin_update_plan(code: str, req: UpdatePlanRequest, db: Session = Depends(get_db)):
+def admin_update_plan(code: str, req: UpdatePlanRequest, request: Request, db: Session = Depends(get_db)):
     plan = db.query(LicensePlan).filter(LicensePlan.code == code).first()
     if not plan: raise HTTPException(404, "Plan introuvable.")
+    changes = {}
     for field, value in req.dict(exclude_unset=True).items():
-        if value is not None: setattr(plan, field, value)
+        if value is None: continue
+        if field in ("price_monthly_usd", "price_yearly_usd") and value < 0: raise HTTPException(400, "Un prix ne peut pas être négatif.")
+        if field in ("max_tables", "max_rows_per_table", "max_devices") and value < 1: raise HTTPException(400, "Les limites doivent être d'au moins 1.")
+        old = getattr(plan, field)
+        if old != value:
+            changes[field] = [old, value]
+            setattr(plan, field, value)
     db.commit()
+    if changes:
+        affected = db.query(Account).filter(Account.plan_code == plan.code).count()
+        _audit(db, request, "plan.update", plan.id, plan.code, {"changes": changes, "accounts_affected": affected}, target_type="plan")
     return {"status": "success", "plan": {"code": plan.code, "name": plan.name}}
 
+# ─── Comptes : lecture ───
 @app.get("/api/admin/accounts", dependencies=[Depends(require_admin_key)])
 def admin_get_accounts(db: Session = Depends(get_db)):
+    """Legacy full list (kept for the desktop tool). The web console uses
+    /api/admin/accounts/search (paginated)."""
     accounts = db.query(Account).order_by(Account.id.desc()).all()
+    counts = _device_counts(db, [a.id for a in accounts])
     results = []
     for acc in accounts:
-        device_count = db.query(AccountDevice).filter(AccountDevice.account_id == acc.id, AccountDevice.is_active == True).count()
-        results.append({"id": acc.id, "email": acc.email, "first_name": acc.first_name or "", "last_name": acc.last_name or "", "phone_number": acc.phone_number or "", "plan_code": acc.plan_code, "is_yearly": bool(acc.is_yearly), "is_trial": bool(acc.is_trial), "is_active": bool(acc.is_active), "expires_at": acc.expires_at.isoformat() if acc.expires_at else None, "purchase_token": acc.purchase_token, "active_devices": device_count, "created_at": acc.created_at.isoformat() if acc.created_at else "", "last_login_at": acc.last_login_at.isoformat() if acc.last_login_at else None})
+        results.append({"id": acc.id, "email": acc.email, "first_name": acc.first_name or "", "last_name": acc.last_name or "", "phone_number": acc.phone_number or "", "plan_code": acc.plan_code, "is_yearly": bool(acc.is_yearly), "is_trial": bool(acc.is_trial), "is_active": bool(acc.is_active), "expires_at": acc.expires_at.isoformat() if acc.expires_at else None, "purchase_token": acc.purchase_token, "active_devices": counts.get(acc.id, 0), "created_at": acc.created_at.isoformat() if acc.created_at else "", "last_login_at": acc.last_login_at.isoformat() if acc.last_login_at else None})
     return results
+
+@app.get("/api/admin/accounts/search", dependencies=[Depends(require_admin_key)])
+def admin_search_accounts(q: str = "", status: str = "all", plan: str = "", sort: str = "created_at", direction: str = "desc", page: int = 1, page_size: int = 25, db: Session = Depends(get_db)):
+    now = get_utc_now()
+    page = max(1, page)
+    page_size = min(100, max(5, page_size))
+    query = _filtered_accounts(db, q, status, plan, now)
+    total = query.count()
+    sort_cols = {"created_at": Account.created_at, "last_login_at": Account.last_login_at, "expires_at": Account.expires_at, "email": Account.email, "id": Account.id}
+    col = sort_cols.get(sort, Account.created_at)
+    order = col.asc() if direction == "asc" else col.desc()
+    rows = query.order_by(order, Account.id.desc()).offset((page - 1) * page_size).limit(page_size).all()
+    counts = _device_counts(db, [a.id for a in rows])
+    return {"total": total, "page": page, "page_size": page_size, "pages": max(1, -(-total // page_size)), "items": [_account_dict(a, now, counts.get(a.id, 0)) for a in rows]}
+
+@app.get("/api/admin/stats", dependencies=[Depends(require_admin_key)])
+def admin_stats(db: Session = Depends(get_db)):
+    now = get_utc_now()
+    accounts = db.query(Account).all()
+    plans = {p.code: p for p in db.query(LicensePlan).all()}
+    total = len(accounts)
+    by_status = {"trial": 0, "paid": 0, "expired": 0, "disabled": 0}
+    by_plan = {}
+    expiring_trials, expiring_paid, admin_grants = [], [], 0
+    signups = {}
+    mrr = 0.0
+    paying_play = 0
+    for a in accounts:
+        st = _account_status(a, now)
+        by_status[st] += 1
+        by_plan[a.plan_code or "trial"] = by_plan.get(a.plan_code or "trial", 0) + 1
+        if a.created_at and (now - a.created_at).days < 30:
+            key = a.created_at.date().isoformat()
+            signups[key] = signups.get(key, 0) + 1
+        if st in ("trial", "paid") and a.expires_at and a.expires_at - now <= timedelta(days=7):
+            (expiring_trials if st == "trial" else expiring_paid).append(_account_dict(a, now))
+        if st == "paid":
+            src = _account_source(a)
+            if src == "admin": admin_grants += 1
+            else:
+                paying_play += 1
+                p = plans.get(a.plan_code)
+                if p:
+                    mrr += (float(p.price_yearly_usd or 0) / 12.0) if a.is_yearly else float(p.price_monthly_usd or 0)
+    days = [(now.date() - timedelta(days=i)).isoformat() for i in range(29, -1, -1)]
+    devices_active = db.query(AccountDevice).filter(AccountDevice.is_active == True).count()
+    last7 = sum(v for k, v in signups.items() if k >= (now.date() - timedelta(days=6)).isoformat())
+    expiring_trials.sort(key=lambda x: x["expires_at"] or "")
+    expiring_paid.sort(key=lambda x: x["expires_at"] or "")
+    return {"generated_at": _iso(now), "total": total, "by_status": by_status, "by_plan": by_plan, "signups_7d": last7, "signups_30d": sum(signups.values()), "signups_by_day": [{"day": d, "count": signups.get(d, 0)} for d in days], "devices_active": devices_active, "expiring_trials": expiring_trials[:10], "expiring_paid": expiring_paid[:10], "admin_grants": admin_grants, "paying_store": paying_play, "mrr_estimate_usd": round(mrr, 2), "arr_estimate_usd": round(mrr * 12, 2), "plans": {c: {"name": p.name, "price_monthly_usd": float(p.price_monthly_usd or 0), "price_yearly_usd": float(p.price_yearly_usd or 0), "is_active": bool(p.is_active)} for c, p in plans.items()}}
+
+@app.get("/api/admin/accounts/export.csv", dependencies=[Depends(require_admin_key)])
+def admin_export_accounts(request: Request, q: str = "", status: str = "all", plan: str = "", db: Session = Depends(get_db)):
+    now = get_utc_now()
+    rows = _filtered_accounts(db, q, status, plan, now).order_by(Account.id.asc()).all()
+    counts = _device_counts(db, [a.id for a in rows])
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["id", "email", "prenom", "nom", "telephone", "plan", "statut", "source", "annuel", "expire_le_utc", "inscrit_le_utc", "derniere_connexion_utc", "appareils_actifs", "note"])
+    for a in rows:
+        d = _account_dict(a, now, counts.get(a.id, 0))
+        w.writerow([_csv_safe(x) for x in [a.id, a.email, a.first_name or "", a.last_name or "", a.phone_number or "", a.plan_code, d["status"], d["source"], "oui" if a.is_yearly else "non", d["expires_at"] or "", d["created_at"] or "", d["last_login_at"] or "", d["active_devices"], a.admin_note or ""]])
+    _audit(db, request, "accounts.export", None, f"{len(rows)} comptes", {"q": q, "status": status, "plan": plan}, target_type="export")
+    return Response(content="﻿" + buf.getvalue(), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": 'attachment; filename="tablyo-comptes.csv"', "Cache-Control": "no-store"})
+
+@app.get("/api/admin/accounts/{account_id}", dependencies=[Depends(require_admin_key)])
+def admin_account_detail(account_id: int, db: Session = Depends(get_db)):
+    account = db.query(Account).filter(Account.id == account_id).first()
+    if not account: raise HTTPException(404, "Compte introuvable.")
+    now = get_utc_now()
+    devices = db.query(AccountDevice).filter(AccountDevice.account_id == account_id).order_by(AccountDevice.last_seen_at.desc()).all()
+    audit = db.query(AdminAudit).filter(AdminAudit.target_type == "account", AdminAudit.target_id == account_id).order_by(AdminAudit.id.desc()).limit(50).all()
+    data = _account_dict(account, now, sum(1 for d in devices if d.is_active))
+    data["max_devices"] = _get_plan_max_devices(account.plan_code, db)
+    data["devices"] = [{"id": d.id, "device_id": d.device_id, "device_name": d.device_name or "", "platform": d.platform, "app_version": d.app_version, "is_active": bool(d.is_active), "created_at": _iso(d.created_at), "last_seen_at": _iso(d.last_seen_at), "revoked_at": _iso(d.revoked_at), "revoked_reason": d.revoked_reason or ""} for d in devices]
+    data["audit"] = [_audit_dict(a) for a in audit]
+    return data
 
 @app.get("/api/admin/accounts/{account_id}/devices", dependencies=[Depends(require_admin_key)])
 def admin_get_account_devices(account_id: int, db: Session = Depends(get_db)):
     account = db.query(Account).filter(Account.id == account_id).first()
+    if not account: raise HTTPException(404, "Compte introuvable.")
     devices = db.query(AccountDevice).filter(AccountDevice.account_id == account_id).order_by(AccountDevice.last_seen_at.desc()).all()
     return {"status": "success", "account_email": account.email, "plan_code": account.plan_code, "devices": [{"id": d.id, "device_id": d.device_id, "device_name": d.device_name or "", "platform": d.platform, "app_version": d.app_version, "is_active": bool(d.is_active), "created_at": d.created_at.isoformat() if d.created_at else None, "last_seen_at": d.last_seen_at.isoformat() if d.last_seen_at else None, "revoked_at": d.revoked_at.isoformat() if d.revoked_at else None, "revoked_reason": d.revoked_reason or ""} for d in devices]}
 
+# ─── Comptes : actions ───
 @app.post("/api/admin/accounts/{account_id}/revoke-device", dependencies=[Depends(require_admin_key)])
-def admin_revoke_account_device(account_id: int, device_id: str, db: Session = Depends(get_db)):
+def admin_revoke_account_device(account_id: int, device_id: str, request: Request, db: Session = Depends(get_db)):
     device = db.query(AccountDevice).filter(AccountDevice.account_id == account_id, AccountDevice.device_id == device_id.strip().upper()).first()
     if not device: raise HTTPException(404, "Appareil introuvable.")
     device.is_active = False
     device.revoked_at = get_utc_now()
     device.revoked_reason = "Révoqué par admin"
     db.commit()
+    _audit(db, request, "device.revoke", account_id, _label(db, account_id), {"device": device.device_name or device.device_id[:12]})
     return {"status": "success", "message": "Appareil révoqué."}
 
 @app.post("/api/admin/accounts/{account_id}/toggle-status", dependencies=[Depends(require_admin_key)])
-def admin_toggle_account_status(account_id: int, db: Session = Depends(get_db)):
+def admin_toggle_account_status(account_id: int, request: Request, db: Session = Depends(get_db)):
     account = db.query(Account).filter(Account.id == account_id).first()
     if not account: raise HTTPException(404, "Compte introuvable.")
     account.is_active = not account.is_active
     db.commit()
+    _audit(db, request, "account.enable" if account.is_active else "account.disable", account_id, _mask_email(account.email))
     return {"status": "success", "is_active": account.is_active}
 
-# ═══════════════════════════════════════════════════════════
-# BUG FIX: plan_code / is_yearly / is_trial désormais appliqués
-# ═══════════════════════════════════════════════════════════
 @app.put("/api/admin/accounts/{account_id}", dependencies=[Depends(require_admin_key)])
-def admin_update_account(account_id: int, req: AdminUpdateAccountRequest, db: Session = Depends(get_db)):
+def admin_update_account(account_id: int, req: AdminUpdateAccountRequest, request: Request, db: Session = Depends(get_db)):
     account = db.query(Account).filter(Account.id == account_id).first()
     if not account: raise HTTPException(404, "Compte introuvable.")
-    if req.first_name is not None: account.first_name = req.first_name.strip()
-    if req.last_name is not None: account.last_name = req.last_name.strip()
-    if req.phone_number is not None: account.phone_number = req.phone_number.strip()
-    if req.is_active is not None: account.is_active = req.is_active
-    if req.plan_code is not None: account.plan_code = req.plan_code
-    if req.is_yearly is not None: account.is_yearly = req.is_yearly
-    if req.is_trial is not None: account.is_trial = req.is_trial
+    changes = {}
+    def setf(name, value):
+        old = getattr(account, name)
+        if old != value:
+            changes[name] = [old, value]
+            setattr(account, name, value)
+    if req.first_name is not None: setf("first_name", req.first_name.strip()[:100])
+    if req.last_name is not None: setf("last_name", req.last_name.strip()[:100])
+    if req.phone_number is not None: setf("phone_number", req.phone_number.strip()[:50])
+    if req.is_active is not None: setf("is_active", req.is_active)
+    if req.plan_code is not None:
+        if not db.query(LicensePlan).filter(LicensePlan.code == req.plan_code).first(): raise HTTPException(400, "Plan inconnu.")
+        setf("plan_code", req.plan_code)
+    if req.is_yearly is not None: setf("is_yearly", req.is_yearly)
+    if req.is_trial is not None: setf("is_trial", req.is_trial)
     db.commit()
+    if changes: _audit(db, request, "account.update", account_id, _mask_email(account.email), {"changes": changes})
     return {"status": "success", "message": "Compte mis à jour."}
 
+@app.put("/api/admin/accounts/{account_id}/note", dependencies=[Depends(require_admin_key)])
+def admin_account_note(account_id: int, req: AdminNoteRequest, request: Request, db: Session = Depends(get_db)):
+    account = db.query(Account).filter(Account.id == account_id).first()
+    if not account: raise HTTPException(404, "Compte introuvable.")
+    account.admin_note = (req.note or "").strip()[:2000]
+    db.commit()
+    _audit(db, request, "account.note", account_id, _mask_email(account.email))
+    return {"status": "success"}
+
 @app.post("/api/admin/accounts/{account_id}/grant-full-access", dependencies=[Depends(require_admin_key)])
-def admin_grant_full_access_account(account_id: int, req: AdminGrantFullAccessRequest, db: Session = Depends(get_db)):
+def admin_grant_full_access_account(account_id: int, req: AdminGrantFullAccessRequest, request: Request, db: Session = Depends(get_db)):
     account = db.query(Account).filter(Account.id == account_id).first()
     if not account: raise HTTPException(404, "Compte introuvable.")
     plan = db.query(LicensePlan).filter(LicensePlan.code == req.plan_code).first()
     if not plan: raise HTTPException(404, "Plan introuvable.")
+    if req.duration_val < 1 or req.duration_val > 100000: raise HTTPException(400, "Durée invalide.")
     new_days_float = _duration_to_days_float(req.duration_val, req.duration_unit)
+    before = {"plan": account.plan_code, "trial": bool(account.is_trial), "expires_at": _iso(account.expires_at)}
     if req.duration_mode == "add" and account.expires_at:
         total_days = max(0, (account.expires_at - get_utc_now()).total_seconds() / 86400.0) + new_days_float
     else: total_days = new_days_float
@@ -932,15 +1235,34 @@ def admin_grant_full_access_account(account_id: int, req: AdminGrantFullAccessRe
     account.is_yearly = req.is_yearly
     account.is_trial = False
     account.is_active = True
+    if not account.purchase_token: account.grant_source = "admin"
     if req.reset_expiry: account.expires_at = get_utc_now() + timedelta(days=total_days)
     db.commit()
+    _audit(db, request, "account.grant", account_id, _mask_email(account.email), {"before": before, "after": {"plan": account.plan_code, "trial": False, "expires_at": _iso(account.expires_at)}, "duration": f"{req.duration_val} {req.duration_unit}", "mode": req.duration_mode})
     return {"status": "success", "message": f"Accès {req.plan_code} accordé.", "expires_at": account.expires_at.isoformat() if account.expires_at else None}
 
-@app.post("/api/admin/accounts/{account_id}/reset-to-trial", dependencies=[Depends(require_admin_key)])
-def admin_reset_account_to_trial(account_id: int, req: AdminResetToTrialRequest, db: Session = Depends(get_db)):
+@app.post("/api/admin/accounts/{account_id}/extend", dependencies=[Depends(require_admin_key)])
+def admin_extend_account(account_id: int, req: AdminExtendRequest, request: Request, db: Session = Depends(get_db)):
+    """Adds time to the current end date (or to now if already expired)
+    without touching the plan."""
     account = db.query(Account).filter(Account.id == account_id).first()
     if not account: raise HTTPException(404, "Compte introuvable.")
+    if req.days <= 0 or req.days > 3650: raise HTTPException(400, "Durée invalide (1 à 3650 jours).")
+    now = get_utc_now()
+    base = account.expires_at if account.expires_at and account.expires_at > now else now
+    before = account.expires_at
+    account.expires_at = base + timedelta(days=req.days)
+    db.commit()
+    _audit(db, request, "account.extend", account_id, _mask_email(account.email), {"days": req.days, "before": _iso(before), "after": _iso(account.expires_at)})
+    return {"status": "success", "expires_at": _iso(account.expires_at)}
+
+@app.post("/api/admin/accounts/{account_id}/reset-to-trial", dependencies=[Depends(require_admin_key)])
+def admin_reset_account_to_trial(account_id: int, req: AdminResetToTrialRequest, request: Request, db: Session = Depends(get_db)):
+    account = db.query(Account).filter(Account.id == account_id).first()
+    if not account: raise HTTPException(404, "Compte introuvable.")
+    if req.duration_val < 1 or req.duration_val > 100000: raise HTTPException(400, "Durée invalide.")
     new_days_float = _duration_to_days_float(req.duration_val, req.duration_unit)
+    before = {"plan": account.plan_code, "trial": bool(account.is_trial), "expires_at": _iso(account.expires_at), "had_purchase": bool(account.purchase_token)}
     if req.duration_mode == "add" and account.expires_at:
         total_days = max(0, (account.expires_at - get_utc_now()).total_seconds() / 86400.0) + new_days_float
     else: total_days = new_days_float
@@ -948,12 +1270,14 @@ def admin_reset_account_to_trial(account_id: int, req: AdminResetToTrialRequest,
     account.is_trial = True
     account.is_yearly = False
     account.is_active = True
+    account.grant_source = "trial"
     account.expires_at = get_utc_now() + timedelta(days=total_days)
     db.commit()
+    _audit(db, request, "account.reset_trial", account_id, _mask_email(account.email), {"before": before, "after_expires_at": _iso(account.expires_at)})
     return {"status": "success", "message": "Compte remis en essai."}
 
 @app.post("/api/admin/accounts/{account_id}/reset-devices", dependencies=[Depends(require_admin_key)])
-def admin_reset_account_devices(account_id: int, db: Session = Depends(get_db)):
+def admin_reset_account_devices(account_id: int, request: Request, db: Session = Depends(get_db)):
     account = db.query(Account).filter(Account.id == account_id).first()
     if not account: raise HTTPException(404, "Compte introuvable.")
     active_devices = db.query(AccountDevice).filter(AccountDevice.account_id == account.id, AccountDevice.is_active == True).all()
@@ -962,26 +1286,71 @@ def admin_reset_account_devices(account_id: int, db: Session = Depends(get_db)):
         d.revoked_at = get_utc_now()
         d.revoked_reason = "Reset admin"
     db.commit()
+    _audit(db, request, "devices.reset", account_id, _mask_email(account.email), {"count": len(active_devices)})
     return {"status": "success", "count": len(active_devices)}
 
+@app.post("/api/admin/accounts/bulk", dependencies=[Depends(require_admin_key)])
+def admin_bulk_accounts(req: AdminBulkRequest, request: Request, db: Session = Depends(get_db)):
+    ids = list(dict.fromkeys(req.ids))[:200]
+    if not ids: raise HTTPException(400, "Aucun compte sélectionné.")
+    if req.action not in ("activate", "deactivate", "reset_devices", "extend"): raise HTTPException(400, "Action inconnue.")
+    if req.action == "extend" and (not req.days or req.days <= 0 or req.days > 3650): raise HTTPException(400, "Durée invalide (1 à 3650 jours).")
+    accounts = db.query(Account).filter(Account.id.in_(ids)).all()
+    now = get_utc_now()
+    done = 0
+    for a in accounts:
+        if req.action == "activate": a.is_active = True
+        elif req.action == "deactivate": a.is_active = False
+        elif req.action == "extend":
+            base = a.expires_at if a.expires_at and a.expires_at > now else now
+            a.expires_at = base + timedelta(days=req.days)
+        elif req.action == "reset_devices":
+            for d in db.query(AccountDevice).filter(AccountDevice.account_id == a.id, AccountDevice.is_active == True).all():
+                d.is_active = False
+                d.revoked_at = now
+                d.revoked_reason = "Reset admin (lot)"
+        done += 1
+    db.commit()
+    _audit(db, request, f"bulk.{req.action}", None, f"{done} comptes", {"ids": [a.id for a in accounts], "days": req.days}, target_type="bulk")
+    return {"status": "success", "count": done}
+
 @app.delete("/api/admin/accounts/{account_id}", dependencies=[Depends(require_admin_key)])
-def admin_delete_account(account_id: int, db: Session = Depends(get_db)):
+def admin_delete_account(account_id: int, request: Request, db: Session = Depends(get_db)):
     account = db.query(Account).filter(Account.id == account_id).first()
     if not account: raise HTTPException(404, "Compte introuvable.")
+    label = _mask_email(account.email)
+    had = {"plan": account.plan_code, "had_purchase": bool(account.purchase_token), "expires_at": _iso(account.expires_at)}
+    _purge_reset_codes(db, account.email)
     db.query(AccountDevice).filter(AccountDevice.account_id == account.id).delete(synchronize_session=False)
     db.delete(account)
     db.commit()
+    _audit(db, request, "account.delete", account_id, label, had)
     return {"status": "success", "message": "Compte supprimé."}
 
+# ─── Configuration & journal ───
 @app.get("/api/admin/config/default-trial", dependencies=[Depends(require_admin_key)])
 def get_default_trial_config(db: Session = Depends(get_db)):
     val, unit, days = _get_default_trial_config(db)
     return {"duration_val": val, "duration_unit": unit, "duration_days": days}
 
 @app.put("/api/admin/config/default-trial", dependencies=[Depends(require_admin_key)])
-def update_default_trial_config(req: DefaultTrialConfigRequest, db: Session = Depends(get_db)):
+def update_default_trial_config(req: DefaultTrialConfigRequest, request: Request, db: Session = Depends(get_db)):
+    if req.duration_val < 1 or req.duration_val > 100000: raise HTTPException(400, "Durée invalide.")
+    if req.duration_unit not in ("Minutes", "Heures", "Jours", "Mois", "Ans"): raise HTTPException(400, "Unité invalide.")
+    old = _get_default_trial_config(db)
     _set_default_trial_config(db, req.duration_val, req.duration_unit)
+    _audit(db, request, "config.default_trial", None, "Essai par défaut", {"before": f"{old[0]} {old[1]}", "after": f"{req.duration_val} {req.duration_unit}"}, target_type="config")
     return {"status": "success", "message": "Config mise à jour."}
+
+@app.get("/api/admin/audit", dependencies=[Depends(require_admin_key)])
+def admin_audit_list(action: str = "", account_id: int = 0, limit: int = 50, offset: int = 0, db: Session = Depends(get_db)):
+    limit = min(200, max(1, limit))
+    q = db.query(AdminAudit)
+    if action: q = q.filter(AdminAudit.action.like(action.replace("%", "") + "%"))
+    if account_id: q = q.filter(AdminAudit.target_type == "account", AdminAudit.target_id == account_id)
+    total = q.count()
+    rows = q.order_by(AdminAudit.id.desc()).offset(max(0, offset)).limit(limit).all()
+    return {"total": total, "items": [_audit_dict(a) for a in rows]}
 
 # ═══════════════════════════════════════════════════════════
 # ACTUALITÉS
@@ -991,21 +1360,64 @@ def get_all_news(db: Session = Depends(get_db)):
     news_items = db.query(AppNews).order_by(AppNews.id.desc()).all()
     return [{"id": str(n.id), "title": str(n.title or ""), "summary": str(n.summary or ""), "content": str(n.content or ""), "category": str(n.category or "news"), "version": n.version, "download_url": n.download_url, "created_at": n.created_at.isoformat() if n.created_at else get_utc_now().isoformat()} for n in news_items]
 
+_NEWS_CATEGORIES = ("news", "update", "tip", "alert")
+
+def _clean_news_fields(title: str, summary: str, category: str, url: Optional[str]):
+    title, summary = (title or "").strip(), (summary or "").strip()
+    if not title or not summary: raise HTTPException(400, "Titre et résumé obligatoires.")
+    cat = category if category in _NEWS_CATEGORIES else "news"
+    url = (url or "").strip() or None
+    if url and not url.lower().startswith("https://"): raise HTTPException(400, "Le lien de téléchargement doit commencer par https://")
+    return title[:255], summary, cat, url
+
 @app.post("/api/admin/news/create", dependencies=[Depends(require_admin_key)])
-def create_admin_news(req: NewsCreateRequest, db: Session = Depends(get_db)):
-    new_article = AppNews(title=req.title.strip(), summary=req.summary.strip(), content=req.content.strip() if req.content else "", category=req.category, version=req.version.strip() if req.version else None, download_url=req.download_url.strip() if req.download_url else None, created_at=get_utc_now())
+def create_admin_news(req: NewsCreateRequest, request: Request, db: Session = Depends(get_db)):
+    title, summary, cat, url = _clean_news_fields(req.title, req.summary, req.category, req.download_url)
+    new_article = AppNews(title=title, summary=summary, content=req.content.strip() if req.content else "", category=cat, version=req.version.strip() if req.version else None, download_url=url, created_at=get_utc_now())
     db.add(new_article)
     db.commit()
     db.refresh(new_article)
+    _audit(db, request, "news.create", new_article.id, title[:80], target_type="news")
     return {"status": "success", "id": new_article.id}
 
-@app.delete("/api/admin/news/{news_id}", dependencies=[Depends(require_admin_key)])
-def delete_admin_news(news_id: int, db: Session = Depends(get_db)):
+@app.put("/api/admin/news/{news_id}", dependencies=[Depends(require_admin_key)])
+def update_admin_news(news_id: int, req: NewsCreateRequest, request: Request, db: Session = Depends(get_db)):
     item = db.query(AppNews).filter(AppNews.id == news_id).first()
     if not item: raise HTTPException(404, "Article introuvable.")
+    title, summary, cat, url = _clean_news_fields(req.title, req.summary, req.category, req.download_url)
+    item.title, item.summary, item.category, item.download_url = title, summary, cat, url
+    item.content = req.content.strip() if req.content else ""
+    item.version = req.version.strip() if req.version else None
+    db.commit()
+    _audit(db, request, "news.update", news_id, title[:80], target_type="news")
+    return {"status": "success"}
+
+@app.delete("/api/admin/news/{news_id}", dependencies=[Depends(require_admin_key)])
+def delete_admin_news(news_id: int, request: Request, db: Session = Depends(get_db)):
+    item = db.query(AppNews).filter(AppNews.id == news_id).first()
+    if not item: raise HTTPException(404, "Article introuvable.")
+    title = item.title or ""
     db.delete(item)
     db.commit()
+    _audit(db, request, "news.delete", news_id, title[:80], target_type="news")
     return {"status": "success", "message": "Supprimé."}
+
+# ═══════════════════════════════════════════════════════════
+# CONSOLE WEB D'ADMINISTRATION (/admin)
+# ═══════════════════════════════════════════════════════════
+_ADMIN_HTML_FILE = Path(__file__).parent / "admin.html"
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_console():
+    """The console itself is a static page: it holds no secret and no data.
+    Everything it shows comes from the /api/admin endpoints, behind the key."""
+    try:
+        html = _ADMIN_HTML_FILE.read_text(encoding="utf-8")
+    except Exception:
+        raise HTTPException(404, "Console introuvable.")
+    nonce = secrets.token_urlsafe(16)
+    csp = f"default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    return HTMLResponse(html.replace("__NONCE__", nonce), headers={"Content-Security-Policy": csp, "Cache-Control": "no-store", "X-Frame-Options": "DENY", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer", "X-Robots-Tag": "noindex, nofollow"})
 
 # ═══════════════════════════════════════════════════════════
 # MAIN
