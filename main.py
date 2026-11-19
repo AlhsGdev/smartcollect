@@ -531,7 +531,8 @@ def _account_to_access_payload(account: Account, db: Session) -> dict:
     plan_code = account.plan_code or "trial"
     limits = _get_plan_limits(plan_code, db)
     plan = db.query(LicensePlan).filter(LicensePlan.code == plan_code).first()
-    return {"mode": "trial" if account.is_trial else "full", "is_trial": bool(account.is_trial), "plan_code": plan_code, "plan_name": plan.name if plan else plan_code.capitalize(), "expires_at": account.expires_at.isoformat() if account.expires_at else None, "max_tables": limits["max_tables"], "max_rows_per_table": limits["max_rows_per_table"], "allow_export": limits["allow_export"], "allow_cloud_backup": limits["allow_cloud_backup"], "allow_bulk_export": limits["allow_bulk_export"], "allow_merge_tables": limits["allow_merge_tables"], "allow_custom_branding": limits["allow_custom_branding"], "allow_reminders": limits["allow_reminders"], "max_devices": limits["max_devices"]}
+    expired = bool(account.expires_at and get_utc_now() > account.expires_at)
+    return {"mode": "expired" if expired else ("trial" if account.is_trial else "full"), "expired": expired, "is_trial": bool(account.is_trial), "plan_code": plan_code, "plan_name": plan.name if plan else plan_code.capitalize(), "expires_at": account.expires_at.isoformat() if account.expires_at else None, "max_tables": limits["max_tables"], "max_rows_per_table": limits["max_rows_per_table"], "allow_export": limits["allow_export"], "allow_cloud_backup": limits["allow_cloud_backup"], "allow_bulk_export": limits["allow_bulk_export"], "allow_merge_tables": limits["allow_merge_tables"], "allow_custom_branding": limits["allow_custom_branding"], "allow_reminders": limits["allow_reminders"], "max_devices": limits["max_devices"]}
 
 def _get_default_trial_config(db: Session) -> tuple:
     defaults = {"default_trial_val": "7", "default_trial_unit": "Jours"}
@@ -791,8 +792,8 @@ def auth_login(req: LoginRequest, db: Session = Depends(get_db)):
         if not _verify_password(req.password, account.password_hash):
             raise HTTPException(401, "Email ou mot de passe incorrect.")
         now = get_utc_now()
-        if account.expires_at and now > account.expires_at:
-            raise HTTPException(403, "Abonnement expiré.")
+        # Expired accounts can still sign in: the app opens read-only and
+        # offers the subscription (access.expired = true).
         device = _enforce_device_limit(account, req.device_id, req.device_name, req.platform, req.app_version, db)
         account.last_login_at = now
         account.last_login_device = req.device_id.strip().upper()
@@ -853,7 +854,6 @@ def auth_verify_session(req: VerifySessionRequest, db: Session = Depends(get_db)
         if device.session_expires_at and now > device.session_expires_at: raise HTTPException(401, "Session expirée.")
         account = db.query(Account).filter(Account.id == device.account_id).first()
         if not account or not account.is_active: raise HTTPException(403, "Compte désactivé.")
-        if account.expires_at and now > account.expires_at: raise HTTPException(403, "Abonnement expiré.")
         device.last_seen_at = now
         db.commit()
         db.refresh(account)
