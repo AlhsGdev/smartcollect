@@ -253,7 +253,7 @@ function envBadge(){ const h=location.hostname; if(h==="localhost"||h==="127.0.0
 /* ───────── libellés ───────── */
 const STATUS = {trial:["Essai","b-info"],paid:["Payant","b-ok"],expired:["Expiré","b-warn"],disabled:["Désactivé","b-bad"]};
 const SOURCE = {play_store:"Google Play",admin:"Accordé à la main",trial:"Essai gratuit"};
-const ACTIONS = {"account.play_purchase":"Abonnement Google Play","plan.sync_play":"Prix envoyés à Google Play","plan.sync_play_check":"Prix vérifiés (Google Play)","plan.sync_play_failed":"Envoi à Google Play refusé","org.create":"Entreprise créée","org.update":"Entreprise modifiée","org.owner_create":"Responsable créé","org.member_add":"Employé ajouté","org.member_remove":"Employé retiré","org.member_password":"Mot de passe d'un employé changé","org.seats_full":"Postes atteints","account.grant":"Accès accordé","account.extend":"Durée prolongée","account.reset_trial":"Remis en essai","account.update":"Infos modifiées","account.note":"Note modifiée","account.enable":"Compte activé","account.disable":"Compte désactivé","account.delete":"Compte supprimé","device.revoke":"Appareil révoqué","devices.reset":"Appareils dissociés","bulk.extend":"Lot : prolongation","bulk.activate":"Lot : activation","bulk.deactivate":"Lot : désactivation","bulk.reset_devices":"Lot : appareils dissociés","accounts.export":"Export CSV","plan.update":"Plan modifié","news.create":"Actualité publiée","news.update":"Actualité modifiée","news.delete":"Actualité supprimée","config.default_trial":"Essai par défaut modifié"};
+const ACTIONS = {"account.play_purchase":"Abonnement Google Play","plan.sync_play":"Prix envoyés à Google Play","plan.sync_play_check":"Prix vérifiés (Google Play)","plan.sync_play_failed":"Envoi à Google Play refusé","org.create":"Entreprise créée","org.update":"Entreprise modifiée","org.owner_create":"Responsable créé","org.member_add":"Employé ajouté","org.member_remove":"Employé retiré","org.member_password":"Mot de passe d'un employé changé","org.seats_full":"Postes atteints","account.grant":"Accès accordé","account.extend":"Durée prolongée","account.reset_trial":"Remis en essai","account.update":"Infos modifiées","account.note":"Note modifiée","account.enable":"Compte activé","account.disable":"Compte désactivé","account.delete":"Compte supprimé","device.revoke":"Appareil révoqué","devices.reset":"Appareils dissociés","bulk.extend":"Lot : prolongation","bulk.activate":"Lot : activation","bulk.deactivate":"Lot : désactivation","bulk.reset_devices":"Lot : appareils dissociés","accounts.export":"Export CSV","plan.update":"Plan modifié","benefits.update":"Avantages des plans modifiés","news.create":"Actualité publiée","news.update":"Actualité modifiée","news.delete":"Actualité supprimée","config.default_trial":"Essai par défaut modifié"};
 function statusBadge(a){ const [t,c]=STATUS[a.status]||["?","b-mute"]; return h("span",{class:"badge "+c},t); }
 function planName(code){ const p=S.plans.find(x=>x.code===code); return p?p.name:(code||"—"); }
 function srcText(a){ return SOURCE[a.source]||a.source; }
@@ -528,6 +528,7 @@ async function viewPlans(box){
   box.replaceChildren(loading());
   try{
     S.plans=await api("/api/admin/plans"); const st=S.stats||await api("/api/admin/stats"); S.stats=st;
+    const bn=await api("/api/admin/benefits");
     const lim=n=>n>=999999?"Illimité":nf.format(n);
     const cards=S.plans.map(p=>h("div",{class:"card"},h("div",{class:"row"},h("div",null,h("h2",{style:{margin:0}},p.name),h("div",{class:"mono muted"},p.code)),h("span",{class:"badge "+(p.is_active?"b-ok":"b-mute"),style:{marginLeft:"auto"}},p.is_active?"Actif":"Masqué")),
       h("p",{class:"muted small"},p.description||"—"),
@@ -537,8 +538,49 @@ async function viewPlans(box){
       h("button",{class:"btn",onclick:()=>planModal(p,st.by_plan[p.code]||0,()=>viewPlans(box))},icon("edit"),"Modifier")));
     box.replaceChildren(h("div",{class:"stack",style:{gap:"14px"}},h("h1",null,"Plans"),
       h("div",{class:"notice info"},icon("alert"),h("div",null,h("b",null,"Prix en USD, envoyés à Google Play."),` En enregistrant un plan avec « Envoyer à Google Play » coché, les prix mensuel et annuel sont convertis par Google dans chaque monnaie locale et valent pour les nouveaux abonnés ; l'app affiche le prix renvoyé par Google. Les abonnés existants gardent leur prix tant qu'ils n'ont pas accepté une hausse. Les limites et options sont envoyées à l'app à chaque connexion.`)),
-      h("div",{class:"grid two"},cards)));
+      h("div",{class:"grid two"},cards),
+      benefitsEditor(bn.benefits,S.plans.filter(p=>p.is_active),()=>viewPlans(box))));
   }catch(e){ box.replaceChildren(failure(e,()=>viewPlans(box))); }
+}
+
+/* ───────── avantages affichés dans l'app ───────── */
+function benefitsEditor(initial,plans,reload){
+  const rows=initial.map(b=>({key:b.key,label_fr:b.label_fr,label_en:b.label_en||"",is_active:b.is_active,values:JSON.parse(JSON.stringify(b.values||{}))}));
+  const host=h("div",{class:"stack",style:{gap:"12px"}});
+  const val=(r,code)=>r.values[code]||(r.values[code]={included:false,value_fr:"",value_en:""});
+  const tick={width:"22px",minHeight:"22px",flex:"none"};
+  function move(i,d){ const j=i+d; if(j<0||j>=rows.length) return; [rows[i],rows[j]]=[rows[j],rows[i]]; draw(); }
+  async function remove(i){ if(await confirmDialog({title:"Retirer cet avantage ?",message:`« ${rows[i].label_fr||"Sans titre"} » disparaîtra de tous les plans quand vous enregistrerez.`,confirm:"Retirer",danger:true})){ rows.splice(i,1); draw(); } }
+  function draw(){
+    host.replaceChildren(...(rows.length?rows.map((r,i)=>h("div",{class:"card",style:{padding:"14px",boxShadow:"none"}},
+      h("div",{class:"row wrap",style:{marginBottom:"10px"}},
+        h("div",{class:"grow",style:{minWidth:"200px"}},h("input",{type:"text",value:r.label_fr,maxLength:120,placeholder:"Texte en français","aria-label":"Texte en français",oninput:e=>r.label_fr=e.target.value})),
+        h("div",{class:"grow",style:{minWidth:"200px"}},h("input",{type:"text",value:r.label_en,maxLength:120,placeholder:"English text","aria-label":"Texte en anglais",oninput:e=>r.label_en=e.target.value})),
+        h("button",{class:"btn",type:"button","aria-label":"Monter",disabled:i===0,onclick:()=>move(i,-1)},"↑"),
+        h("button",{class:"btn",type:"button","aria-label":"Descendre",disabled:i===rows.length-1,onclick:()=>move(i,1)},"↓"),
+        h("button",{class:"btn danger",type:"button","aria-label":"Retirer",onclick:()=>remove(i)},"Retirer")),
+      h("div",{class:"grid two",style:{gap:"8px"}},plans.map(pl=>{ const v=val(r,pl.code);
+        return h("div",{class:"row",style:{gap:"8px"}},
+          h("label",{class:"row",style:{gap:"8px",minWidth:"110px",fontWeight:"600"}},h("input",{type:"checkbox",checked:v.included,style:tick,onchange:e=>v.included=e.target.checked}),pl.name),
+          h("input",{type:"text",value:v.value_fr,maxLength:60,placeholder:"Valeur (FR)","aria-label":"Valeur en français pour "+pl.name,oninput:e=>v.value_fr=e.target.value}),
+          h("input",{type:"text",value:v.value_en,maxLength:60,placeholder:"Value (EN)","aria-label":"Valeur en anglais pour "+pl.name,oninput:e=>v.value_en=e.target.value})); })),
+      h("label",{class:"row",style:{gap:"8px",marginTop:"10px",fontSize:"13px"}},h("input",{type:"checkbox",checked:r.is_active,style:tick,onchange:e=>r.is_active=e.target.checked}),"Affiché dans l'app"))):[h("p",{class:"muted",style:{margin:0}},"Aucun avantage pour l'instant.")]));
+  }
+  draw();
+  const save=h("button",{class:"btn primary",type:"button",onclick:async ev=>{
+    const btn=ev.currentTarget;
+    if(rows.some(r=>!r.label_fr.trim())){ toast("Chaque avantage a besoin d'un texte en français.",true); return; }
+    btn.disabled=true;
+    try{
+      const benefits=rows.map(r=>({key:r.key,label_fr:r.label_fr,label_en:r.label_en,is_active:r.is_active,values:Object.fromEntries(plans.map(pl=>{ const v=val(r,pl.code); return [pl.code,{included:!!v.included,value_fr:v.value_fr||"",value_en:v.value_en||""}]; }))}));
+      await api("/api/admin/benefits",{method:"PUT",body:{benefits}}); toast("Avantages enregistrés : l'app les affiche à la prochaine ouverture des abonnements"); reload();
+    }catch(e){ toast(e.message,true); } finally{ btn.disabled=false; } }},"Enregistrer les avantages");
+  return h("div",{class:"card"},h("h2",null,"Avantages affichés dans l'app"),
+    h("div",{class:"notice info"},icon("alert"),h("div",null,"Chaque ligne apparaît sur la carte de chaque plan dans l'app : une coche si le plan l'inclut (avec la valeur facultative, comme « 10 » ou « Illimité »), un tiret sinon. ",h("b",null,"Ce sont des textes d'information : ils n'appliquent aucune limite."),` Les limites réelles se règlent dans « Modifier » de chaque plan. Une nouvelle option de l'app s'ajoute ici, sans mise à jour de l'app.`)),
+    host,
+    h("div",{class:"row wrap",style:{marginTop:"12px"}},
+      h("button",{class:"btn",type:"button",onclick:()=>{ rows.push({key:null,label_fr:"",label_en:"",is_active:true,values:{}}); draw(); host.lastElementChild&&host.lastElementChild.querySelector("input")&&host.lastElementChild.querySelector("input").focus(); }},icon("plus"),"Ajouter un avantage"),
+      h("span",{class:"right"},save)));
 }
 function planModal(p,count,after){
   const f={}; const inp=(k,type,extra)=>f[k]=h("input",Object.assign({type,value:p[k]},extra||{}));

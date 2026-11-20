@@ -283,6 +283,27 @@ class LicensePlan(Base):
     created_at = Column(DateTime, default=get_utc_now)
     updated_at = Column(DateTime, default=get_utc_now, onupdate=get_utc_now)
 
+class PlanBenefit(Base):
+    """One line of the list of advantages shown in the app (catalogue)."""
+    __tablename__ = "plan_benefits"
+    id = Column(Integer, primary_key=True)
+    key = Column(String(40), unique=True, index=True, nullable=False)
+    label_fr = Column(String(120), nullable=False)
+    label_en = Column(String(120), default="")
+    display_order = Column(Integer, default=0)
+    is_active = Column(Boolean, default=True)
+
+class PlanBenefitValue(Base):
+    """Whether a plan has an advantage, with an optional value ("10", "Illimité")."""
+    __tablename__ = "plan_benefit_values"
+    id = Column(Integer, primary_key=True)
+    plan_id = Column(Integer, ForeignKey("license_plans.id", ondelete="CASCADE"), nullable=False, index=True)
+    benefit_id = Column(Integer, ForeignKey("plan_benefits.id", ondelete="CASCADE"), nullable=False, index=True)
+    included = Column(Boolean, default=False)
+    value_fr = Column(String(60), default="")
+    value_en = Column(String(60), default="")
+    __table_args__ = (Index("uq_plan_benefit", "plan_id", "benefit_id", unique=True),)
+
 class Account(Base):
     __tablename__ = "accounts"
     id = Column(Integer, primary_key=True, index=True)
@@ -474,6 +495,45 @@ def _seed_default_plans():
         db.close()
 
 _seed_default_plans()
+
+def _lim(n, fr=True):
+    return ("Illimité" if fr else "Unlimited") if (n or 0) >= 999999 else str(n)
+
+def _seed_default_benefits():
+    """First start only: the list of advantages is written from the plans'
+    current limits. After that the admin owns it (nothing is overwritten)."""
+    db = SessionLocal()
+    try:
+        if db.query(PlanBenefit).count() > 0:
+            return
+        spec = [
+            ("tables", "Tableaux", "Tables", lambda p: (True, _lim(p.max_tables), _lim(p.max_tables, False))),
+            ("rows", "Lignes par tableau", "Rows per table", lambda p: (True, _lim(p.max_rows_per_table), _lim(p.max_rows_per_table, False))),
+            ("devices", "Appareils", "Devices", lambda p: (True, str(p.max_devices), str(p.max_devices))),
+            ("export", "Export PDF, Word et Excel", "PDF, Word and Excel export", lambda p: (bool(p.allow_export), "", "")),
+            ("drive", "Sauvegarde Google Drive", "Google Drive backup", lambda p: (True, "", "")),
+            ("merge", "Fusion de tableaux", "Merging tables", lambda p: (bool(p.allow_merge_tables), "", "")),
+            ("branding", "Logo et couleurs de l'institution", "Institution logo and colors", lambda p: (bool(p.allow_custom_branding), "", "")),
+            ("reminders", "Rappels", "Reminders", lambda p: (bool(p.allow_reminders), "", "")),
+            ("bulk", "Export groupé", "Bulk export", lambda p: (bool(p.allow_bulk_export), "", "")),
+        ]
+        plans = db.query(LicensePlan).all()
+        for i, (key, fr, en, fn) in enumerate(spec):
+            b = PlanBenefit(key=key, label_fr=fr, label_en=en, display_order=i, is_active=True)
+            db.add(b)
+            db.flush()
+            for p in plans:
+                inc, vfr, ven = fn(p)
+                db.add(PlanBenefitValue(plan_id=p.id, benefit_id=b.id, included=inc, value_fr=vfr, value_en=ven))
+        db.commit()
+        print("[startup] Avantages des plans créés.")
+    except Exception as e:
+        db.rollback()
+        print(f"[startup] Avantages : {e}")
+    finally:
+        db.close()
+
+_seed_default_benefits()
 print("[startup] Migrations terminées.")
 
 def get_db():
@@ -945,10 +1005,25 @@ def privacy(lang: str = "fr"):
     """Public privacy policy of the app (Google Play, Google sign-in)."""
     return privacy_page(lang)
 
+def _benefits_by_plan(db: Session, plan_ids):
+    """{plan_id: [benefit dict, ...]} for the active advantages, in order.
+    A plan with no value for an advantage shows it as not included."""
+    catalog = db.query(PlanBenefit).filter(PlanBenefit.is_active == True).order_by(PlanBenefit.display_order.asc(), PlanBenefit.id.asc()).all()
+    values = {(v.plan_id, v.benefit_id): v for v in db.query(PlanBenefitValue).filter(PlanBenefitValue.plan_id.in_(list(plan_ids) or [0])).all()}
+    out = {}
+    for pid in plan_ids:
+        rows = []
+        for b in catalog:
+            v = values.get((pid, b.id))
+            rows.append({"key": b.key, "label_fr": b.label_fr, "label_en": b.label_en or b.label_fr, "included": bool(v and v.included), "value_fr": (v.value_fr if v else "") or "", "value_en": ((v.value_en or v.value_fr) if v else "") or ""})
+        out[pid] = rows
+    return out
+
 @app.get("/api/plans")
 def get_public_plans(db: Session = Depends(get_db)):
     plans = db.query(LicensePlan).filter(LicensePlan.is_active == True).order_by(LicensePlan.display_order.asc()).all()
-    return [{"code": p.code, "name": p.name, "description": p.description or "", "price_monthly_usd": float(p.price_monthly_usd or 0), "price_yearly_usd": float(p.price_yearly_usd or 0), "discount_yearly_pct": round((1 - (p.price_yearly_usd / (float(p.price_monthly_usd or 0) * 12))) * 100, 1) if p.price_monthly_usd and p.price_yearly_usd else 0.0, "max_tables": p.max_tables, "max_rows_per_table": p.max_rows_per_table, "allow_export": bool(p.allow_export), "allow_cloud_backup": bool(p.allow_cloud_backup), "allow_bulk_export": bool(p.allow_bulk_export), "allow_merge_tables": bool(p.allow_merge_tables), "allow_custom_branding": bool(p.allow_custom_branding), "allow_reminders": bool(p.allow_reminders), "max_devices": p.max_devices} for p in plans]
+    benefits = _benefits_by_plan(db, [p.id for p in plans])
+    return [{"benefits": benefits.get(p.id, []), "code": p.code, "name": p.name, "description": p.description or "", "price_monthly_usd": float(p.price_monthly_usd or 0), "price_yearly_usd": float(p.price_yearly_usd or 0), "discount_yearly_pct": round((1 - (p.price_yearly_usd / (float(p.price_monthly_usd or 0) * 12))) * 100, 1) if p.price_monthly_usd and p.price_yearly_usd else 0.0, "max_tables": p.max_tables, "max_rows_per_table": p.max_rows_per_table, "allow_export": bool(p.allow_export), "allow_cloud_backup": bool(p.allow_cloud_backup), "allow_bulk_export": bool(p.allow_bulk_export), "allow_merge_tables": bool(p.allow_merge_tables), "allow_custom_branding": bool(p.allow_custom_branding), "allow_reminders": bool(p.allow_reminders), "max_devices": p.max_devices} for p in plans]
 
 @app.get("/api/plans/{code}")
 def get_plan_by_code(code: str, db: Session = Depends(get_db)):
@@ -1168,6 +1243,83 @@ def admin_update_plan(code: str, req: UpdatePlanRequest, request: Request, db: S
         affected = db.query(Account).filter(Account.plan_code == plan.code).count()
         _audit(db, request, "plan.update", plan.id, plan.code, {"changes": changes, "accounts_affected": affected}, target_type="plan")
     return {"status": "success", "plan": {"code": plan.code, "name": plan.name}}
+
+# ═══════════════════════════════════════════════════════════
+# AVANTAGES DES PLANS : la liste montrée dans l'app, gérée ici
+# ═══════════════════════════════════════════════════════════
+class BenefitValueIn(BaseModel):
+    included: bool = False
+    value_fr: str = Field("", max_length=60)
+    value_en: str = Field("", max_length=60)
+
+class BenefitIn(BaseModel):
+    key: Optional[str] = Field(None, max_length=40)
+    label_fr: str = Field(..., max_length=120)
+    label_en: str = Field("", max_length=120)
+    is_active: bool = True
+    values: dict = {}
+
+class BenefitsIn(BaseModel):
+    benefits: List[BenefitIn]
+
+def _slug(s: str) -> str:
+    import unicodedata
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[^a-z0-9]+", "_", s).strip("_")[:30] or "avantage"
+
+@app.get("/api/admin/benefits", dependencies=[Depends(require_admin_key)])
+def admin_get_benefits(db: Session = Depends(get_db)):
+    catalog = db.query(PlanBenefit).order_by(PlanBenefit.display_order.asc(), PlanBenefit.id.asc()).all()
+    plans = {p.id: p.code for p in db.query(LicensePlan).all()}
+    values = {}
+    for v in db.query(PlanBenefitValue).all():
+        values.setdefault(v.benefit_id, {})[plans.get(v.plan_id, "?")] = {"included": bool(v.included), "value_fr": v.value_fr or "", "value_en": v.value_en or ""}
+    return {"benefits": [{"key": b.key, "label_fr": b.label_fr, "label_en": b.label_en or "", "is_active": bool(b.is_active), "values": values.get(b.id, {})} for b in catalog]}
+
+@app.put("/api/admin/benefits", dependencies=[Depends(require_admin_key)])
+def admin_put_benefits(req: BenefitsIn, request: Request, db: Session = Depends(get_db)):
+    """Replaces the whole list (order = order sent). Missing ones are removed."""
+    if len(req.benefits) > 40: raise HTTPException(400, "40 avantages au maximum.")
+    plans = {p.code: p for p in db.query(LicensePlan).all()}
+    existing = {b.key: b for b in db.query(PlanBenefit).all()}
+    used, kept, gone = set(), [], []
+    try:
+        for i, bi in enumerate(req.benefits):
+            label = bi.label_fr.strip()
+            if not label: raise HTTPException(400, "Chaque avantage a besoin d'un texte en français.")
+            key = (bi.key or "").strip()
+            if not key or key in used:
+                base = _slug(label); key = base; n = 2
+                while key in used or key in existing:
+                    key = f"{base}_{n}"; n += 1
+            used.add(key)
+            b = existing.get(key)
+            if b is None:
+                b = PlanBenefit(key=key); db.add(b)
+            b.label_fr, b.label_en, b.display_order, b.is_active = label, bi.label_en.strip(), i, bool(bi.is_active)
+            db.flush()
+            kept.append(b.id)
+            old = {v.plan_id: v for v in db.query(PlanBenefitValue).filter(PlanBenefitValue.benefit_id == b.id).all()}
+            for code, raw in (bi.values or {}).items():
+                plan = plans.get(code)
+                if not plan: continue
+                val = BenefitValueIn(**raw) if isinstance(raw, dict) else BenefitValueIn()
+                row = old.get(plan.id)
+                if row is None:
+                    row = PlanBenefitValue(plan_id=plan.id, benefit_id=b.id); db.add(row)
+                row.included, row.value_fr, row.value_en = bool(val.included), val.value_fr.strip(), val.value_en.strip()
+        gone = [b.id for b in existing.values() if b.id not in kept]
+        if gone:
+            db.query(PlanBenefitValue).filter(PlanBenefitValue.benefit_id.in_(gone)).delete(synchronize_session=False)
+            db.query(PlanBenefit).filter(PlanBenefit.id.in_(gone)).delete(synchronize_session=False)
+        db.commit()
+    except HTTPException:
+        db.rollback(); raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(400, f"Avantages invalides : {e}")
+    _audit(db, request, "benefits.update", None, "avantages", {"count": len(req.benefits), "removed": len(gone)}, target_type="plan")
+    return {"status": "success", "count": len(req.benefits)}
 
 # ═══════════════════════════════════════════════════════════
 # ENTREPRISES : un responsable, des postes, des employés
