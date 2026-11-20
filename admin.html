@@ -253,7 +253,7 @@ function envBadge(){ const h=location.hostname; if(h==="localhost"||h==="127.0.0
 /* ───────── libellés ───────── */
 const STATUS = {trial:["Essai","b-info"],paid:["Payant","b-ok"],expired:["Expiré","b-warn"],disabled:["Désactivé","b-bad"]};
 const SOURCE = {play_store:"Google Play",admin:"Accordé à la main",trial:"Essai gratuit"};
-const ACTIONS = {"account.grant":"Accès accordé","account.extend":"Durée prolongée","account.reset_trial":"Remis en essai","account.update":"Infos modifiées","account.note":"Note modifiée","account.enable":"Compte activé","account.disable":"Compte désactivé","account.delete":"Compte supprimé","device.revoke":"Appareil révoqué","devices.reset":"Appareils dissociés","bulk.extend":"Lot : prolongation","bulk.activate":"Lot : activation","bulk.deactivate":"Lot : désactivation","bulk.reset_devices":"Lot : appareils dissociés","accounts.export":"Export CSV","plan.update":"Plan modifié","news.create":"Actualité publiée","news.update":"Actualité modifiée","news.delete":"Actualité supprimée","config.default_trial":"Essai par défaut modifié"};
+const ACTIONS = {"org.create":"Entreprise créée","org.update":"Entreprise modifiée","org.owner_create":"Responsable créé","org.member_add":"Employé ajouté","org.member_remove":"Employé retiré","org.member_password":"Mot de passe d'un employé changé","org.seats_full":"Postes atteints","account.grant":"Accès accordé","account.extend":"Durée prolongée","account.reset_trial":"Remis en essai","account.update":"Infos modifiées","account.note":"Note modifiée","account.enable":"Compte activé","account.disable":"Compte désactivé","account.delete":"Compte supprimé","device.revoke":"Appareil révoqué","devices.reset":"Appareils dissociés","bulk.extend":"Lot : prolongation","bulk.activate":"Lot : activation","bulk.deactivate":"Lot : désactivation","bulk.reset_devices":"Lot : appareils dissociés","accounts.export":"Export CSV","plan.update":"Plan modifié","news.create":"Actualité publiée","news.update":"Actualité modifiée","news.delete":"Actualité supprimée","config.default_trial":"Essai par défaut modifié"};
 function statusBadge(a){ const [t,c]=STATUS[a.status]||["?","b-mute"]; return h("span",{class:"badge "+c},t); }
 function planName(code){ const p=S.plans.find(x=>x.code===code); return p?p.name:(code||"—"); }
 function srcText(a){ return SOURCE[a.source]||a.source; }
@@ -302,7 +302,7 @@ function viewLogin(msg){
 }
 
 /* ───────── coquille ───────── */
-const NAV=[["dashboard","Tableau de bord","grid","Tableau"],["accounts","Comptes","users","Comptes"],["plans","Plans","diamond","Plans"],["news","Actualités","news","Actus"],["audit","Journal","clock","Journal"],["settings","Réglages","settings","Réglages"]];
+const NAV=[["dashboard","Tableau de bord","grid","Tableau"],["accounts","Comptes","users","Comptes"],["plans","Plans","diamond","Plans"],["orgs","Entreprises","users","Entrep."],["news","Actualités","news","Actus"],["audit","Journal","clock","Journal"],["settings","Réglages","settings","Réglages"]];
 function shell(content){
   const [ec,el]=envBadge();
   const link=(n,cls)=>h("a",{class:cls||"nav",href:"#/"+n[0],"aria-current":S.route===n[0]?"page":null},icon(n[2]),cls?n[3]:n[1]);
@@ -568,6 +568,57 @@ function planModal(p,count,after){
       after(); }}]});
 }
 
+
+/* ───────── entreprises ───────── */
+async function viewOrgs(box){
+  box.replaceChildren(loading());
+  try{
+    const orgs=await api("/api/admin/orgs");
+    const add=h("button",{class:"btn primary",onclick:()=>orgModal(null,()=>viewOrgs(box))},icon("plus"),"Nouvelle entreprise");
+    box.replaceChildren(h("div",{class:"stack",style:{gap:"14px"}},h("div",{class:"row wrap"},h("h1",null,"Entreprises"),h("div",{class:"right"},add)),
+      h("div",{class:"notice info"},icon("alert"),h("div",null,h("b",null,"Postes à la carte."),` Créez l'entreprise et son responsable : il ajoute lui-même ses employés (e-mail + mot de passe) depuis l'app, jusqu'au nombre de postes fixé ici. Les employés suivent le plan et la date de fin de l'entreprise. La facturation se fait en dehors de Google Play.`)),
+      orgs.length?h("div",{class:"grid two"},orgs.map(o=>h("div",{class:"card"},h("div",{class:"row"},h("div",null,h("h2",{style:{margin:0}},o.name),h("div",{class:"mono muted"},o.plan_code)),h("span",{class:"badge "+(o.is_active?"b-ok":"b-mute"),style:{marginLeft:"auto"}},o.is_active?"Actif":"Désactivé")),
+        h("dl",{class:"dl",style:{gridTemplateColumns:"130px 1fr"}},h("dt",null,"Postes"),h("dd",null,`${o.used} / ${o.seats}`+(o.used>=o.seats?" (complet)":"")),h("dt",null,"Fin d'accès"),h("dd",null,o.expires_at?fmtDate(o.expires_at):"Sans fin")),
+        h("div",{class:"row wrap",style:{marginTop:"12px"}},h("button",{class:"btn",onclick:()=>orgModal(o,()=>viewOrgs(box))},icon("edit"),"Modifier"),h("button",{class:"btn",onclick:()=>orgMembers(o,()=>viewOrgs(box))},icon("users"),"Employés"))))):h("div",{class:"empty"},icon("users"),h("p",null,"Aucune entreprise."))));
+  }catch(e){ box.replaceChildren(failure(e,()=>viewOrgs(box))); }
+}
+function orgModal(o,after){
+  const f={name:h("input",{type:"text",maxLength:150,value:o?o.name:""}),seats:h("input",{type:"number",min:1,inputMode:"numeric",value:o?o.seats:5}),
+    exp:h("input",{type:"date",value:o&&o.expires_at?o.expires_at.slice(0,10):""})};
+  const active=h("input",{type:"checkbox",checked:o?!!o.is_active:true});
+  const owner={email:h("input",{type:"email",autocomplete:"off"}),pw:h("input",{type:"text",autocomplete:"off",placeholder:"8 caractères minimum"}),first:h("input",{type:"text"}),last:h("input",{type:"text"})};
+  modal({title:o?`Modifier « ${o.name} »`:"Nouvelle entreprise",body:h("div",{class:"stack"},
+    h("label",{class:"f"},"Nom de l'entreprise",f.name),
+    h("div",{class:"row"},h("label",{class:"f grow"},"Nombre de postes",f.seats),h("label",{class:"f grow"},"Fin d'accès (vide = sans fin)",f.exp)),
+    o?h("label",{class:"check"},active,"Entreprise active"):null,
+    o?null:h("div",null,h("h3",{style:{margin:"6px 0"}},"Responsable (premier compte)"),
+      h("div",{class:"row"},h("label",{class:"f grow"},"Prénom",owner.first),h("label",{class:"f grow"},"Nom",owner.last)),
+      h("label",{class:"f"},"E-mail",owner.email),h("label",{class:"f"},"Mot de passe provisoire",owner.pw),
+      h("p",{class:"small muted"},"Communiquez-lui ce mot de passe : il pourra le changer avec « Mot de passe oublié ».")))
+    ,buttons:[{label:"Annuler",close:true},{label:"Enregistrer",kind:"primary",run:async()=>{
+      const name=f.name.value.trim(),seats=parseInt(f.seats.value,10);
+      if(!name){toast("Le nom est obligatoire.",true);return false;} if(isNaN(seats)||seats<1){toast("Nombre de postes invalide.",true);return false;}
+      const body={name,seats,expires_at:f.exp.value||""}; if(o) body.is_active=active.checked;
+      try{
+        if(o){ await api("/api/admin/orgs/"+o.id,{method:"PUT",body}); }
+        else{
+          const email=owner.email.value.trim(); if(!email||owner.pw.value.length<8){toast("E-mail et mot de passe (8 caractères) du responsable obligatoires.",true);return false;}
+          const c=await api("/api/admin/orgs",{method:"POST",body:Object.assign(body,{plan_code:"enterprise"})});
+          try{ await api(`/api/admin/orgs/${c.id}/owner`,{method:"POST",body:{email,password:owner.pw.value,first_name:owner.first.value.trim(),last_name:owner.last.value.trim()}}); }
+          catch(e){ toast("Entreprise créée, mais pas le responsable : "+e.message,true); after(); return; }
+        }
+        toast("Enregistré"); after();
+      }catch(e){ toast(e.message,true); return false; } }}]});
+}
+async function orgMembers(o,after){
+  try{
+    const d=await api("/api/admin/orgs/"+o.id);
+    modal({title:`Employés de « ${o.name} » (${d.used} / ${d.seats})`,body:h("div",{class:"stack"},
+      d.members.length?h("ul",{style:{margin:0,paddingLeft:"18px",lineHeight:"1.8"}},d.members.map(m=>h("li",null,`${m.first_name} ${m.last_name}`.trim()||m.email,h("span",{class:"muted small"},` · ${m.email} · ${m.role==="owner"?"responsable":"employé"}${m.is_active?"":" · désactivé"}`)))):h("p",{class:"muted"},"Aucun employé.")),
+      buttons:[{label:"Fermer",close:true}]});
+  }catch(e){ toast(e.message,true); }
+}
+
 /* ───────── actualités ───────── */
 const CATS=[["news","Actualité"],["update","Mise à jour"],["tip","Astuce"],["alert","Alerte"]];
 async function viewNews(box){
@@ -632,7 +683,7 @@ function render(msg){
   if(!S.token){ S.route="login"; app.replaceChildren(viewLogin(msg)); return; }
   const m=location.hash.replace(/^#\//,"").split("/"); let route=m[0]||"dashboard"; if(!NAV.some(n=>n[0]===route)) route="dashboard";
   S.route=route; const box=h("div"); app.replaceChildren(shell(box)); closeAll();
-  ({dashboard:viewDashboard,accounts:viewAccounts,plans:viewPlans,news:viewNews,audit:viewAudit,settings:viewSettings})[route](box);
+  ({dashboard:viewDashboard,accounts:viewAccounts,plans:viewPlans,orgs:viewOrgs,news:viewNews,audit:viewAudit,settings:viewSettings})[route](box);
   if(route==="accounts"&&m[1]&&/^\d+$/.test(m[1])) openAccount(parseInt(m[1],10));
   document.title="Tablyo · "+(NAV.find(n=>n[0]===route)||[0,"Administration"])[1];
 }

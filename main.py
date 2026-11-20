@@ -309,6 +309,22 @@ class Account(Base):
     auto_renewing = Column(Boolean, nullable=True)
     purchase_order_id = Column(String(100), nullable=True)
     purchased_at = Column(DateTime, nullable=True)
+    # Company accounts: the plan, the end date and the seat count come from
+    # the organization; the owner adds and removes the employees.
+    organization_id = Column(Integer, ForeignKey("organizations.id", ondelete="SET NULL"), nullable=True, index=True)
+    org_role = Column(String(10), nullable=True)  # owner | member
+
+class Organization(Base):
+    __tablename__ = "organizations"
+    id = Column(Integer, primary_key=True)
+    name = Column(String(150), nullable=False)
+    plan_code = Column(String(20), default="enterprise")
+    seats = Column(Integer, default=5)  # employees allowed (the owner counts)
+    expires_at = Column(DateTime, nullable=True)
+    is_active = Column(Boolean, default=True)
+    admin_note = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=get_utc_now)
+    updated_at = Column(DateTime, default=get_utc_now, onupdate=get_utc_now)
 
 class AccountDevice(Base):
     __tablename__ = "account_devices"
@@ -400,6 +416,23 @@ migrations = [
     ("ALTER accounts.auto_renewing", "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS auto_renewing BOOLEAN"),
     ("ALTER accounts.purchase_order_id", "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS purchase_order_id VARCHAR(100)"),
     ("ALTER accounts.purchased_at", "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS purchased_at TIMESTAMP"),
+    ("CREATE TABLE organizations IF NOT EXISTS",
+     "CREATE TABLE IF NOT EXISTS organizations ("
+     "  id SERIAL PRIMARY KEY,"
+     "  name VARCHAR(150) NOT NULL,"
+     "  plan_code VARCHAR(20) DEFAULT 'enterprise',"
+     "  seats INTEGER DEFAULT 5,"
+     "  expires_at TIMESTAMP,"
+     "  is_active BOOLEAN DEFAULT TRUE,"
+     "  admin_note TEXT,"
+     "  created_at TIMESTAMP DEFAULT NOW(),"
+     "  updated_at TIMESTAMP DEFAULT NOW()"
+     ")"),
+    ("ALTER accounts.organization_id", "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS organization_id INTEGER REFERENCES organizations(id) ON DELETE SET NULL"),
+    ("ALTER accounts.org_role", "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS org_role VARCHAR(10)"),
+    ("Plan business -> enterprise (hidden, given by the admin)",
+     "UPDATE license_plans SET code = 'enterprise', name = 'Entreprise', description = 'Sur devis - postes à la carte', is_active = FALSE WHERE code = 'business' AND NOT EXISTS (SELECT 1 FROM license_plans WHERE code = 'enterprise')"),
+    ("Accounts business -> enterprise", "UPDATE accounts SET plan_code = 'enterprise' WHERE plan_code = 'business'"),
 ]
 
 for name, sql in migrations:
@@ -427,7 +460,7 @@ def _seed_default_plans():
             {"code": "trial", "name": "Essai", "description": "Essai gratuit 7 jours - 1 tableau, 50 lignes", "price_monthly_usd": 0.0, "price_yearly_usd": 0.0, "max_tables": 1, "max_rows_per_table": 50, "allow_export": False, "allow_cloud_backup": False, "allow_bulk_export": False, "allow_merge_tables": False, "allow_custom_branding": False, "allow_reminders": False, "max_devices": 1, "display_order": 0},
             {"code": "basic", "name": "Basic", "description": "Pour les indépendants - 10 tableaux, 500 lignes, exports", "price_monthly_usd": 5.0, "price_yearly_usd": 40.0, "max_tables": 10, "max_rows_per_table": 500, "allow_export": True, "allow_cloud_backup": False, "allow_bulk_export": False, "allow_merge_tables": False, "allow_custom_branding": False, "allow_reminders": False, "max_devices": 1, "display_order": 1},
             {"code": "pro", "name": "Pro", "description": "Pour les PME - Illimité + publipostage + cloud", "price_monthly_usd": 10.0, "price_yearly_usd": 80.0, "max_tables": 999999, "max_rows_per_table": 999999, "allow_export": True, "allow_cloud_backup": True, "allow_bulk_export": True, "allow_merge_tables": True, "allow_custom_branding": True, "allow_reminders": True, "max_devices": 3, "display_order": 2},
-            {"code": "business", "name": "Business", "description": "Pour les organisations - Multi-appareils + support", "price_monthly_usd": 25.0, "price_yearly_usd": 200.0, "max_tables": 999999, "max_rows_per_table": 999999, "allow_export": True, "allow_cloud_backup": True, "allow_bulk_export": True, "allow_merge_tables": True, "allow_custom_branding": True, "allow_reminders": True, "max_devices": 5, "display_order": 3},
+            {"code": "enterprise", "name": "Entreprise", "description": "Sur devis - postes à la carte", "price_monthly_usd": 0.0, "price_yearly_usd": 0.0, "max_tables": 999999, "max_rows_per_table": 999999, "allow_export": True, "allow_cloud_backup": True, "allow_bulk_export": True, "allow_merge_tables": True, "allow_custom_branding": True, "allow_reminders": True, "max_devices": 2, "display_order": 3, "is_active": False},
         ]
         for p in defaults:
             existing = db.query(LicensePlan).filter(LicensePlan.code == p["code"]).first()
@@ -494,13 +527,13 @@ def _validate_email(email: str) -> bool:
 def _get_plan_max_devices(plan_code: str, db: Session) -> int:
     plan = db.query(LicensePlan).filter(LicensePlan.code == plan_code).first()
     if plan: return max(1, plan.max_devices or 1)
-    return {"trial": 1, "basic": 1, "pro": 3, "business": 5}.get(plan_code, 1)
+    return {"trial": 1, "basic": 1, "pro": 3, "enterprise": 2}.get(plan_code, 1)
 
 def _get_plan_limits(plan_code: str, db: Session) -> dict:
     plan = db.query(LicensePlan).filter(LicensePlan.code == plan_code).first()
     if plan:
         return {"max_tables": plan.max_tables, "max_rows_per_table": plan.max_rows_per_table, "allow_export": bool(plan.allow_export), "allow_cloud_backup": bool(plan.allow_cloud_backup), "allow_bulk_export": bool(plan.allow_bulk_export), "allow_merge_tables": bool(plan.allow_merge_tables), "allow_custom_branding": bool(plan.allow_custom_branding), "allow_reminders": bool(plan.allow_reminders), "max_devices": plan.max_devices}
-    return {"max_tables": 1 if plan_code == "trial" else 999999, "max_rows_per_table": 50 if plan_code == "trial" else 999999, "allow_export": plan_code != "trial", "allow_cloud_backup": plan_code in ("pro", "business"), "allow_bulk_export": plan_code in ("pro", "business"), "allow_merge_tables": plan_code in ("pro", "business"), "allow_custom_branding": plan_code in ("pro", "business"), "allow_reminders": plan_code in ("pro", "business"), "max_devices": {"trial": 1, "basic": 1, "pro": 3, "business": 5}.get(plan_code, 1)}
+    return {"max_tables": 1 if plan_code == "trial" else 999999, "max_rows_per_table": 50 if plan_code == "trial" else 999999, "allow_export": plan_code != "trial", "allow_cloud_backup": plan_code in ("pro", "enterprise"), "allow_bulk_export": plan_code in ("pro", "enterprise"), "allow_merge_tables": plan_code in ("pro", "enterprise"), "allow_custom_branding": plan_code in ("pro", "enterprise"), "allow_reminders": plan_code in ("pro", "enterprise"), "max_devices": {"trial": 1, "basic": 1, "pro": 3, "enterprise": 2}.get(plan_code, 1)}
 
 def _enforce_device_limit(account: Account, device_id: str, device_name: str, platform: str, app_version: str, db: Session) -> AccountDevice:
     clean_device = (device_id or "").strip().upper()
@@ -528,12 +561,32 @@ def _enforce_device_limit(account: Account, device_id: str, device_name: str, pl
     db.add(new_device)
     return new_device
 
+def _org_of(account: Account, db: Session):
+    return db.query(Organization).filter(Organization.id == account.organization_id).first() if account.organization_id else None
+
+def _org_seats_used(org: Organization, db: Session) -> int:
+    return db.query(func.count(Account.id)).filter(Account.organization_id == org.id).scalar() or 0
+
+def _sync_org_members(org: Organization, db: Session):
+    """The members follow the organization: plan, end date, paid, active."""
+    for m in db.query(Account).filter(Account.organization_id == org.id).all():
+        m.plan_code = org.plan_code
+        m.is_trial = False
+        m.expires_at = org.expires_at
+        m.grant_source = "org"
+        if not org.is_active: m.is_active = False
+
+def _org_payload(org: Organization, account: Account, db: Session) -> dict:
+    used = _org_seats_used(org, db)
+    return {"id": org.id, "name": org.name, "role": account.org_role or "member", "seats": org.seats, "used": used, "full": used >= org.seats}
+
 def _account_to_access_payload(account: Account, db: Session) -> dict:
     plan_code = account.plan_code or "trial"
     limits = _get_plan_limits(plan_code, db)
     plan = db.query(LicensePlan).filter(LicensePlan.code == plan_code).first()
     expired = bool(account.expires_at and get_utc_now() > account.expires_at)
-    return {"mode": "expired" if expired else ("trial" if account.is_trial else "full"), "expired": expired, "is_trial": bool(account.is_trial), "plan_code": plan_code, "plan_name": plan.name if plan else plan_code.capitalize(), "expires_at": account.expires_at.isoformat() if account.expires_at else None, "max_tables": limits["max_tables"], "max_rows_per_table": limits["max_rows_per_table"], "allow_export": limits["allow_export"], "allow_cloud_backup": limits["allow_cloud_backup"], "allow_bulk_export": limits["allow_bulk_export"], "allow_merge_tables": limits["allow_merge_tables"], "allow_custom_branding": limits["allow_custom_branding"], "allow_reminders": limits["allow_reminders"], "max_devices": limits["max_devices"]}
+    org = _org_of(account, db)
+    return {"organization": _org_payload(org, account, db) if org else None, "mode": "expired" if expired else ("trial" if account.is_trial else "full"), "expired": expired, "is_trial": bool(account.is_trial), "plan_code": plan_code, "plan_name": plan.name if plan else plan_code.capitalize(), "expires_at": account.expires_at.isoformat() if account.expires_at else None, "max_tables": limits["max_tables"], "max_rows_per_table": limits["max_rows_per_table"], "allow_export": limits["allow_export"], "allow_cloud_backup": limits["allow_cloud_backup"], "allow_bulk_export": limits["allow_bulk_export"], "allow_merge_tables": limits["allow_merge_tables"], "allow_custom_branding": limits["allow_custom_branding"], "allow_reminders": limits["allow_reminders"], "max_devices": limits["max_devices"]}
 
 def _get_default_trial_config(db: Session) -> tuple:
     defaults = {"default_trial_val": "7", "default_trial_unit": "Jours"}
@@ -1070,6 +1123,210 @@ def admin_update_plan(code: str, req: UpdatePlanRequest, request: Request, db: S
         affected = db.query(Account).filter(Account.plan_code == plan.code).count()
         _audit(db, request, "plan.update", plan.id, plan.code, {"changes": changes, "accounts_affected": affected}, target_type="plan")
     return {"status": "success", "plan": {"code": plan.code, "name": plan.name}}
+
+# ═══════════════════════════════════════════════════════════
+# ENTREPRISES : un responsable, des postes, des employés
+# ═══════════════════════════════════════════════════════════
+def _session_account(session_token: str, db: Session) -> Account:
+    device = db.query(AccountDevice).filter(AccountDevice.session_token == session_token).first()
+    if not device or not device.is_active: raise HTTPException(401, "Session invalide.")
+    account = db.query(Account).filter(Account.id == device.account_id).first()
+    if not account or not account.is_active: raise HTTPException(403, "Compte désactivé.")
+    return account
+
+def _org_owner(session_token: str, db: Session):
+    account = _session_account(session_token, db)
+    org = _org_of(account, db)
+    if not org: raise HTTPException(404, "Ce compte n'appartient à aucune entreprise.")
+    if account.org_role != "owner": raise HTTPException(403, "Réservé au responsable de l'entreprise.")
+    return account, org
+
+def _member_dict(m: Account, now) -> dict:
+    return {"id": m.id, "email": m.email, "first_name": m.first_name or "", "last_name": m.last_name or "", "role": m.org_role or "member", "is_active": bool(m.is_active), "last_login_at": _iso(m.last_login_at)}
+
+class OrgSessionRequest(BaseModel):
+    session_token: str
+
+class OrgAddMemberRequest(BaseModel):
+    session_token: str
+    email: str
+    password: str = Field(..., min_length=8, max_length=100)
+    first_name: str = ""
+    last_name: str = ""
+
+class OrgMemberRequest(BaseModel):
+    session_token: str
+    account_id: int
+
+class OrgMemberPasswordRequest(BaseModel):
+    session_token: str
+    account_id: int
+    new_password: str = Field(..., min_length=8, max_length=100)
+
+@app.post("/api/org/info")
+def org_info(req: OrgSessionRequest, db: Session = Depends(get_db)):
+    """My company: name, seats, and (for the owner) the employees."""
+    account = _session_account(req.session_token, db)
+    org = _org_of(account, db)
+    if not org: return {"status": "success", "organization": None}
+    out = {"status": "success", "organization": _org_payload(org, account, db)}
+    if account.org_role == "owner":
+        now = get_utc_now()
+        out["members"] = [_member_dict(m, now) for m in db.query(Account).filter(Account.organization_id == org.id).order_by(Account.id.asc()).all()]
+    return out
+
+@app.post("/api/org/members/add")
+def org_add_member(req: OrgAddMemberRequest, request: Request, db: Session = Depends(get_db)):
+    owner, org = _org_owner(req.session_token, db)
+    if not org.is_active: raise HTTPException(403, "L'entreprise est désactivée.")
+    email = _normalize_email(req.email)
+    if not _validate_email(email): raise HTTPException(400, "Adresse e-mail invalide.")
+    used = _org_seats_used(org, db)
+    if used >= org.seats:
+        _audit(db, request, "org.seats_full", org.id, org.name, {"seats": org.seats, "tried": _mask_email(email)}, target_type="org")
+        raise HTTPException(409, f"Nombre de postes atteint ({used} sur {org.seats}). Contactez-nous pour en ajouter.")
+    existing = db.query(Account).filter(Account.email == email).first()
+    if existing:
+        # A person removed from a company earlier can be taken back; any
+        # other existing account is its own (never taken over).
+        if existing.organization_id is not None or existing.is_active or existing.grant_source != "org":
+            raise HTTPException(409, "Cette adresse a déjà un compte.")
+        existing.password_hash = _hash_password(req.password)
+        member = existing
+        member.is_active = True
+    else:
+        member = Account(email=email, password_hash=_hash_password(req.password), created_at=get_utc_now())
+        db.add(member)
+    member.first_name = req.first_name.strip()[:100]
+    member.last_name = req.last_name.strip()[:100]
+    member.organization_id = org.id
+    member.org_role = "member"
+    _sync_org_members(org, db)
+    db.commit()
+    _audit(db, request, "org.member_add", org.id, org.name, {"member": _mask_email(email)}, target_type="org")
+    used = _org_seats_used(org, db)
+    return {"status": "success", "member": _member_dict(member, get_utc_now()), "seats": org.seats, "used": used, "full": used >= org.seats}
+
+@app.post("/api/org/members/remove")
+def org_remove_member(req: OrgMemberRequest, request: Request, db: Session = Depends(get_db)):
+    owner, org = _org_owner(req.session_token, db)
+    member = db.query(Account).filter(Account.id == req.account_id, Account.organization_id == org.id).first()
+    if not member: raise HTTPException(404, "Employé introuvable.")
+    if member.id == owner.id: raise HTTPException(400, "Le responsable ne peut pas se retirer lui-même.")
+    # The seat is freed; the account and its cloud backups are kept.
+    member.organization_id = None
+    member.org_role = None
+    member.is_active = False
+    db.query(AccountDevice).filter(AccountDevice.account_id == member.id).update({"is_active": False})
+    db.commit()
+    _audit(db, request, "org.member_remove", org.id, org.name, {"member": _mask_email(member.email)}, target_type="org")
+    used = _org_seats_used(org, db)
+    return {"status": "success", "seats": org.seats, "used": used, "full": used >= org.seats}
+
+@app.post("/api/org/members/password")
+def org_member_password(req: OrgMemberPasswordRequest, request: Request, db: Session = Depends(get_db)):
+    owner, org = _org_owner(req.session_token, db)
+    member = db.query(Account).filter(Account.id == req.account_id, Account.organization_id == org.id).first()
+    if not member: raise HTTPException(404, "Employé introuvable.")
+    member.password_hash = _hash_password(req.new_password)
+    db.query(AccountDevice).filter(AccountDevice.account_id == member.id).update({"is_active": False})
+    db.commit()
+    _audit(db, request, "org.member_password", org.id, org.name, {"member": _mask_email(member.email)}, target_type="org")
+    return {"status": "success"}
+
+# ─── Admin : entreprises ───
+class AdminOrgRequest(BaseModel):
+    name: Optional[str] = None
+    plan_code: Optional[str] = None
+    seats: Optional[int] = None
+    expires_at: Optional[str] = None  # ISO date; "" = no end
+    is_active: Optional[bool] = None
+    admin_note: Optional[str] = None
+
+class AdminOrgOwnerRequest(BaseModel):
+    email: str
+    password: str = Field(..., min_length=8, max_length=100)
+    first_name: str = ""
+    last_name: str = ""
+
+def _org_admin_dict(o: Organization, db: Session) -> dict:
+    return {"id": o.id, "name": o.name, "plan_code": o.plan_code, "seats": o.seats, "used": _org_seats_used(o, db), "expires_at": _iso(o.expires_at), "is_active": bool(o.is_active), "admin_note": o.admin_note or "", "created_at": _iso(o.created_at)}
+
+def _parse_org_date(s: str):
+    if not s: return None
+    try: return datetime.fromisoformat(s.replace("Z", "")).replace(tzinfo=None)
+    except ValueError: raise HTTPException(400, "Date invalide.")
+
+@app.get("/api/admin/orgs", dependencies=[Depends(require_admin_key)])
+def admin_orgs(db: Session = Depends(get_db)):
+    return [_org_admin_dict(o, db) for o in db.query(Organization).order_by(Organization.id.desc()).all()]
+
+@app.get("/api/admin/orgs/{org_id}", dependencies=[Depends(require_admin_key)])
+def admin_org(org_id: int, db: Session = Depends(get_db)):
+    o = db.query(Organization).filter(Organization.id == org_id).first()
+    if not o: raise HTTPException(404, "Entreprise introuvable.")
+    now = get_utc_now()
+    return {**_org_admin_dict(o, db), "members": [_member_dict(m, now) for m in db.query(Account).filter(Account.organization_id == o.id).order_by(Account.id.asc()).all()]}
+
+@app.post("/api/admin/orgs", dependencies=[Depends(require_admin_key)])
+def admin_create_org(req: AdminOrgRequest, request: Request, db: Session = Depends(get_db)):
+    name = (req.name or "").strip()
+    if not name: raise HTTPException(400, "Le nom est obligatoire.")
+    plan = req.plan_code or "enterprise"
+    if not db.query(LicensePlan).filter(LicensePlan.code == plan).first(): raise HTTPException(400, "Plan inconnu.")
+    o = Organization(name=name[:150], plan_code=plan, seats=max(1, req.seats or 5), expires_at=_parse_org_date(req.expires_at or ""), admin_note=req.admin_note or "")
+    db.add(o)
+    db.commit()
+    _audit(db, request, "org.create", o.id, o.name, {"seats": o.seats, "plan": o.plan_code}, target_type="org")
+    return _org_admin_dict(o, db)
+
+@app.put("/api/admin/orgs/{org_id}", dependencies=[Depends(require_admin_key)])
+def admin_update_org(org_id: int, req: AdminOrgRequest, request: Request, db: Session = Depends(get_db)):
+    o = db.query(Organization).filter(Organization.id == org_id).first()
+    if not o: raise HTTPException(404, "Entreprise introuvable.")
+    changes = {}
+    def setf(name, value):
+        old = getattr(o, name)
+        if old != value:
+            changes[name] = [str(old), str(value)]
+            setattr(o, name, value)
+    if req.name is not None:
+        if not req.name.strip(): raise HTTPException(400, "Le nom est obligatoire.")
+        setf("name", req.name.strip()[:150])
+    if req.plan_code is not None:
+        if not db.query(LicensePlan).filter(LicensePlan.code == req.plan_code).first(): raise HTTPException(400, "Plan inconnu.")
+        setf("plan_code", req.plan_code)
+    if req.seats is not None:
+        used = _org_seats_used(o, db)
+        if req.seats < max(1, used): raise HTTPException(400, f"{used} postes sont déjà utilisés : retirez des employés avant de réduire.")
+        setf("seats", req.seats)
+    if req.expires_at is not None: setf("expires_at", _parse_org_date(req.expires_at))
+    if req.is_active is not None: setf("is_active", req.is_active)
+    if req.admin_note is not None: setf("admin_note", req.admin_note)
+    if req.is_active is True:
+        for m in db.query(Account).filter(Account.organization_id == o.id).all(): m.is_active = True
+    _sync_org_members(o, db)
+    db.commit()
+    if changes: _audit(db, request, "org.update", o.id, o.name, {"changes": changes}, target_type="org")
+    return _org_admin_dict(o, db)
+
+@app.post("/api/admin/orgs/{org_id}/owner", dependencies=[Depends(require_admin_key)])
+def admin_org_owner(org_id: int, req: AdminOrgOwnerRequest, request: Request, db: Session = Depends(get_db)):
+    """Creates the company's owner account (the one who adds the employees)."""
+    o = db.query(Organization).filter(Organization.id == org_id).first()
+    if not o: raise HTTPException(404, "Entreprise introuvable.")
+    email = _normalize_email(req.email)
+    if not _validate_email(email): raise HTTPException(400, "Adresse e-mail invalide.")
+    if db.query(Account).filter(Account.email == email).first(): raise HTTPException(409, "Cette adresse a déjà un compte.")
+    if _org_seats_used(o, db) >= o.seats: raise HTTPException(409, "Aucun poste libre.")
+    owner = Account(email=email, password_hash=_hash_password(req.password), first_name=req.first_name.strip()[:100], last_name=req.last_name.strip()[:100], organization_id=o.id, org_role="owner", created_at=get_utc_now())
+    db.add(owner)
+    _sync_org_members(o, db)
+    db.flush()
+    _sync_org_members(o, db)
+    db.commit()
+    _audit(db, request, "org.owner_create", o.id, o.name, {"owner": _mask_email(email)}, target_type="org")
+    return {"status": "success", "owner": _member_dict(owner, get_utc_now())}
 
 @app.get("/api/admin/play/status", dependencies=[Depends(require_admin_key)])
 def admin_play_status():
