@@ -852,6 +852,7 @@ def auth_login(req: LoginRequest, db: Session = Depends(get_db)):
         account.last_login_at = now
         account.last_login_device = req.device_id.strip().upper()
         db.commit()
+        _refresh_play(account, db)
         db.refresh(account)
         db.refresh(device)
         return {"status": "success", "message": "Connexion réussie.", "account": {"id": account.id, "email": account.email, "first_name": account.first_name, "last_name": account.last_name, "plan_code": account.plan_code, "is_trial": account.is_trial, "expires_at": account.expires_at.isoformat() if account.expires_at else None}, "session_token": device.session_token, "session_expires_at": device.session_expires_at.isoformat(), "access": _account_to_access_payload(account, db)}
@@ -910,6 +911,7 @@ def auth_verify_session(req: VerifySessionRequest, db: Session = Depends(get_db)
         if not account or not account.is_active: raise HTTPException(403, "Compte désactivé.")
         device.last_seen_at = now
         db.commit()
+        _refresh_play(account, db)
         db.refresh(account)
         return {"status": "valid", "account": {"id": account.id, "email": account.email, "first_name": account.first_name, "last_name": account.last_name, "plan_code": account.plan_code, "is_trial": account.is_trial, "expires_at": account.expires_at.isoformat() if account.expires_at else None}, "access": _account_to_access_payload(account, db)}
     except HTTPException: raise
@@ -986,23 +988,66 @@ def revoke_account_device(req: RevokeDeviceRequest, db: Session = Depends(get_db
     db.commit()
     return {"status": "success", "message": f"Appareil révoqué."}
 
-@app.post("/api/account/upgrade")
-def account_upgrade(req: AccountUpgradeRequest, db: Session = Depends(get_db)):
-    device = db.query(AccountDevice).filter(AccountDevice.session_token == req.session_token).first()
-    if not device or not device.is_active: raise HTTPException(401, "Session invalide.")
-    account = db.query(Account).filter(Account.id == device.account_id).first()
-    plan = db.query(LicensePlan).filter(LicensePlan.code == req.plan_code).first()
-    if not plan: raise HTTPException(404, "Plan introuvable.")
-    now = get_utc_now()
-    account.plan_code = req.plan_code
-    account.is_yearly = req.is_yearly
+def _apply_play_purchase(account: Account, info: dict, purchase_token: str, db: Session):
+    """Gives the account what Google says it bought (plan, end date)."""
+    code = play_billing.plan_code_of(info["product_id"])
+    plan = db.query(LicensePlan).filter(LicensePlan.code == code).first() if code else None
+    if not plan or code in ("trial", "enterprise"): raise HTTPException(400, "Produit inconnu.")
+    other = db.query(Account).filter(Account.purchase_token == purchase_token, Account.id != account.id).first()
+    if other: raise HTTPException(409, "Cet abonnement est déjà utilisé par un autre compte.")
+    account.plan_code = code
+    account.is_yearly = info["base_plan_id"] == "yearly"
     account.is_trial = False
-    account.purchase_token = req.purchase_token
-    account.purchase_platform = req.purchase_platform
-    account.expires_at = now + timedelta(days=365 if req.is_yearly else 30)
+    account.purchase_token = purchase_token
+    account.purchase_platform = "play_store"
+    account.grant_source = "play_store"
+    account.subscription_state = info["state"][:30]
+    account.auto_renewing = info["auto_renewing"]
+    account.purchase_order_id = (info["order_id"] or "")[:100]
+    # No access beyond what Google says: a finished subscription ends now.
+    account.expires_at = info["expires_at"] if info["gives_access"] else min(info["expires_at"] or get_utc_now(), get_utc_now())
+    if not account.purchased_at: account.purchased_at = get_utc_now()
+    return plan
+
+def _refresh_play(account: Account, db: Session):
+    """Renewals and cancellations: asks Google again when the access is
+    about to end. Never breaks a sign-in."""
+    if not account.purchase_token or account.organization_id or not play_billing.configured(): return
+    if account.expires_at and account.expires_at > get_utc_now() + timedelta(days=1): return
+    try:
+        _apply_play_purchase(account, play_billing.verify_purchase(account.purchase_token), account.purchase_token, db)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[play refresh] {e}")
+
+class PlayVerifyRequest(BaseModel):
+    session_token: str
+    purchase_token: str = Field(..., min_length=10, max_length=4000)
+
+@app.post("/api/account/play-verify")
+def account_play_verify(req: PlayVerifyRequest, request: Request, db: Session = Depends(get_db)):
+    """After a purchase in the app: the token is checked with Google, then
+    the plan is given. The app's own word is never enough."""
+    account = _session_account(req.session_token, db)
+    if account.organization_id: raise HTTPException(400, "Ce compte dépend d'une entreprise.")
+    try:
+        info = play_billing.verify_purchase(req.purchase_token)
+    except play_billing.PlayError as e:
+        raise HTTPException(502, str(e))
+    plan = _apply_play_purchase(account, info, req.purchase_token, db)
     db.commit()
     db.refresh(account)
-    return {"status": "success", "message": f"Plan {plan.name} activé.", "plan_code": account.plan_code, "is_yearly": account.is_yearly, "expires_at": account.expires_at.isoformat() if account.expires_at else None, "access": _account_to_access_payload(account, db)}
+    _audit(db, request, "account.play_purchase", account.id, _mask_email(account.email), {"plan": plan.code, "state": info["state"], "base_plan": info["base_plan_id"]})
+    return {"status": "success", "message": f"Plan {plan.name} activé.", "acknowledged": info["acknowledged"], "access": _account_to_access_payload(account, db)}
+
+@app.post("/api/account/upgrade")
+def account_upgrade(req: AccountUpgradeRequest, request: Request, db: Session = Depends(get_db)):
+    """Old route of the app 1.0: the plan was taken from the app's word, so
+    anyone could give themselves a plan. Now only a purchase token checked
+    with Google counts; the plan and dates come from Google."""
+    if not req.purchase_token: raise HTTPException(400, "Achat introuvable : abonnez-vous depuis l'app.")
+    return account_play_verify(PlayVerifyRequest(session_token=req.session_token, purchase_token=req.purchase_token), request, db)
 
 # ═══════════════════════════════════════════════════════════
 # ROUTES ADMIN
