@@ -26,6 +26,7 @@ from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response
 
+import play_billing
 from privacy import delete_account_page_html, privacy_page
 from pydantic import BaseModel, Field
 from sqlalchemy import (
@@ -1069,6 +1070,29 @@ def admin_update_plan(code: str, req: UpdatePlanRequest, request: Request, db: S
         affected = db.query(Account).filter(Account.plan_code == plan.code).count()
         _audit(db, request, "plan.update", plan.id, plan.code, {"changes": changes, "accounts_affected": affected}, target_type="plan")
     return {"status": "success", "plan": {"code": plan.code, "name": plan.name}}
+
+@app.get("/api/admin/play/status", dependencies=[Depends(require_admin_key)])
+def admin_play_status():
+    """Whether prices can be sent to Google Play from here."""
+    return {"configured": play_billing.configured(), "package": play_billing.package_name(), "product_prefix": play_billing.product_prefix()}
+
+class SyncPlayRequest(BaseModel):
+    dry_run: bool = False
+
+@app.post("/api/admin/plans/{code}/sync-play", dependencies=[Depends(require_admin_key)])
+def admin_sync_play(code: str, request: Request, req: SyncPlayRequest = SyncPlayRequest(), db: Session = Depends(get_db)):
+    """Sends this plan's monthly and yearly USD prices to Google Play (new
+    subscribers). dry_run only checks what would change."""
+    plan = db.query(LicensePlan).filter(LicensePlan.code == code).first()
+    if not plan: raise HTTPException(404, "Plan introuvable.")
+    prices = {"monthly": float(plan.price_monthly_usd or 0), "yearly": float(plan.price_yearly_usd or 0)}
+    try:
+        result = play_billing.sync_plan(plan.code, prices, dry_run=req.dry_run)
+    except play_billing.PlayError as e:
+        _audit(db, request, "plan.sync_play_failed", plan.id, plan.code, {"error": str(e), "prices": prices}, target_type="plan")
+        raise HTTPException(502, str(e))
+    _audit(db, request, "plan.sync_play_check" if req.dry_run else "plan.sync_play", plan.id, plan.code, {"prices": prices, **result}, target_type="plan")
+    return {"status": "success", "prices_usd": prices, **result}
 
 # ─── Comptes : lecture ───
 @app.get("/api/admin/accounts", dependencies=[Depends(require_admin_key)])

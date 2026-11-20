@@ -536,7 +536,7 @@ async function viewPlans(box){
       h("div",{class:"row wrap",style:{margin:"12px 0"}},FEATURES.map(([k,l])=>h("span",{class:"badge "+(p[k]?"b-ok":"b-mute")},(p[k]?"✓ ":"✕ ")+l))),
       h("button",{class:"btn",onclick:()=>planModal(p,st.by_plan[p.code]||0,()=>viewPlans(box))},icon("edit"),"Modifier")));
     box.replaceChildren(h("div",{class:"stack",style:{gap:"14px"}},h("h1",null,"Plans"),
-      h("div",{class:"notice info"},icon("alert"),h("div",null,h("b",null,"Les prix ici sont indicatifs."),` Ce que l'utilisateur paie est défini dans Google Play Console (abonnements) : modifier un prix ici ne change pas la facturation. Les limites et options, elles, sont envoyées à l'app à chaque connexion et valent tout de suite pour tous les comptes du plan.`)),
+      h("div",{class:"notice info"},icon("alert"),h("div",null,h("b",null,"Prix en USD, envoyés à Google Play."),` En enregistrant un plan avec « Envoyer à Google Play » coché, les prix mensuel et annuel sont convertis par Google dans chaque monnaie locale et valent pour les nouveaux abonnés ; l'app affiche le prix renvoyé par Google. Les abonnés existants gardent leur prix tant qu'ils n'ont pas accepté une hausse. Les limites et options sont envoyées à l'app à chaque connexion.`)),
       h("div",{class:"grid two"},cards)));
   }catch(e){ box.replaceChildren(failure(e,()=>viewPlans(box))); }
 }
@@ -546,18 +546,26 @@ function planModal(p,count,after){
   inp("max_tables","number",{min:1,inputMode:"numeric"}); inp("max_rows_per_table","number",{min:1,inputMode:"numeric"}); inp("max_devices","number",{min:1,max:50,inputMode:"numeric"}); inp("display_order","number",{min:0,inputMode:"numeric"});
   const flags={}; const flagRow=([k,l])=>h("label",{class:"check"},flags[k]=h("input",{type:"checkbox",checked:!!p[k]}),l);
   const active=h("input",{type:"checkbox",checked:!!p.is_active});
+  const play=h("input",{type:"checkbox",checked:false,disabled:true}); const playNote=h("span",{class:"small muted"});
+  api("/api/admin/play/status").then(s=>{ if(s.configured){ play.disabled=false; play.checked=true; } else playNote.textContent="(Google Play n'est pas encore configuré sur le serveur)"; }).catch(()=>{});
   modal({title:`Modifier « ${p.name} »`,body:h("div",{class:"stack"},
     count?h("div",{class:"notice warn"},icon("alert"),`Ce plan est utilisé par ${nf.format(count)} compte(s) : les changements de limites leur sont appliqués immédiatement.`):null,
     h("label",{class:"f"},"Nom",f.name),h("label",{class:"f"},"Description",f.description),
     h("div",{class:"row"},h("label",{class:"f grow"},"Prix mensuel (USD)",f.price_monthly_usd),h("label",{class:"f grow"},"Prix annuel (USD)",f.price_yearly_usd)),
     h("div",{class:"row"},h("label",{class:"f grow"},"Tables max",f.max_tables),h("label",{class:"f grow"},"Lignes max",f.max_rows_per_table)),
     h("div",{class:"row"},h("label",{class:"f grow"},"Appareils max",f.max_devices),h("label",{class:"f grow"},"Ordre d'affichage",f.display_order)),
-    h("div",null,FEATURES.map(flagRow)),h("label",{class:"check"},active,"Plan visible dans l'app (désactiver le masque pour les nouveaux achats)")),
+    h("div",null,FEATURES.map(flagRow)),h("label",{class:"check"},active,"Plan visible dans l'app (désactiver le masque pour les nouveaux achats)"),
+    p.code==="trial"?null:h("label",{class:"check"},play,"Envoyer les prix à Google Play (nouveaux abonnés) ",playNote)),
     buttons:[{label:"Annuler",close:true},{label:"Enregistrer",kind:"primary",run:async()=>{
       const body={name:f.name.value.trim(),description:f.description.value.trim(),price_monthly_usd:parseFloat(f.price_monthly_usd.value),price_yearly_usd:parseFloat(f.price_yearly_usd.value),max_tables:parseInt(f.max_tables.value,10),max_rows_per_table:parseInt(f.max_rows_per_table.value,10),max_devices:parseInt(f.max_devices.value,10),display_order:parseInt(f.display_order.value,10),is_active:active.checked};
       for(const [k] of FEATURES) body[k]=flags[k].checked;
       if(!body.name){toast("Le nom est obligatoire.",true);return false;} if([body.price_monthly_usd,body.price_yearly_usd,body.max_tables,body.max_rows_per_table,body.max_devices].some(x=>isNaN(x))){toast("Vérifiez les nombres saisis.",true);return false;}
-      await api("/api/admin/plans/"+p.code,{method:"PUT",body}); S.plans=[]; toast("Plan enregistré"); after(); }}]});
+      await api("/api/admin/plans/"+p.code,{method:"PUT",body}); S.plans=[];
+      if(play.checked&&p.code!=="trial"){
+        try{ const r=await api("/api/admin/plans/"+p.code+"/sync-play",{method:"POST",body:{}}); const n=Object.values(r.countries||{}).reduce((a,b)=>a+b,0); toast(r.sent?`Plan enregistré · prix envoyés à Google (${n} pays)`:"Plan enregistré · Google : rien à modifier"); }
+        catch(e){ toast("Plan enregistré, mais Google Play a refusé : "+e.message,true); }
+      } else toast("Plan enregistré");
+      after(); }}]});
 }
 
 /* ───────── actualités ───────── */
